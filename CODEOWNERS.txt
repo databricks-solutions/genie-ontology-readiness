@@ -1,0 +1,4 @@
+# Code owners for databricks-solutions/genie-ontology-readiness
+# Maintained on a best-effort basis (see NOTICE.md). Not staffed by Databricks Support.
+# NOTE: add the co-owner's GHEC username once confirmed (e.g. @<ralph-ghec-username>).
+* @allan-cao-databricks

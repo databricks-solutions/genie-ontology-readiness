@@ -1,0 +1,69 @@
+bundle:
+  name: genie-ontology-readiness
+
+# Customer-deployable Databricks App that assesses a workspace's readiness for
+# Genie Ontology / Unity Catalog Business Semantics and generates tailored
+# enablement plans. It READS the existing environment — it does not seed data.
+
+# The built frontend (app/frontend/dist) and the rendered app/app.yml are
+# .gitignored (build artifact / workspace-specific), but the app needs both at
+# runtime — force-include them in the deploy sync. node_modules stays excluded.
+sync:
+  include:
+    - app/frontend/dist/**
+    - app/app.yml
+
+variables:
+  warehouse_id:
+    description: "SQL Warehouse ID used for assessment queries (databricks api get /api/2.0/sql/warehouses)"
+  app_name:
+    description: "Databricks App name"
+    default: genie-ontology-readiness
+  assess_catalogs:
+    description: "Optional comma-separated catalogs to assess (empty = all non-system catalogs the app SP can see)"
+    default: ""
+  genie_space_id:
+    description: "Optional Genie Space ID to enable the live answer-quality test (pillar 5)"
+    default: ""
+  lakebase_instance_name:
+    description: "Lakebase instance that hosts this app's per-user history DB (the app gets its own database on it). Only needed when USE_LAKEBASE=true. Leave empty to let post_deploy.py skip history persistence; set to an existing instance name to reuse it."
+    default: ""
+  lakebase_database:
+    description: "Lakebase PostgreSQL database name (created on the instance above by post_deploy.py)"
+    default: ontology_readiness
+
+resources:
+  apps:
+    ontology_readiness:
+      name: ${var.app_name}
+      description: "Genie Ontology Readiness — assess, learn, and plan"
+      source_code_path: ./app
+      # On-behalf-of-user (user authorization): when enabled, the app can run
+      # metadata reads as the *viewing user* (their UC permissions) instead of the
+      # app SP, so it inherits their catalog access. Requires the workspace admin
+      # to enable user authorization (Public Preview). The app degrades to the SP
+      # when no user token is forwarded. `sql` covers warehouse/UC reads.
+      # (iam.current-user:read / iam.access-control:read are auto-added defaults —
+      # don't list them here; they aren't settable user_api_scopes.)
+      # NOTE: bundle deploy sets user_api_scopes on app *create*; to add it to an
+      # already-created app, run: databricks apps update <name> --json '{... "user_api_scopes":["sql"] ...}'.
+      user_api_scopes:
+        - sql
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+      # NOTE: read grants for the app service principal (system schemas + target
+      # catalogs) are applied by scripts/post_deploy.py after the SP exists.
+      #
+      # Per-user assessment/plan history is persisted in Lakebase. There is no
+      # database_instances block here on purpose: when USE_LAKEBASE=true,
+      # post_deploy.py creates a dedicated database on the existing Lakebase
+      # instance named by ${var.lakebase_instance_name} (LAKEBASE_INSTANCE_NAME)
+      # and attaches the 'lakebase-db' app resource. Leaving the instance name
+      # empty keeps the app stateless.
+
+targets:
+  dev:
+    default: true

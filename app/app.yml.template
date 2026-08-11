@@ -1,0 +1,33 @@
+# Template for app.yml — DO NOT edit app.yml by hand.
+# scripts/post_deploy.py generates app/app.yml with workspace-specific values.
+# If deploying manually, copy this to app/app.yml and fill in the values.
+command:
+  - python
+  - app.py
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  # Optional: restrict the assessment to specific catalogs (comma-separated).
+  - name: ASSESS_CATALOGS
+    value: ""
+  # Optional: enable the live Genie answer-quality test (pillar 5).
+  - name: GENIE_SPACE_ID
+    value: ""
+  # Branding shown in the app header.
+  - name: BRAND_NAME
+    value: "Databricks"
+  # Per-user assessment/plan history persistence (Lakebase). post_deploy.py sets
+  # these: it creates the database on the shared instance, attaches the
+  # 'lakebase-db' app resource, and pins the host/user/database/instance below. The app
+  # authenticates to Postgres with an instance-scoped database credential minted from
+  # the Databricks database credentials API.
+  - name: USE_LAKEBASE
+    value: "false"
+  - name: LAKEBASE_HOST
+    value: ""
+  - name: LAKEBASE_USER
+    value: ""
+  - name: LAKEBASE_DATABASE
+    value: "ontology_readiness"
+  - name: LAKEBASE_INSTANCE_NAME
+    value: ""

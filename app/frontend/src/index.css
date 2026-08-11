@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-ink-900 antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-white rounded-lg border border-gray-200 shadow-sm;
+  }
+  .btn-primary {
+    @apply bg-databricks-500 hover:bg-databricks-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-md transition-colors;
+  }
+  .btn-secondary {
+    @apply bg-white hover:bg-gray-50 border border-gray-300 text-ink-800 font-medium py-2 px-4 rounded-md transition-colors;
+  }
+  .stat-tile {
+    @apply bg-gray-50 rounded-md border border-gray-200 px-3 py-2;
+  }
+}
+
+/* Markdown rendering */
+.markdown-body h1 {
+  @apply text-xl font-bold text-ink-900 mt-5 mb-2;
+}
+.markdown-body h2 {
+  @apply text-lg font-bold text-ink-900 mt-4 mb-2;
+}
+.markdown-body h3 {
+  @apply text-base font-semibold text-ink-900 mt-3 mb-1;
+}
+.markdown-body p {
+  @apply text-sm text-ink-800 leading-relaxed mb-3;
+}
+.markdown-body ul {
+  @apply list-disc pl-5 mb-3 space-y-1 text-sm text-ink-800;
+}
+.markdown-body ol {
+  @apply list-decimal pl-5 mb-3 space-y-1 text-sm text-ink-800;
+}
+.markdown-body li {
+  @apply leading-relaxed;
+}
+.markdown-body strong {
+  @apply font-semibold text-ink-900;
+}
+.markdown-body code {
+  @apply bg-gray-100 text-databricks-700 px-1 py-0.5 rounded text-xs font-mono;
+}
+.markdown-body pre {
+  @apply bg-ink-900 text-gray-100 rounded-md p-3 overflow-x-auto mb-3 text-xs;
+}
+.markdown-body pre code {
+  @apply bg-transparent text-gray-100 p-0;
+}
+.markdown-body table {
+  @apply w-full text-sm border-collapse mb-3;
+}
+.markdown-body th {
+  @apply text-left bg-gray-50 border border-gray-200 px-2 py-1 font-semibold;
+}
+.markdown-body td {
+  @apply border border-gray-200 px-2 py-1;
+}
+.markdown-body a {
+  @apply text-databricks-600 underline;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
