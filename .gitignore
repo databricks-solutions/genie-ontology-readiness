@@ -1,5 +1,8 @@
-# Org secret-guard (from databricks-solutions seed)
+# Org secret-guard (from databricks-solutions seed): ignore *conf*.json to keep
+# credential/config files out — but NOT the TypeScript project files it also matches.
 *conf*.json
+!tsconfig.json
+!tsconfig.*.json
 .idea/
 
 # Python
