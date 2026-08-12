@@ -69,6 +69,40 @@ function fmtWhen(iso: string): string {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
+// Wrap a pillar name to <=~16-char lines so long titles like
+// "Semantic Layer (Business Semantics)" don't clip off the radar chart.
+function wrapLabel(text: string, maxChars = 16): string[] {
+  const words = text.split(' ');
+  const lines: string[] = [];
+  let line = '';
+  for (const w of words) {
+    if (!line) { line = w; }
+    else if ((line + ' ' + w).length <= maxChars) { line += ' ' + w; }
+    else { lines.push(line); line = w; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Custom PolarAngleAxis tick: multi-line, anchored by its angular position so
+// left-side labels right-align and right-side labels left-align — keeps every
+// line inside the chart box.
+function RadarTick(props: any) {
+  const { x, y, cx, cy, payload } = props;
+  const lines = wrapLabel(String(payload?.value ?? ''));
+  const dx = x - cx;
+  const anchor = Math.abs(dx) < 12 ? 'middle' : dx > 0 ? 'start' : 'end';
+  return (
+    <text x={x} y={y} textAnchor={anchor} fill="#65868a" fontSize={10.5}>
+      {lines.map((ln, i) => (
+        <tspan key={i} x={x} dy={i === 0 ? (lines.length > 1 ? '-0.3em' : '0.32em') : '1.1em'}>
+          {ln}
+        </tspan>
+      ))}
+    </text>
+  );
+}
+
 export default function Scorecard({
   config,
   scorecard,
@@ -110,7 +144,9 @@ export default function Scorecard({
   const radarData = useMemo(
     () =>
       config.pillars.map((p) => ({
-        pillar: p.short || p.name,
+        // Use the pillar's card title (name), not its long description, so the
+        // radar labels match the 7 pillar cards below.
+        pillar: p.name,
         score: Math.round(pillarsByKey[p.key]?.score ?? 0),
       })),
     [config.pillars, pillarsByKey]
@@ -378,10 +414,10 @@ export default function Scorecard({
         <div className="space-y-6">
           <div className="card p-5">
             <h3 className="text-sm font-semibold text-ink-700 mb-2">Pillar maturity</h3>
-            <ResponsiveContainer width="100%" height={300}>
-              <RadarChart data={radarData} outerRadius="72%">
+            <ResponsiveContainer width="100%" height={340}>
+              <RadarChart data={radarData} outerRadius="62%" margin={{ top: 24, right: 56, bottom: 24, left: 56 }}>
                 <PolarGrid stroke="#e5e7eb" />
-                <PolarAngleAxis dataKey="pillar" tick={{ fontSize: 11, fill: '#65868a' }} />
+                <PolarAngleAxis dataKey="pillar" tick={<RadarTick />} />
                 <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={90} />
                 <Radar name="Score" dataKey="score" stroke="#FF3621" fill="#FF3621" fillOpacity={0.25} strokeWidth={2} />
                 <Tooltip />
