@@ -418,7 +418,10 @@ export default function Scorecard({
               <RadarChart data={radarData} outerRadius="62%" margin={{ top: 24, right: 56, bottom: 24, left: 56 }}>
                 <PolarGrid stroke="#e5e7eb" />
                 <PolarAngleAxis dataKey="pillar" tick={<RadarTick />} />
-                <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={90} />
+                {/* Place the 0–100 radius ladder in the gap BETWEEN the top two
+                    spokes (~64° for 7 pillars) so it doesn't collide with the
+                    top "Unity Catalog Foundation" label. */}
+                <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={64} />
                 <Radar name="Score" dataKey="score" stroke="#FF3621" fill="#FF3621" fillOpacity={0.25} strokeWidth={2} />
                 <Tooltip />
               </RadarChart>
