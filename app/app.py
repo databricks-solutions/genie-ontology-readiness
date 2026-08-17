@@ -22,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
 from server.routes import router
-from server.routes._shared import _ai_model, AI_MODELS, DEFAULT_LLM_MODEL
+from server.routes._shared import _ai_model, DEFAULT_LLM_MODEL, is_available_model
 from server.config import USE_LAKEBASE
 
 logging.basicConfig(
@@ -85,7 +85,11 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         model = request.headers.get("X-AI-Model", DEFAULT_LLM_MODEL)
-        if model not in AI_MODELS:
+        # Validate against the models the workspace actually serves (dynamic,
+        # cached) — NOT the static AI_MODELS label map, which only covers a few
+        # known families. Validating against the static map silently dropped
+        # every other live model back to the default.
+        if not await is_available_model(model):
             model = DEFAULT_LLM_MODEL
         token = _ai_model.set(model)
         try:

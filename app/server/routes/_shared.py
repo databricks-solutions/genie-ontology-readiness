@@ -293,3 +293,23 @@ async def resolve_default_model(models: list[dict]) -> str:
 
     # Ultimate fallback
     return DEFAULT_LLM_MODEL
+
+
+async def is_available_model(model_id: str) -> bool:
+    """Whether a model id is one the workspace actually serves.
+
+    Validates against the DYNAMIC serving-endpoints list (cached), NOT the
+    static AI_MODELS label map — the picker lists every live chat endpoint, so
+    the static map is not the source of truth for what's selectable. Degrades
+    open: if the list can't be resolved, accept the id rather than silently
+    forcing the default (the FM API call itself will surface a real error if
+    the endpoint truly doesn't exist).
+    """
+    if not model_id:
+        return False
+    try:
+        models = await list_available_models()
+        ids = {m["id"] for m in models}
+        return model_id in ids if ids else True
+    except Exception:
+        return True
