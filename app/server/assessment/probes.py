@@ -16,13 +16,18 @@ than raising. Each probe returns a uniform shape:
 DATA SOURCE RESILIENCE: an assessment ideally reads the metastore-wide
 ``system.information_schema`` (one query covers everything). But that requires
 the app service principal to be an account admin / granted on system schemas,
-which customers often won't do for an app SP. So we resolve the source once:
-if ``system.information_schema`` is readable we use it; otherwise we fall back
-to unioning each accessible catalog's own ``<catalog>.information_schema`` —
-which only needs catalog-level SELECT (grantable by any catalog owner).
+which customers often won't do for an app SP. So we resolve the source: if
+``system.information_schema`` is readable we use it; otherwise we fall back to
+unioning each accessible catalog's own ``<catalog>.information_schema`` — which
+only needs catalog-level SELECT (grantable by any catalog owner). SP-only runs
+cache this for the process lifetime; under on-behalf-of-user auth it is re-run
+per request (the viewer's grants differ from the SP's). Within one assessment it
+is resolved once and shared across all probes via a request-scoped contextvar —
+see ``prime_request_sources``.
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import aiohttp
@@ -33,6 +38,7 @@ from server.config import (
     get_auth_headers,
     ASSESS_CATALOGS,
     GENIE_SPACE_ID,
+    get_user_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +51,17 @@ _INTERNAL_CATALOGS = ("system", "__databricks_internal", "samples", "hive_metast
 
 def _empty(note: str) -> dict:
     return {"available": False, "score": 0.0, "signals": [], "gaps": [], "note": note, "metrics": {}}
+
+
+def _no_catalogs_note(what: str) -> str:
+    """Zero-readable-catalogs message that points at the identity actually being
+    used. Under on-behalf-of-user the reads run as the viewer, so blame the user's
+    grants; otherwise blame the app service principal."""
+    if get_user_token():
+        return (f"No catalogs are readable by your user account for the {what}. Ensure you have "
+                f"USE CATALOG + SELECT on the catalogs to assess.")
+    return (f"No readable catalogs for the {what}. Grant the app service principal "
+            f"USE CATALOG + SELECT on the catalogs to assess.")
 
 
 async def _scalar(query: str, force_sp: bool = False):
@@ -85,17 +102,27 @@ def _pct(num, den) -> float:
 _sources_sp = None
 _sources_sp_lock = asyncio.Lock()
 
+# Request-scoped resolution: primed once per assessment (prime_request_sources)
+# and shared across the probes the scorer dispatches concurrently, so a single
+# assessment resolves sources ONCE instead of once per probe. contextvars are
+# copied into each task at gather()/ensure_future()-time, so priming in the parent
+# context before dispatch propagates the value to every probe task.
+_request_sources: contextvars.ContextVar = contextvars.ContextVar("request_sources", default=None)
+
 
 async def _resolve_sources() -> dict:
     """Determine whether system.information_schema is readable and which
     catalogs to assess.
 
-    When a forwarded end-user token is present (on-behalf-of-user), resolution
-    runs fresh every time — the user's Unity Catalog grants may differ from
-    the SP's. When no user token is present (SP-only), the result is cached
-    for the process lifetime.
+    If a resolution was primed for this assessment (prime_request_sources), return
+    it so every probe in the assessment shares one resolution. Otherwise: when a
+    forwarded end-user token is present (on-behalf-of-user), resolve fresh — the
+    user's Unity Catalog grants may differ from the SP's; when no user token is
+    present (SP-only), the result is cached for the process lifetime.
     """
-    from server.config import get_user_token
+    primed = _request_sources.get()
+    if primed is not None:
+        return primed
 
     global _sources_sp
     has_user_token = get_user_token() is not None
@@ -113,6 +140,21 @@ async def _resolve_sources() -> dict:
     # For OBO (user-token) requests, resolve fresh every time so the result
     # reflects the viewing user's permissions.
     return await _do_resolve_sources()
+
+
+async def prime_request_sources() -> dict:
+    """Resolve the assessment's data sources ONCE and cache them in a request-scoped
+    contextvar so the probes dispatched concurrently by the scorer reuse a single
+    resolution. Without this, each probe calls _resolve_sources independently — and
+    under OBO (where the SP cache is bypassed) that meant every probe re-ran the
+    system probe + catalog enumeration + per-catalog readability checks, an N× fan-out.
+
+    Call this in the assessment context BEFORE dispatching probes: contextvars set
+    here are inherited by each probe task created by asyncio.gather/ensure_future.
+    """
+    s = await _resolve_sources()
+    _request_sources.set(s)
+    return s
 
 
 async def _do_resolve_sources() -> dict:
@@ -151,12 +193,18 @@ async def _do_resolve_sources() -> dict:
     # break the UNION. Keep only catalogs whose information_schema is
     # actually readable, tested concurrently.
     if not use_system and catalogs:
+        # Bound concurrency so a wide metastore (many catalogs) can't fan out an
+        # unbounded burst of readability probes that trips the warehouse's
+        # max-concurrent-queries / API rate limits — which would make _readable
+        # spuriously return False and silently drop a catalog the user can read.
+        _sem = asyncio.Semaphore(10)
         async def _readable(c: str) -> bool:
-            try:
-                await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
-                return True
-            except Exception:
-                return False
+            async with _sem:
+                try:
+                    await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
+                    return True
+                except Exception:
+                    return False
         checks = await asyncio.gather(*(_readable(c) for c in catalogs))
         accessible = [c for c, ok in zip(catalogs, checks) if ok]
         if accessible:
@@ -183,13 +231,10 @@ def _src(view: str, sources: dict) -> str | None:
 # 1. Unity Catalog foundation
 # ---------------------------------------------------------------------------
 async def probe_uc_foundation() -> dict:
-    from server.config import get_user_token
     s = await _resolve_sources()
     n_catalogs = len(s["catalogs"])
     if n_catalogs == 0 and not s["system_ok"]:
-        if get_user_token():
-            return _empty("No catalogs are readable by your user account. Ensure you have USE CATALOG + SELECT on the catalogs to assess.")
-        return _empty("No catalogs are readable by the app service principal. Grant it USE CATALOG + SELECT on the catalogs to assess.")
+        return _empty(_no_catalogs_note("assessment"))
     try:
         tbl = _src("tables", s)
         sch = _src("schemata", s)
@@ -296,7 +341,7 @@ async def probe_metadata() -> dict:
     tbl = _src("tables", s)
     col = _src("columns", s)
     if tbl is None:
-        return _empty("No readable catalogs for metadata assessment.")
+        return _empty(_no_catalogs_note("metadata assessment"))
     try:
         rows = await execute_sql(
             f"""SELECT COUNT(*) AS total,
@@ -361,7 +406,7 @@ async def probe_relationships() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
     if tbl is None:
-        return _empty("No readable catalogs for relationship assessment.")
+        return _empty(_no_catalogs_note("relationship assessment"))
     try:
         constraints_available = True
         pk = fk = 0
@@ -418,7 +463,7 @@ async def probe_semantic_layer() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
     if tbl is None:
-        return _empty("No readable catalogs for the semantic-layer assessment.")
+        return _empty(_no_catalogs_note("semantic-layer assessment"))
     try:
         metric_views = None
         type_value = None
