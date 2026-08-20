@@ -81,69 +81,91 @@ def _pct(num, den) -> float:
 # ---------------------------------------------------------------------------
 # Source resolution
 # ---------------------------------------------------------------------------
-_sources = None
-_sources_lock = asyncio.Lock()
+# SP-only cache: used when no user token is present (scheduled/unattended mode).
+_sources_sp = None
+_sources_sp_lock = asyncio.Lock()
 
 
 async def _resolve_sources() -> dict:
     """Determine whether system.information_schema is readable and which
-    catalogs to assess. Cached for the process lifetime."""
-    global _sources
-    if _sources is not None:
-        return _sources
-    async with _sources_lock:
-        if _sources is not None:
-            return _sources
+    catalogs to assess.
 
+    When a forwarded end-user token is present (on-behalf-of-user), resolution
+    runs fresh every time — the user's Unity Catalog grants may differ from
+    the SP's. When no user token is present (SP-only), the result is cached
+    for the process lifetime.
+    """
+    from server.config import get_user_token
+
+    global _sources_sp
+    has_user_token = get_user_token() is not None
+
+    # For SP-only requests, use the global cache.
+    if not has_user_token:
+        if _sources_sp is not None:
+            return _sources_sp
+        async with _sources_sp_lock:
+            if _sources_sp is not None:
+                return _sources_sp
+            _sources_sp = await _do_resolve_sources()
+            return _sources_sp
+
+    # For OBO (user-token) requests, resolve fresh every time so the result
+    # reflects the viewing user's permissions.
+    return await _do_resolve_sources()
+
+
+async def _do_resolve_sources() -> dict:
+    """Core source resolution logic (called by _resolve_sources)."""
+    system_ok = False
+    try:
+        await execute_sql("SELECT 1 FROM system.information_schema.tables LIMIT 1")
+        system_ok = True
+    except Exception:
         system_ok = False
+
+    catalogs = list(ASSESS_CATALOGS)
+    if not catalogs:
+        rows = []
         try:
-            await execute_sql("SELECT 1 FROM system.information_schema.tables LIMIT 1")
-            system_ok = True
-        except Exception:
-            system_ok = False
+            if system_ok:
+                rows = await execute_sql("SELECT catalog_name AS c FROM system.information_schema.catalogs")
+                catalogs = [r.get("c") for r in rows]
+            else:
+                rows = await execute_sql("SHOW CATALOGS")
+                catalogs = [list(r.values())[0] for r in rows]
+        except Exception as e:
+            logger.warning(f"catalog enumeration failed: {e}")
+            catalogs = []
+        catalogs = [
+            c for c in catalogs
+            if c and c not in _INTERNAL_CATALOGS and not c.startswith("__")
+        ]
 
-        catalogs = list(ASSESS_CATALOGS)
-        if not catalogs:
-            rows = []
+    # When restricted to specific catalogs, prefer per-catalog reads even if
+    # system is readable, so we never depend on system grants we can't assume.
+    use_system = system_ok and not ASSESS_CATALOGS
+
+    # In per-catalog mode, SHOW CATALOGS may list catalogs the SP can only
+    # BROWSE (not SELECT) — querying their information_schema would fail and
+    # break the UNION. Keep only catalogs whose information_schema is
+    # actually readable, tested concurrently.
+    if not use_system and catalogs:
+        async def _readable(c: str) -> bool:
             try:
-                if system_ok:
-                    rows = await execute_sql("SELECT catalog_name AS c FROM system.information_schema.catalogs")
-                    catalogs = [r.get("c") for r in rows]
-                else:
-                    rows = await execute_sql("SHOW CATALOGS")
-                    catalogs = [list(r.values())[0] for r in rows]
-            except Exception as e:
-                logger.warning(f"catalog enumeration failed: {e}")
-                catalogs = []
-            catalogs = [
-                c for c in catalogs
-                if c and c not in _INTERNAL_CATALOGS and not c.startswith("__")
-            ]
+                await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
+                return True
+            except Exception:
+                return False
+        checks = await asyncio.gather(*(_readable(c) for c in catalogs))
+        accessible = [c for c, ok in zip(catalogs, checks) if ok]
+        if accessible:
+            catalogs = accessible
+        logger.info(f"accessible catalogs: {len(catalogs)} of {len(checks)} discovered")
 
-        # When restricted to specific catalogs, prefer per-catalog reads even if
-        # system is readable, so we never depend on system grants we can't assume.
-        use_system = system_ok and not ASSESS_CATALOGS
-
-        # In per-catalog mode, SHOW CATALOGS may list catalogs the SP can only
-        # BROWSE (not SELECT) — querying their information_schema would fail and
-        # break the UNION. Keep only catalogs whose information_schema is
-        # actually readable, tested concurrently.
-        if not use_system and catalogs:
-            async def _readable(c: str) -> bool:
-                try:
-                    await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
-                    return True
-                except Exception:
-                    return False
-            checks = await asyncio.gather(*(_readable(c) for c in catalogs))
-            accessible = [c for c, ok in zip(catalogs, checks) if ok]
-            if accessible:
-                catalogs = accessible
-            logger.info(f"accessible catalogs: {len(catalogs)} of {len(checks)} discovered")
-
-        _sources = {"system_ok": use_system, "catalogs": catalogs}
-        logger.info(f"assessment sources: system_ok={use_system}, catalogs={len(catalogs)}")
-        return _sources
+    sources = {"system_ok": use_system, "catalogs": catalogs}
+    logger.info(f"assessment sources: system_ok={use_system}, catalogs={len(catalogs)}")
+    return sources
 
 
 def _src(view: str, sources: dict) -> str | None:
@@ -161,9 +183,12 @@ def _src(view: str, sources: dict) -> str | None:
 # 1. Unity Catalog foundation
 # ---------------------------------------------------------------------------
 async def probe_uc_foundation() -> dict:
+    from server.config import get_user_token
     s = await _resolve_sources()
     n_catalogs = len(s["catalogs"])
     if n_catalogs == 0 and not s["system_ok"]:
+        if get_user_token():
+            return _empty("No catalogs are readable by your user account. Ensure you have USE CATALOG + SELECT on the catalogs to assess.")
         return _empty("No catalogs are readable by the app service principal. Grant it USE CATALOG + SELECT on the catalogs to assess.")
     try:
         tbl = _src("tables", s)
