@@ -15,7 +15,7 @@ from server.pillars import (
     level_from_score,
     readiness_stage,
 )
-from server.assessment.probes import PROBES
+from server.assessment.probes import PROBES, prime_request_sources
 from server.content.library import best_practices_for, capability_summary
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,9 @@ async def _run_probe(key: str) -> tuple[str, dict]:
 
 async def run_assessment() -> dict:
     """Run every probe concurrently and build the full scorecard."""
+    # Resolve data sources once for this assessment; primes a request-scoped cache
+    # the probes reuse, so we don't re-resolve per probe (a fan-out under OBO).
+    await prime_request_sources()
     results = await asyncio.gather(*(_run_probe(k) for k in PROBES))
     probe_by_key = dict(results)
     pillars_out = [
@@ -133,6 +136,8 @@ async def run_assessment_stream():
     pillars ordered canonically.
     """
     by_key: dict[str, dict] = {}
+    # Prime the shared per-request source resolution before dispatching probes.
+    await prime_request_sources()
     tasks = [asyncio.ensure_future(_run_probe(k)) for k in PROBES]
     for fut in asyncio.as_completed(tasks):
         key, probe = await fut
