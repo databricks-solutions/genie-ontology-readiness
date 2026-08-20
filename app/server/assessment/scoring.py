@@ -48,6 +48,15 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         "level": level,
         "level_label": LEVEL_LABELS[level],
         "available": tech_available,
+        # score_exempt pillars are shown and explained but excluded from the
+        # overall score (e.g. a placeholder probe for a capability with no
+        # detection API yet). Keeps a top-weighted-but-unmeasurable pillar from
+        # dragging the headline number. See _finalize and pillars.py.
+        #
+        # Authoritative source is the pillar definition, so the exemption
+        # survives even when a probe raises and is replaced by _error_probe
+        # (which carries no flag); the probe result may also assert it.
+        "score_exempt": bool(pillar_def.get("score_exempt") or probe.get("score_exempt")),
         "note": probe.get("note"),
         "signals": probe.get("signals", []),
         "gaps": probe.get("gaps", []),
@@ -58,15 +67,24 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
 
 
 def _finalize(pillars_out: list[dict]) -> dict:
-    """Compute the overall score + prioritized gaps from all pillar entries."""
-    weighted_sum = sum(p["score"] * p["weight"] for p in pillars_out)
-    weight_total = sum(p["weight"] for p in pillars_out)
+    """Compute the overall score + prioritized gaps from all pillar entries.
+
+    Pillars flagged score_exempt (e.g. a placeholder probe for a Beta capability
+    with no detection API yet) are shown and explained but excluded from the
+    overall score and its weight denominator, so a top-weighted-but-unmeasurable
+    pillar never drags the headline number down. They are also kept out of the
+    auto-ranked top gaps (their guidance lives in Learn/Plan instead).
+    """
+    scored = [p for p in pillars_out if not p.get("score_exempt")]
+
+    weighted_sum = sum(p["score"] * p["weight"] for p in scored)
+    weight_total = sum(p["weight"] for p in scored)
     overall_score = round(weighted_sum / weight_total, 1) if weight_total else 0.0
     overall_level = level_from_score(overall_score)
     stage = readiness_stage(overall_score)
 
     # Prioritized gaps: lowest-scoring pillars first, weighted by importance.
-    ranked = sorted(pillars_out, key=lambda x: (x["score"], -x["weight"]))
+    ranked = sorted(scored, key=lambda x: (x["score"], -x["weight"]))
     top_gaps = []
     for pil in ranked:
         for g in pil["gaps"]:
@@ -81,6 +99,7 @@ def _finalize(pillars_out: list[dict]) -> dict:
             "readiness_stage": stage["label"],
             "readiness_detail": stage["detail"],
             "assessed_at": datetime.now(timezone.utc).isoformat(),
+            "excluded_pillars": [p["name"] for p in pillars_out if p.get("score_exempt")],
         },
         "top_gaps": top_gaps,
     }

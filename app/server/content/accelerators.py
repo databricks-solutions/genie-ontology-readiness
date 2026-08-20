@@ -23,7 +23,7 @@ ACCELERATORS: list[dict] = [
         # certification-ready, metric views, FK) — listed first for customers.
         "key": "metadata-dbxmetagen",
         "title": "dbxmetagen — AI metadata, tags, certification & metric-view generator",
-        "summary": "Databricks Industry Solutions toolkit that auto-generates comments, PII/domain tags, metric views, FK predictions, and even Genie spaces across Unity Catalog — the fastest way to enrich metadata at scale.",
+        "summary": "Databricks Industry Solutions toolkit that auto-generates comments, PII/domain tags, metric views, FK predictions, and even Genie agents across Unity Catalog — the fastest way to enrich metadata at scale.",
         "capability": "metadata",
         "type": "repo",
         "effort": "Half a day to pilot on a schema",
@@ -32,9 +32,9 @@ ACCELERATORS: list[dict] = [
             "metadata at scale across several modes: comment generation (tables/columns), PI mode "
             "(classify + tag PII/PHI/PCI as governed tags), domain classification, data profiling and "
             "quality scoring, AI-assisted foreign-key prediction, and a semantic-layer mode that "
-            "auto-generates metric views and provisions Genie spaces from a knowledge base. Because it "
+            "auto-generates metric views and provisions Genie agents from a knowledge base. Because it "
             "writes comments, governed tags, and metric views, it lifts the Metadata, Domains, "
-            "Relationships, and Semantic Layer pillars at once — and its outputs are a strong base for "
+            "Relationships, and Metrics pillars at once — and its outputs are a strong base for "
             "certifying your canonical assets. Review AI-generated metadata before applying."
         ),
         "prerequisites": [
@@ -43,7 +43,7 @@ ACCELERATORS: list[dict] = [
             "MODIFY on the target catalog to apply comments/tags; ASSIGN on governed tags to tag",
             "A steward to review generated metadata before it is applied",
         ],
-        "improves_signals": ["metadata", "domains", "relationships", "semantic_layer"],
+        "improves_signals": ["metadata", "domains", "relationships", "metric_views"],
         "target_level": 4,
         "review_mode": True,
         "steps": [
@@ -62,14 +62,14 @@ ACCELERATORS: list[dict] = [
     {
         "key": "semantic-dbxmetagen",
         "title": "dbxmetagen — auto-generate metric views (semantic layer)",
-        "summary": "Use dbxmetagen's semantic-layer mode to auto-generate Unity Catalog metric views (measures, dimensions, join paths) — and even provision Genie spaces — from your documented catalog.",
+        "summary": "Use dbxmetagen's semantic-layer mode to auto-generate Unity Catalog metric views (measures, dimensions, join paths) — and even provision Genie agents — from your documented catalog.",
         "capability": "metric_views",
         "type": "repo",
         "effort": "~1-2 hours per subject area",
         "what_it_does": (
             "dbxmetagen's semantic-layer mode reads your tables (and any comments / tags it generated) and "
             "drafts Unity Catalog metric views — measures, dimensions, and join paths — plus example SQL, "
-            "and can provision a Genie space from the knowledge base. It turns a documented catalog into a "
+            "and can provision a Genie agent from the knowledge base. It turns a documented catalog into a "
             "queryable semantic layer far faster than authoring metric views by hand. Always review the "
             "generated measure logic with a business owner before publishing."
         ),
@@ -88,8 +88,8 @@ ACCELERATORS: list[dict] = [
             "Run comment/domain modes first so the LLM has business context (optional but recommended).",
             "Run the semantic-layer mode to draft metric views (measures, dimensions, joins) + example SQL.",
             "Review the generated metric-view definitions with a business owner; correct measure logic and names.",
-            "Publish the approved metric views (and optionally the generated Genie space).",
-            "Re-run the readiness assessment — the Semantic Layer pillar should rise.",
+            "Publish the approved metric views (and optionally the generated Genie agent).",
+            "Re-run the readiness assessment — the Metrics pillar should rise.",
         ],
         "source": {
             "title": "dbxmetagen (Databricks Industry Solutions, GitHub)",
@@ -244,37 +244,37 @@ ACCELERATORS: list[dict] = [
         # docs/blogs) and the bundled plan is a shareable leave-behind — no
         # internal go/ links, tickets, Slack, or field-only material.
         "key": "genie-space-workbench-workshop",
-        "title": "Genie Space Quality Workshop (Genie Workbench)",
-        "summary": "A guided half-day that takes one Genie Space from cold-start failures to 85%+ benchmark accuracy — scored, optimized, and production-ready — using the open-source Genie Workbench app.",
-        "capability": "genie_spaces",
+        "title": "Genie Agent Quality Workshop (Genie Workbench)",
+        "summary": "A guided half-day that takes one Genie Agent from cold-start failures to 85%+ benchmark accuracy — scored, optimized, and production-ready — using the open-source Genie Workbench app.",
+        "capability": "genie_agents",
         "type": "repo",
         "effort": "Half a day (facilitated)",
         "what_it_does": (
-            "Genie Workbench is an open-source Databricks App that scores a Genie Space against "
+            "Genie Workbench is an open-source Databricks App that scores a Genie Agent against "
             "deterministic and LLM-evaluated checks, benchmarks it against your own question set, and "
             "runs a guided fix + auto-optimize loop with proof of lift. In a half-day workshop your BI "
-            "developer and business power users take one space from failing answers to a trusted, "
-            "benchmarked, versioned space — and leave with a reproducible playbook for the next 2-3 "
-            "spaces. Download the workshop plan below to line up the right people, then engage your "
+            "developer and business power users take one agent from failing answers to a trusted, "
+            "benchmarked, versioned agent — and leave with a reproducible playbook for the next 2-3 "
+            "agents. Download the workshop plan below to line up the right people, then engage your "
             "Databricks account team to facilitate the session."
         ),
         "prerequisites": [
             "Deploy Genie Workbench as a Databricks App in your workspace (open-source repo, linked below)",
-            "One Genie Space backed by a real data model (5-7 tables ideal, fewer than 16 preferred; 30-table hard limit)",
+            "One Genie Agent backed by a real data model (5-7 tables ideal, fewer than 16 preferred; 30-table hard limit)",
             "10-20 benchmark questions with expected answers or SQL, prepared by business power users",
             "A Foundation Model API endpoint (Genie Workbench uses Claude Sonnet)",
             "Baseline curation where obvious: table/column descriptions, join relationships, hidden internal tables",
         ],
-        "improves_signals": ["genie_spaces"],
+        "improves_signals": ["genie_agents"],
         "target_level": 4,
         "review_mode": True,
         "steps": [
-            "Use-case discovery — frame the business questions the space must answer and the metric definitions behind them (30 min).",
+            "Use-case discovery — frame the business questions the agent must answer and the metric definitions behind them (30 min).",
             "Benchmark questions — capture expected SQL/answers, tag the tier-1 deal-breakers, and load the suite into Workbench (45 min).",
             "Scan + deep analysis — run the deterministic and LLM-evaluated checks; prioritize data model > knowledge store > SQL examples > instructions (45 min).",
             "Fix + curation — the BI developer runs the fixes; power users accept/modify/reject each patch in the side-by-side diff (60 min).",
             "Auto-optimize + validate — run the optimization loop, A/B compare baseline vs. optimized on the tier-1 questions, and document the playbook (60 min).",
-            "Re-run the readiness assessment — the Genie Spaces pillar should rise as the space reaches the 'Trusted' tier.",
+            "Re-run the readiness assessment — the Genie Agents pillar should rise as the agent reaches the 'Trusted' tier.",
         ],
         "artifact_dir": "genie-space-workbench-workshop",
         "artifact_file": "workshop-plan.md",
@@ -287,19 +287,19 @@ ACCELERATORS: list[dict] = [
     {
         # Customer-facing: Databricks-owned open-source template; public repo only.
         "key": "genie-code-data-product-accelerator",
-        "title": "Data Product Accelerator — Genie Code skills for semantics & Genie Spaces",
-        "summary": "Databricks open-source library of Genie Code / agentic skills that build a governed data product end-to-end, including semantic-layer (metric view) and Genie-space patterns.",
-        "capability": "genie_spaces",
+        "title": "Data Product Accelerator — Genie Code skills for semantics & Genie Agents",
+        "summary": "Databricks open-source library of Genie Code / agentic skills that build a governed data product end-to-end, including semantic-layer (metric view) and Genie-agent patterns.",
+        "capability": "genie_agents",
         "type": "repo",
         "effort": "Guided / skill-driven",
         "what_it_does": (
             "The Data Product Accelerator is a Databricks open-source template of composable "
             "'Genie Code' skills that guide an engineer through building a governed data product: "
             "medallion (bronze/silver/gold) modeling, a semantic layer of metric views, "
-            "Genie-space patterns with agent instructions and benchmark questions, and "
-            "monitoring. Use the semantic-layer and Genie-space skills to stand up well-curated "
-            "metric views and spaces faster and more consistently than authoring them by hand — "
-            "a code-driven complement to the Genie Space Quality Workshop."
+            "Genie-agent patterns with agent instructions and benchmark questions, and "
+            "monitoring. Use the semantic-layer and Genie-agent skills to stand up well-curated "
+            "metric views and agents faster and more consistently than authoring them by hand — "
+            "a code-driven complement to the Genie Agent Quality Workshop."
         ),
         "prerequisites": [
             "Databricks workspace with Unity Catalog",
@@ -307,15 +307,15 @@ ACCELERATORS: list[dict] = [
             "A target schema and the source tables for your data product",
             "A Foundation Model API endpoint for the agentic steps",
         ],
-        "improves_signals": ["genie_spaces", "metric_views"],
+        "improves_signals": ["genie_agents", "metric_views"],
         "target_level": 4,
         "review_mode": False,
         "steps": [
             "Clone the repo and open the data_product_accelerator skills.",
             "Use the semantic-layer skill to define metric views for your core KPIs.",
-            "Use the Genie-space patterns / genai-agents skills to scaffold a curated, well-instructed space with benchmark questions.",
+            "Use the Genie-agent patterns / genai-agents skills to scaffold a curated, well-instructed agent with benchmark questions.",
             "Iterate with the skills' review steps, then publish the objects to Unity Catalog.",
-            "Re-run the readiness assessment — the Genie Spaces (and Metric Views) score should rise.",
+            "Re-run the readiness assessment — the Genie Agents (and Metric Views) score should rise.",
         ],
         "source": {
             "title": "Data Product Accelerator (Databricks, GitHub)",
@@ -325,32 +325,32 @@ ACCELERATORS: list[dict] = [
     },
     {
         "key": "genie-spaces-methodology-guide",
-        "title": "Handbook: curate & benchmark Genie Spaces",
-        "summary": "How to organize Genie Spaces by domain, onboard one measure at a time with example SQL, write trigger→action→example instructions, and benchmark + regression-test. Download the full handbook.",
-        "capability": "genie_spaces",
+        "title": "Handbook: curate & benchmark Genie Agents",
+        "summary": "How to organize Genie Agents by domain, onboard one measure at a time with example SQL, write trigger→action→example instructions, and benchmark + regression-test. Download the full handbook.",
+        "capability": "genie_agents",
         "type": "guide",
         "effort": "Reference / self-guided",
         "what_it_does": (
-            "A well-curated Genie Space has one focused domain/subdomain (≤30 items), always with a description "
+            "A well-curated Genie Agent has one focused domain/subdomain (≤30 items), always with a description "
             "for routing. You save validated queries as example SQL and keep it simple. Instructions are written "
             "as trigger→action→example. Benchmark 2–4 phrasings per question with ground-truth SQL and "
             "regression-test after every change. This guide covers Phases 3–5 of the AI-ready-semantics handbook "
-            "in depth, with techniques for organizing and validating trusted Genie Spaces."
+            "in depth, with techniques for organizing and validating trusted Genie Agents."
         ),
         "prerequisites": [
-            "Create access on Genie Spaces",
-            "Metric views already drafted and available in the space's source catalog",
+            "Create access on Genie Agents",
+            "Metric views already drafted and available in the agent's source catalog",
             "2-4 benchmark questions per KPI with ground-truth SQL",
-            "A business owner to validate space routing and instructions",
+            "A business owner to validate agent routing and instructions",
         ],
-        "improves_signals": ["genie_spaces"],
+        "improves_signals": ["genie_agents"],
         "target_level": 4,
         "review_mode": False,
         "steps": [
-            "Create one Genie Space per business domain/subdomain, keeping under 30 items for performance.",
+            "Create one Genie Agent per business domain/subdomain, keeping under 30 items for performance.",
             "Onboard one metric view at a time; validate its measure against sample questions.",
             "Save validated queries as example SQL; keep the SQL simple to reduce the agent's reasoning load.",
-            "Write space instructions as trigger→action→example for ambiguous or domain-specific logic.",
+            "Write agent instructions as trigger→action→example for ambiguous or domain-specific logic.",
             "Benchmark 2–4 phrasings per question, regression-test after every change, and download the handbook for the full method.",
         ],
         "artifact_dir": "ai-ready-semantics",
@@ -434,7 +434,7 @@ ACCELERATORS: list[dict] = [
         },
         "valid_as_of": "2026-07",
     },
-    # ---- Semantic Layer / Metric Views (weight 22) -------------------------
+    # ---- Metrics / Metric Views (weight 18) -------------------------
     {
         # Build accelerator (per plan §3): scaffold metric-view YAML from a KPI
         # inventory or query history — a hand-authored complement to the
@@ -466,7 +466,7 @@ ACCELERATORS: list[dict] = [
             "Author metric-view YAML stubs (measures, dimensions, join paths, synonyms) for each KPI (see the linked docs).",
             "Review each metric view with a business owner; correct measure logic, names, and synonyms.",
             "Publish the approved metric views to Unity Catalog.",
-            "Re-run the readiness assessment — the Semantic Layer pillar should rise.",
+            "Re-run the readiness assessment — the Metrics pillar should rise.",
         ],
         "source": {
             "title": "Unity Catalog metric views (docs)",
@@ -499,7 +499,7 @@ ACCELERATORS: list[dict] = [
             "Rank the recurring computations by traffic and inconsistency so you can prioritize which metric views to define first.",
             "Review the ranked drift report; pick the top KPIs to standardize via metric views.",
             "Define metric views for those KPIs (see the Author metric views guide) and point dashboards at them.",
-            "Re-run the readiness assessment — the Semantic Layer pillar should rise as KPIs consolidate.",
+            "Re-run the readiness assessment — the Metrics pillar should rise as KPIs consolidate.",
         ],
         "source": {
             "title": "Query history system table (docs)",
@@ -617,19 +617,19 @@ ACCELERATORS: list[dict] = [
     {
         "key": "domains-methodology-guide",
         "title": "Handbook: organize domains & stewardship",
-        "summary": "How to structure Genie Spaces and metric views around business domains, name metric views by convention, tag assets with their domain, and certify canonical assets with named stewards. Download the full handbook.",
+        "summary": "How to structure Genie Agents and metric views around business domains, name metric views by convention, tag assets with their domain, and certify canonical assets with named stewards. Download the full handbook.",
         "capability": "domains",
         "type": "guide",
         "effort": "Reference / self-guided",
         "what_it_does": (
-            "Organizing around business domains (not reports) keeps Genie Spaces focused and discoverable. "
-            "Metric views follow a naming convention ({subdomain}_{kpi_group}), and both spaces and metric views "
+            "Organizing around business domains (not reports) keeps Genie Agents focused and discoverable. "
+            "Metric views follow a naming convention ({subdomain}_{kpi_group}), and both agents and metric views "
             "are tagged with their domain for observability. Canonical assets are certified and assigned named stewards. "
             "This guide covers Phase 3 (Organize by domain) of the AI-ready-semantics handbook in depth, with the "
             "foundational discipline that makes a semantic layer sustainable."
         ),
         "prerequisites": [
-            "Genie Spaces and metric views already created per the build phases",
+            "Genie Agents and metric views already created per the build phases",
             "ASSIGN on governed tags to apply domain/steward classifications",
             "Business domain leads to confirm domain boundaries and steward assignments",
         ],
@@ -637,10 +637,10 @@ ACCELERATORS: list[dict] = [
         "target_level": 4,
         "review_mode": False,
         "steps": [
-            "Map your Genie Spaces to business domains and subdomains; one space per focused domain, under 30 items.",
+            "Map your Genie Agents to business domains and subdomains; one agent per focused domain, under 30 items.",
             "Name metric views by convention: {subdomain}_{kpi_group} to make ownership visible in the catalog.",
-            "Apply governed domain and steward tags to both Genie Spaces and metric views for discoverability and observability.",
-            "Identify the canonical (most-used, most-trusted) metric view or space per domain and certify it with a named steward.",
+            "Apply governed domain and steward tags to both Genie Agents and metric views for discoverability and observability.",
+            "Identify the canonical (most-used, most-trusted) metric view or agent per domain and certify it with a named steward.",
             "Download the handbook for the full domain-organization method and stewardship patterns.",
         ],
         "artifact_dir": "ai-ready-semantics",

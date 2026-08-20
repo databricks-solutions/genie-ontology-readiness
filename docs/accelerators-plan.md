@@ -106,15 +106,15 @@ assessment → Metadata pillar score goes up → overall readiness stage advance
 - **Pre-joined gold view scaffolder** (build) — generate wide/star views for the
   common join paths Genie should see.
 
-### Semantic Layer / Metric Views (weight 22)
+### Metrics / Metric Views (weight 18)
 - **Metric-view scaffolder** (build) — from a KPI inventory sheet (or from query
   history) generate metric-view YAML stubs (measures/dimensions/joins/synonyms).
 - **KPI-drift finder** (build) — mine query history for the same KPI computed
   differently across dashboards → prioritize which metric views to define first.
 
-### Genie Spaces (weight 16)
-- **Genie Space bootstrapper** (build, leverages `genie-rooms` skill) — create a
-  space scoped to a domain's gold tables + metric views, seed instructions from
+### Genie Agents (weight 16)
+- **Genie Agent bootstrapper** (build, leverages `genie-rooms` skill) — create an
+  agent scoped to a domain's gold tables + metric views, seed instructions from
   metadata.
 - **Benchmark harness** (build, extends `genie_client.py`) — run a benchmark
   question set via the Conversation API, score answers, track regressions.

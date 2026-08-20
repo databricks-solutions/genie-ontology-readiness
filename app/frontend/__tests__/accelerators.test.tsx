@@ -24,7 +24,7 @@ const CAPABILITY_KEYS = [
   'metadata',
   'relationships',
   'metric_views',
-  'genie_spaces',
+  'genie_agents',
   'domains',
   'adoption',
 ] as const;

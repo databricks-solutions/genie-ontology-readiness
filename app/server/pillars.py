@@ -34,12 +34,12 @@ READINESS_STAGES = [
     {
         "min_score": 55,
         "label": "Ready for Session 2 — Genie Room Setup & Tuning",
-        "detail": "Metadata and a semantic layer exist; stand up and tune Genie Spaces.",
+        "detail": "Metadata and a semantic layer exist; stand up and tune Genie Agents.",
     },
     {
         "min_score": 72,
         "label": "Ready for Session 3 — Validation & Business Onboarding",
-        "detail": "Genie Spaces are curated; validate accuracy and onboard business users.",
+        "detail": "Genie Agents are curated; validate accuracy and onboard business users.",
     },
     {
         "min_score": 85,
@@ -48,49 +48,78 @@ READINESS_STAGES = [
     },
 ]
 
-# Relative weight of each pillar in the overall score (sums to 100).
+# Relative weight of each pillar in the overall score. Weights sum to 100, but a
+# score_exempt pillar (see the NOTE below) is excluded from the live score's
+# weight denominator — so today the headline number normalizes over 84, not 100.
+#
+# Weighting reflects what most determines Genie Ontology readiness: the
+# ontology-modeled layers the customer authors and governs — Metrics (metric
+# views), Domains & Stewardship, and Pages & Business Concepts — carry
+# the most weight, followed by Metadata Richness. The infrastructural (UC
+# foundation, relationships), consumption (Genie Agents), and activity
+# (adoption) pillars weigh less.
+#
+# NOTE on Pages: it is intentionally in the top weight tier, but its probe is
+# currently a placeholder (Pages is a Beta UC Semantics feature with no public
+# metadata API). While a probe returns "score_exempt", scoring.py excludes that
+# pillar from the overall score entirely — so the placeholder does NOT drag the
+# headline number. Remove the score_exempt flag from probe_pages once real
+# detection lands and Pages will count at its full weight.
 PILLARS = [
     {
         "key": "uc_foundation",
         "name": "Unity Catalog Foundation",
-        "weight": 15,
+        "weight": 10,
         "short": "Governed catalogs, schemas, and tables in Unity Catalog.",
         "capability": "unity_catalog",
     },
     {
         "key": "metadata",
         "name": "Metadata Richness",
-        "weight": 22,
+        "weight": 15,
         "short": "Comments and descriptions on tables and columns, plus tags.",
         "capability": "metadata",
     },
     {
         "key": "relationships",
         "name": "Relationships & Modeling",
-        "weight": 12,
+        "weight": 7,
         "short": "Primary/foreign keys and a curated gold layer for analytics.",
         "capability": "relationships",
     },
     {
-        "key": "semantic_layer",
-        "name": "Semantic Layer (Business Semantics)",
-        "weight": 20,
-        "short": "Metric views, glossary, synonyms — the foundation that feeds the ontology.",
+        "key": "metrics",
+        "name": "Metrics",
+        "weight": 18,
+        "short": "Metric views — the governed metrics foundation that feeds the ontology.",
         "capability": "metric_views",
     },
     {
-        "key": "genie_spaces",
-        "name": "Genie Spaces",
-        "weight": 16,
-        "short": "Curated Genie Spaces with instructions, example SQL, and benchmarks.",
-        "capability": "genie_spaces",
+        "key": "genie_agents",
+        "name": "Genie Agents",
+        "weight": 12,
+        "short": "Curated Genie Agents with instructions, example SQL, and benchmarks.",
+        "capability": "genie_agents",
     },
     {
         "key": "domains",
         "name": "Domains & Stewardship",
-        "weight": 10,
+        "weight": 17,
         "short": "Business-aligned domains with named stewards and certification.",
         "capability": "domains",
+    },
+    {
+        "key": "pages",
+        "name": "Pages & Business Concepts",
+        "weight": 16,
+        "short": "Governed Pages defining business concepts, terms, and acronyms — the authoritative layer Genie One cites over inferred context.",
+        "capability": "pages",
+        # Authoritative exemption flag: scoring excludes this pillar from the
+        # overall score while it is unmeasurable (placeholder probe). Set here on
+        # the definition — not only on the probe — so the exemption holds even if
+        # the probe raises and falls back to _error_probe. Drop it (and the
+        # placeholder in probe_pages) once a real detection signal exists.
+        "score_exempt": True,
     },
     {
         "key": "adoption",

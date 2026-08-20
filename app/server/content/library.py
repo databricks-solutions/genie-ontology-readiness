@@ -4,7 +4,7 @@ For each capability: a concise "what it is", technical + business value, clear
 recommendations, best practices, and PUBLIC Databricks documentation sources only.
 
 Product accuracy to preserve (without release-stage labels):
-  - Unity Catalog *Business Semantics* (metric views, glossary, domains,
+  - Unity Catalog *Business Semantics* (metric views, Pages, domains,
     synonyms, certification) is the customer-built, governed foundation.
   - *Genie Ontology* is the continuously-LEARNED enterprise context layer that
     Databricks builds on top of that foundation. The foundation FEEDS the
@@ -19,26 +19,26 @@ CAPABILITIES: dict[str, dict] = {
         "what": (
             "Genie Ontology is the business-aware context layer that lets Genie answer from "
             "your authoritative source. It brings together two kinds of context: the semantics "
-            "you MODEL and govern in Unity Catalog (metric views, domains, a business glossary, "
+            "you MODEL and govern in Unity Catalog (metric views, domains, Pages, "
             "synonyms, certified assets) and context Genie LEARNS from the assets you already "
-            "have (dashboards, saved queries, Genie Spaces, notebooks). It ranks every signal by "
+            "have (dashboards, saved queries, Genie Agents, notebooks). It ranks every signal by "
             "authority — things like certification, popularity, freshness, and ownership — so it "
             "answers from the source that is actually right. The modeled foundation FEEDS the "
             "learned layer, so preparing for Genie Ontology means maturing that foundation: "
-            "governance, metadata, metric views, domains, glossary, and curated Genie Spaces."
+            "governance, metadata, metric views, domains, Pages, and curated Genie Agents."
         ),
         "technical_value": "One governed meaning, reused across Genie, SQL, notebooks, dashboards, and BI — instead of definitions fragmented across tools.",
         "business_value": "Business users and AI agents give the same trustworthy answer to the same question. The foundation work pays off in AI/BI and Genie accuracy immediately.",
         "technical_enablement": [
-            "Mature the foundation first: UC governance, rich metadata, metric views, curated Genie Spaces.",
+            "Mature the foundation first: UC governance, rich metadata, metric views, curated Genie Agents.",
             "Engage your Databricks account team about Genie Ontology eligibility.",
         ],
         "business_adoption": [
             "Frame this as a semantic-standardization program, not a tool rollout.",
-            "Name owners for metrics, glossary terms, and domains before scaling.",
+            "Name owners for metrics, Pages, and domains before scaling.",
         ],
         "best_practices": [
-            "Treat 'preparing for Genie Ontology' as maturing UC Business Semantics + governance + Genie Spaces.",
+            "Treat 'preparing for Genie Ontology' as maturing UC Business Semantics + governance + Genie Agents.",
             "The foundation work improves AI/BI accuracy today — don't wait.",
         ],
         "sources": [
@@ -107,7 +107,7 @@ CAPABILITIES: dict[str, dict] = {
         "name": "Metadata Richness",
         "tagline": "The comments and tags Genie reads to understand your data.",
         "what": "Table and column comments, descriptions, and governed tags. Genie maps natural-language questions to the right tables and columns using this metadata, so its quality strongly predicts answer accuracy.",
-        "technical_value": "Higher first-attempt accuracy; less manual instruction-writing in each Genie Space.",
+        "technical_value": "Higher first-attempt accuracy; less manual instruction-writing in each Genie Agent.",
         "business_value": "Faster, more trustworthy self-serve answers and better discovery in Catalog Explorer.",
         "technical_enablement": [
             "Add COMMENT to every gold-layer table and column.",
@@ -153,7 +153,7 @@ CAPABILITIES: dict[str, dict] = {
         ],
     },
     "metric_views": {
-        "name": "Metric Views (Business Semantics)",
+        "name": "Metric Views",
         "tagline": "Centrally-defined, certified KPIs — the core of the semantic foundation.",
         "what": "Unity Catalog metric views define measures, dimensions, filters, and joins once, in governed YAML, and reuse them across Genie, dashboards, SQL, notebooks, and external BI. This is the central pillar of the semantic foundation that feeds Genie Ontology.",
         "technical_value": "One definition of each KPI consumed everywhere; no metric drift between BI and Genie.",
@@ -161,7 +161,7 @@ CAPABILITIES: dict[str, dict] = {
         "technical_enablement": [
             "Define metric views in YAML for your top KPIs (measures, dimensions, joins).",
             "Add synonyms, display names, and formatting for agent-friendliness.",
-            "Use the same metric views in dashboards and Genie Spaces.",
+            "Use the same metric views in dashboards and Genie Agents.",
         ],
         "business_adoption": [
             "Have business owners define the 'what' of each KPI, not just IT the 'how'.",
@@ -178,30 +178,30 @@ CAPABILITIES: dict[str, dict] = {
             {"title": "Redefining the semantics layer for BI and AI (blog)", "url": "https://www.databricks.com/blog/redefining-semantics-data-layer-future-bi-and-ai"},
         ],
     },
-    "genie_spaces": {
-        "name": "Genie Spaces",
+    "genie_agents": {
+        "name": "Genie Agents",
         "tagline": "Curated natural-language analytics over your governed data.",
-        "what": "A Genie Space is a curated room where business users ask questions in natural language. Curation — instructions, example/verified SQL, benchmark questions, and the tables/metric views in scope — is what makes answers accurate.",
+        "what": "A Genie Agent is a curated room where business users ask questions in natural language. Curation — instructions, example/verified SQL, benchmark questions, and the tables/metric views in scope — is what makes answers accurate.",
         "technical_value": "Scoped, governed context for the model; verified queries and benchmarks raise accuracy.",
         "business_value": "Self-serve answers for business users without writing SQL; faster decisions.",
         "technical_enablement": [
-            "Create a Genie Space scoped to a domain's gold tables and metric views.",
+            "Create a Genie Agent scoped to a domain's gold tables and metric views.",
             "Add instructions, example/verified SQL, and benchmark questions.",
             "Test answer quality and iterate on the instructions.",
         ],
         "business_adoption": [
             "Onboard real business users and capture their actual questions.",
             "Run a feedback loop to refine instructions and verified queries.",
-            "Scope spaces by business domain, not the whole catalog.",
+            "Scope agents by business domain, not the whole catalog.",
         ],
         "best_practices": [
-            "Prefer gold/semantic objects; give the space a tight, well-described scope.",
+            "Prefer gold/semantic objects; give the agent a tight, well-described scope.",
             "Maintain a benchmark question set to catch regressions as you tune.",
-            "Curate instructions/examples — an uncurated space answers poorly.",
+            "Curate instructions/examples — an uncurated agent answers poorly.",
         ],
         "sources": [
-            {"title": "Curate an effective Genie space (docs)", "url": "https://docs.databricks.com/aws/en/genie/best-practices"},
-            {"title": "Set up a Genie space (docs)", "url": "https://docs.databricks.com/aws/en/genie/set-up"},
+            {"title": "Curate an effective Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/best-practices"},
+            {"title": "Set up a Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/set-up"},
         ],
     },
     "domains": {
@@ -300,12 +300,40 @@ CAPABILITIES: dict[str, dict] = {
             {"title": "System tables reference (docs)", "url": "https://docs.databricks.com/aws/en/admin/system-tables/"},
         ],
     },
+    "pages": {
+        "name": "Pages & Business Concepts",
+        "tagline": "Governed, authoritative definitions of your business concepts — cited by Genie.",
+        "what": "A Page is a governed definition of a business concept — a critical term, entity, or acronym — authored in Unity Catalog. Pages are the human-modeled layer of Genie Ontology: structured fields (domain, owner, synonyms, description) plus a rich body, linked to the metrics and tables the concept depends on. When answering, Genie One prioritizes a Page's definition over context it infers automatically and cites the Page so users can confirm the source.",
+        "technical_value": "One authoritative definition per concept that agents reason over and cite — resolving conflicting or inferred definitions and raising answer trust.",
+        "business_value": "A shared business vocabulary: everyone (and every agent) uses the same definition of 'active user', 'qualified lead', or 'net revenue', with a named owner and an auditable source.",
+        "technical_enablement": [
+            "Have an account admin enable Pages (Previews), then author Pages for your highest-traffic terms, entities, and acronyms.",
+            "Give each Page an owner and place it in the right domain/subdomain; add synonyms and link the related metrics, tables, and sources.",
+            "Publish the canonical definitions (draft Pages stay private) and certify them so Genie One prefers and cites them.",
+            "Use AI-assisted bulk import to extract terms from an existing glossary or documents, then dedupe and resolve conflicts.",
+        ],
+        "business_adoption": [
+            "Start with the handful of contested metrics that cause the most 'which number is right?' debates.",
+            "Name an owner per concept and route edit suggestions and comments through them so definitions stay trusted and current.",
+            "Review Genie One answers for citations — where it cites a Page the definition is landing; where it doesn't, author or publish one.",
+        ],
+        "best_practices": [
+            "Author Pages for the concepts people argue about first — authority beats coverage early on.",
+            "Every published Page has an owner, a domain, synonyms, and links to the metrics/tables it defines.",
+            "Publish and certify canonical definitions so Genie One cites them over inferred context; keep drafts private until they're ready.",
+            "Keep Pages fresh — a stale authoritative definition is worse than none; use the review/suggestion workflow.",
+        ],
+        "sources": [
+            {"title": "Pages (Unity Catalog Semantics docs)", "url": "https://docs.databricks.com/aws/en/uc-semantics/pages"},
+            {"title": "Introducing Genie One, Genie Agents, and Genie Ontology (blog)", "url": "https://www.databricks.com/blog/introducing-genie-one-genie-ontology-and-genie-agents"},
+        ],
+    },
 }
 
 # Display order for the Learn tab.
 CAPABILITY_ORDER = [
     "ontology", "unity_catalog", "metadata", "relationships",
-    "metric_views", "genie_spaces", "domains", "adoption",
+    "metric_views", "genie_agents", "domains", "pages", "adoption",
 ]
 
 

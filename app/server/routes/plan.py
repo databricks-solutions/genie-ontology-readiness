@@ -40,8 +40,8 @@ class PlanPdfRequest(BaseModel):
 
 
 _GROUND_TRUTH = """PRODUCT GROUND TRUTH (do not violate):
-- Genie Ontology is a LEARNED enterprise context layer built on top of the customer's governed Unity Catalog Business Semantics (metric views, glossary, domains, synonyms). The foundation FEEDS the ontology. Never describe the learned ontology layer as generally available.
-- "Preparing for Genie Ontology" = maturing UC governance, metadata, metric views/semantics, Genie Spaces, and domains."""
+- Genie Ontology is a LEARNED enterprise context layer built on top of the customer's governed Unity Catalog Business Semantics (metric views, Pages, domains, synonyms). The foundation FEEDS the ontology. Never describe the learned ontology layer as generally available.
+- "Preparing for Genie Ontology" = maturing UC governance, metadata, metric views/semantics, Genie Agents, and domains."""
 
 
 def _scorecard_digest(sc: Optional[dict]) -> str:
@@ -50,6 +50,16 @@ def _scorecard_digest(sc: Optional[dict]) -> str:
     overall = sc.get("overall", {})
     lines = [f"Overall readiness: {overall.get('score')}/100 ({overall.get('level_label')}) — {overall.get('readiness_stage')}."]
     for p in sc.get("pillars", []):
+        # Score-exempt pillars (e.g. the Beta Pages placeholder) carry no real
+        # score and are excluded from the overall number and top gaps. Present
+        # them as "not scored" so the plan LLM can still recommend them where
+        # relevant but never treats a placeholder 0 as the worst-scoring gap.
+        if p.get("score_exempt"):
+            lines.append(
+                f"- {p.get('name')}: not scored (Beta capability — include in the plan where "
+                f"relevant, but it does not affect the readiness score)"
+            )
+            continue
         sigs = ", ".join(f"{s.get('label')}={s.get('value')}{s.get('unit','')}" for s in (p.get("signals") or [])[:3])
         avail = "" if p.get("available", True) else " [not available]"
         line = f"- {p.get('name')}: {p.get('score')} ({p.get('level_label')}){avail}"
@@ -91,7 +101,7 @@ PUBLIC DATABRICKS ACCELERATORS you may recommend (only these; each is a real, Da
 Keep it tight and scannable — no filler, no generic multi-phase project plan. Produce exactly these sections:
 1. **Where you are** — 2-3 sentences on their readiness, tied to their overall score/stage and their biggest levers (the lowest-scoring, highest-weight pillars).
 2. **Top recommendations** — the 4-6 highest-impact actions, prioritized worst-gap first. Each bullet must: (a) name the specific pillar/gap it closes, (b) give the concrete technical step AND the business/ownership step, and (c) where one applies, name the relevant accelerator above with its link.
-3. **Suggested sequence** — a NUMBERED list of clear, tactical steps the customer can follow in order (what to do first → next). Each step is a concrete action (e.g. "Declare PK/FK constraints on your 8 gold fact tables"), not a theme. Where the work involves building metric views, Genie Spaces, or domain tags, follow the BUILD METHODOLOGY above — reflect its phases and non-negotiable techniques (one source per metric view, validate one measure at a time, base views for multi-fact KPIs, one focused Genie Space per domain, benchmark + regression-test). Make these specific enough to hand to a data team.
+3. **Suggested sequence** — a NUMBERED list of clear, tactical steps the customer can follow in order (what to do first → next). Each step is a concrete action (e.g. "Declare PK/FK constraints on your 8 gold fact tables"), not a theme. Where the work involves building metric views, Genie Agents, or domain tags, follow the BUILD METHODOLOGY above — reflect its phases and non-negotiable techniques (one source per metric view, validate one measure at a time, base views for multi-fact KPIs, one focused Genie Agent per domain, benchmark + regression-test). Make these specific enough to hand to a data team.
 4. **Example Genie use cases** — 2-3 realistic questions Genie could answer once the foundation is in place, each one line (the question + the metric views / tables it would use). Infer the domain from the catalog/schema names in the assessment signals if available; otherwise keep them broadly applicable and say so in a short lead-in line.
 
 Do not invent scores or accelerators that are not listed above. Be specific to the assessment numbers."""

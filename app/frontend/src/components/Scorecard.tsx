@@ -70,7 +70,7 @@ function fmtWhen(iso: string): string {
 }
 
 // Wrap a pillar name to <=~16-char lines so long titles like
-// "Semantic Layer (Business Semantics)" don't clip off the radar chart.
+// "Pages & Business Concepts" don't clip off the radar chart.
 function wrapLabel(text: string, maxChars = 16): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
@@ -143,12 +143,16 @@ export default function Scorecard({
 
   const radarData = useMemo(
     () =>
-      config.pillars.map((p) => ({
-        // Use the pillar's card title (name), not its long description, so the
-        // radar labels match the 7 pillar cards below.
-        pillar: p.name,
-        score: Math.round(pillarsByKey[p.key]?.score ?? 0),
-      })),
+      config.pillars
+        // Drop score-exempt pillars (e.g. the Beta Pages placeholder) — they
+        // carry no real score and would show as a misleading 0 on the radar.
+        .filter((p) => !pillarsByKey[p.key]?.score_exempt)
+        .map((p) => ({
+          // Use the pillar's card title (name), not its long description, so the
+          // radar labels match the scored pillar cards below.
+          pillar: p.name,
+          score: Math.round(pillarsByKey[p.key]?.score ?? 0),
+        })),
     [config.pillars, pillarsByKey]
   );
 
@@ -294,7 +298,7 @@ export default function Scorecard({
         <h2 className="text-xl font-bold text-ink-900">Assess your Genie Ontology readiness</h2>
         <p className="text-sm text-ink-600 mt-2 leading-relaxed">
           This reads your Unity Catalog metadata (catalogs, comments, constraints, metric views,
-          Genie Spaces, tags) to score your readiness across seven pillars. It runs read-only as the
+          Genie Agents, tags) to score your readiness across seven pillars. It runs read-only as the
           app's service principal and typically takes 30–60 seconds.
         </p>
       </div>
@@ -307,9 +311,9 @@ export default function Scorecard({
         <p className="text-sm text-ink-700 leading-relaxed">
           Genie Ontology is the business-aware context layer that lets Genie answer from your
           <span className="font-medium"> authoritative </span> source instead of guessing. It combines
-          the context you govern and certify — metric views, domains, and a business glossary — with
+          the context you govern and certify — metric views, domains, and Pages — with
           context Genie learns from the assets you already have (dashboards, saved queries, Genie
-          Spaces), and ranks every signal by authority so answers stay accurate, governed, and
+          Agents), and ranks every signal by authority so answers stay accurate, governed, and
           permission-aware. Getting ready for it means maturing that governed foundation, which is
           exactly what this assessment measures.
         </p>
@@ -324,7 +328,7 @@ export default function Scorecard({
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>A workspace with <span className="font-medium">Unity Catalog</span> enabled.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>A <span className="font-medium">SQL warehouse</span> for the read-only metadata queries.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>Read access for the app's <span className="font-medium">service principal</span>: <code className="text-xs">USE CATALOG</code> / <code className="text-xs">USE SCHEMA</code> / <code className="text-xs">SELECT</code> on <code className="text-xs">system.information_schema</code>, <code className="text-xs">system.access</code>, <code className="text-xs">system.query</code>, plus the catalogs you want assessed. Deploy applies these automatically; it falls back to each catalog's own <code className="text-xs">information_schema</code> if system tables aren't granted.</span></li>
-          <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">CAN_RUN</code> on your Genie Spaces so the Genie pillar can count and assess them.</span></li>
+          <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">CAN_RUN</code> on your Genie Agents so the Genie pillar can count and assess them.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>The <span className="font-medium">Plan</span> tab additionally uses your workspace's Foundation Model API to generate a plan against a saved assessment.</span></li>
         </ul>
         <p className="text-xs text-ink-400 mt-2.5">
@@ -487,29 +491,44 @@ export default function Scorecard({
           }
           const open = expanded === p.key;
           const s = levelStyle(p.level);
+          const exempt = p.score_exempt;
           return (
-            <div key={p.key} className={`card overflow-hidden ${!p.available ? 'opacity-80' : ''}`}>
+            <div key={p.key} className={`card overflow-hidden ${!p.available && !exempt ? 'opacity-80' : ''}`}>
               <button
                 onClick={() => setExpanded(open ? null : p.key)}
                 className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
               >
                 <div className="w-12 text-center shrink-0">
-                  <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
-                    {Math.round(p.score)}
-                  </div>
+                  {exempt ? (
+                    <div className="text-lg font-bold text-ink-300">—</div>
+                  ) : (
+                    <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
+                      {Math.round(p.score)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-ink-900">{p.name}</span>
-                    <LevelBadge level={p.level} label={p.level_label} />
-                    {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                    {exempt ? (
+                      <span className="text-[11px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                        Beta · not scored
+                      </span>
+                    ) : (
+                      <>
+                        <LevelBadge level={p.level} label={p.level_label} />
+                        {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                      </>
+                    )}
                   </div>
                   <p className="text-xs text-ink-500 mt-0.5 truncate">{p.short}</p>
                 </div>
                 <div className="hidden sm:block w-24 shrink-0">
-                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                    <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
-                  </div>
+                  {!exempt && (
+                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
+                    </div>
+                  )}
                 </div>
                 <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
               </button>

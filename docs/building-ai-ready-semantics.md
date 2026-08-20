@@ -1,11 +1,11 @@
 # Building AI-Ready Business Semantics
 
-A practical, self-guided method for curating **metric views**, **Genie Spaces**, and
+A practical, self-guided method for curating **metric views**, **Genie Agents**, and
 the **governed tags/domains** that make them discoverable — so an AI agent answers
 your business questions accurately and consistently.
 
 Trustworthy talk-to-data rests on a unified, curated semantic foundation. Metric
-views and Genie Spaces are the tools for building it, but they only pay off with
+views and Genie Agents are the tools for building it, but they only pay off with
 deliberate curation: the integrity of the numbers, the richness of the metadata,
 and the discipline of testing are what separate a demo from something a business
 team relies on.
@@ -30,7 +30,7 @@ roadmaps. Both describe the same five-phase process; edit them together.
 
 - The fact and dimension tables behind each KPI, governed in Unity Catalog.
 - Source documentation and the data model (tables and their relationships).
-- Permission to create metric views and Genie Spaces.
+- Permission to create metric views and Genie Agents.
 - If you are migrating an existing BI semantic model: the measure definitions and
   the reports that consume them, so nothing is silently dropped.
 
@@ -45,9 +45,9 @@ a loop you stay in as the semantic layer grows.
 |---|---|
 | 1. Prepare | A scoped KPI list mapped to its Unity Catalog sources of truth. |
 | 2. Build the semantic layer | Governed metric views — one fact source each — with rich metadata. |
-| 3. Organize by domain | Genie Spaces and metric views structured around the business. |
+| 3. Organize by domain | Genie Agents and metric views structured around the business. |
 | 4. Test incrementally | Validated measures, saved example SQL, and question benchmarks. |
-| 5. Validate & release | Regression-tested spaces, piloted with real users, feedback looping back. |
+| 5. Validate & release | Regression-tested agents, piloted with real users, feedback looping back. |
 
 ---
 
@@ -82,7 +82,7 @@ spans multiple fact tables or contains nested logic, build a **base view** first
 > unaggregated, row-level data, so the agent still has to infer the aggregation and
 > may get it wrong. A metric view **pre-defines** the aggregation, which cuts
 > hallucination risk. Once the metric view exists, **remove the raw base view and
-> tables from the Genie Space** and expose only the metric view — keeping both
+> tables from the Genie Agent** and expose only the metric view — keeping both
 > creates redundancy and ambiguity.
 
 ### Building it up
@@ -124,18 +124,18 @@ spans multiple fact tables or contains nested logic, build a **base view** first
 
 ## Phase 3 — Organize by domain, not by report
 
-**Goal: structure Genie Spaces and metric views around the business.**
+**Goal: structure Genie Agents and metric views around the business.**
 
-- **Genie Space = a business domain or subdomain** (for example, "Online
+- **Genie Agent = a business domain or subdomain** (for example, "Online
   Marketing"). **Metric view = a KPI group** within it (for example, "Conversion
   Metrics").
 - Name metric views by convention: `{subdomain}_{kpi_group}`.
-- **Tag** Genie Spaces and metric views with their domain/subdomain for
+- **Tag** Genie Agents and metric views with their domain/subdomain for
   discoverability and observability. Optionally mirror the structure in Unity
   Catalog — one schema per domain or subdomain.
-- Keep each space focused. A Genie Space supports up to **30** tables/views/metric
+- Keep each agent focused. A Genie Agent supports up to **30** tables/views/metric
   views, and the tighter the domain, the better the agent performs. As you approach
-  the limit, split the domain into more granular subdomain spaces.
+  the limit, split the domain into more granular subdomain agents.
 
 ---
 
@@ -143,18 +143,18 @@ spans multiple fact tables or contains nested logic, build a **base view** first
 
 **Goal: onboard one measure at a time, prove it, and capture what works.**
 
-- Add **one measure** to the space, ask sample questions, and validate the answer
+- Add **one measure** to the agent, ask sample questions, and validate the answer
   before adding the next.
-- Save each validated query as an **example SQL query** in the space so the agent
+- Save each validated query as an **example SQL query** in the agent so it
   reuses it or learns from it. Keep example SQL **simple** — prefer `WHERE` over
   `CASE`; complexity adds to the agent's reasoning load.
 - Leave **prompt matching** enabled on columns so the agent maps user language to
   real values and tolerates misspellings. For ambiguous categorical values, add
   exact-match filter instructions.
-- Always give the **space itself a name and a description**. Routing across multiple
-  spaces (and multi-agent setups) depends on the description to delegate a question
-  to the right space — without one, an orchestrating agent cannot reliably choose.
-- Structure space instructions as: **(1) trigger condition** — when the user asks
+- Always give the **agent itself a name and a description**. Routing across multiple
+  agents (and multi-agent setups) depends on the description to delegate a question
+  to the right agent — without one, an orchestrating agent cannot reliably choose.
+- Structure agent instructions as: **(1) trigger condition** — when the user asks
   about X; **(2) required action** — then always do Y; **(3) example** — a sample
   question and the expected behavior.
 
@@ -174,12 +174,12 @@ or easy to misread. Repeat for each KPI until the whole KPI group is covered.
 - **Re-run all benchmarks after every change** — a new measure, a new instruction.
   If a previously passing benchmark now fails, the latest addition is the likely
   cause. Use the failure analysis and fix-review tools to diagnose it.
-- Regression testing is **per space** — adding a new space does not affect existing
-  ones. If you connect multiple spaces (a supervisor or custom multi-agent system),
-  also test the **cross-space** interactions.
-- **Pilot with business users.** Share the curated space, and have testers use the
+- Regression testing is **per agent** — adding a new agent does not affect existing
+  ones. If you connect multiple agents (a supervisor or custom multi-agent system),
+  also test the **cross-agent** interactions.
+- **Pilot with business users.** Share the curated agent, and have testers use the
   built-in feedback to flag and comment on responses. Keep conversations
-  **reviewable by space managers** so curators can see the feedback — a private
+  **reviewable by agent managers** so curators can see the feedback — a private
   conversation hides the response from the curator.
 - Feed **both** regression failures and user feedback back into Phase 4. This is a
   loop, not a one-time release.
@@ -203,11 +203,11 @@ Always review generated output before you apply it.
   then the metric view on top.
 - **Validate one measure at a time** against the trusted number.
 - **Comment at view/dimension/measure level**; add **synonyms** and **format specs**.
-- **One Genie Space per domain**, under 30 items, **with a description**.
+- **One Genie Agent per domain**, under 30 items, **with a description**.
 - **Save validated queries as example SQL** and keep it simple.
 - **Instructions:** trigger → action → example.
 - **Benchmark** 2–4 phrasings per question with ground-truth SQL; **regression-test
   after every change**.
-- **Name** metric views `{subdomain}_{kpi_group}`; **tag** spaces and metric views
+- **Name** metric views `{subdomain}_{kpi_group}`; **tag** agents and metric views
   with their domain.
 - **Certify** canonical assets and **name a steward** per domain.

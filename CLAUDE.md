@@ -12,7 +12,7 @@ Bundles** + `post_deploy.py`.
 
 > **Product accuracy:** Genie Ontology is the *learned* enterprise context layer
 > (gated / Private Preview) built on top of the customer's *governed* UC Business
-> Semantics (metric views, glossary, domains — largely GA). The foundation
+> Semantics (metric views, Pages, domains — largely GA). The foundation
 > **feeds** the ontology. The app never positions the learned layer as GA.
 
 ## Prerequisites
@@ -104,14 +104,14 @@ catalog-level SELECT is needed). Pillars whose data the SP can't read degrade
 gracefully to "not available" plus a self-assessment fallback — they never crash
 the app.
 
-**Genie Spaces (pillar 5):** Genie Spaces have their own ACLs. The app needs
-`CAN_RUN` on a space to **list and count** it. Reading a space's **curation
+**Genie Agents (pillar 5):** Genie Agents have their own ACLs. The app needs
+`CAN_RUN` on an agent to **list and count** it. Reading an agent's **curation
 detail** (instructions, sample questions, example/verified SQL, functions,
-benchmarks) comes from the space's serialized definition, which Databricks gates
-behind **`CAN_EDIT`** — so the per-space curation breakdown is best-effort: the
-app assesses whatever spaces it can read and reports the rest as "curation not
+benchmarks) comes from the agent's serialized definition, which Databricks gates
+behind **`CAN_EDIT`** — so the per-agent curation breakdown is best-effort: the
+app assesses whatever agents it can read and reports the rest as "curation not
 assessed (needs CAN_EDIT)" rather than as uncurated. Granting an app SP
-`CAN_EDIT` across every space is a heavy ask; for a lighter footprint, grant
+`CAN_EDIT` across every agent is a heavy ask; for a lighter footprint, grant
 `CAN_RUN` (counts only) and rely on the self-assessment for curation depth, or
 have an editor run the deep pass.
 
@@ -146,7 +146,7 @@ databricks.yml               — DABs: app + sql-warehouse resource
 ## Readiness pillars (each scored 0-4)
 
 Unity Catalog Foundation · Metadata Richness · Relationships & Modeling ·
-Semantic Layer (Business Semantics) · Genie Spaces · Domains & Stewardship ·
+Metrics · Genie Agents · Domains & Stewardship · Pages & Business Concepts ·
 Adoption & Activity. The overall score maps to a **Genie Foundations** session
 ("Ready for Session 2 — Genie Room Setup", etc.).
 

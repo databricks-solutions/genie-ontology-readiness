@@ -1,4 +1,4 @@
-"""Genie endpoints — optionally test answer quality against a configured Genie Space.
+"""Genie endpoints — optionally test answer quality against a configured Genie Agent.
 
 Set GENIE_SPACE_ID to enable. Used in pillar 5 to demonstrate live value.
 """
@@ -27,8 +27,8 @@ class GenieMessageRequest(BaseModel):
 
 
 @router.get("/genie/spaces")
-async def list_genie_spaces():
-    """List Genie Spaces visible to the app (for the pillar 5 detail view)."""
+async def list_genie_agents():
+    """List Genie Agents visible to the app (for the pillar 5 detail view)."""
     host = get_workspace_host()
     headers = get_auth_headers()
     if not host or not headers:
@@ -42,7 +42,7 @@ async def list_genie_spaces():
                 raw = data.get("spaces", []) or data.get("data", []) or []
                 return {"spaces": [{"id": s.get("space_id") or s.get("id"), "title": s.get("title") or s.get("name")} for s in raw]}
     except Exception as e:
-        logger.warning(f"list_genie_spaces failed: {e}")
+        logger.warning(f"list_genie_agents failed: {e}")
         return {"spaces": [], "note": str(e)[:120]}
 
 
