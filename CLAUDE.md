@@ -68,7 +68,11 @@ Lakebase instance, attaches the `lakebase-db` app resource, and pins the
 connection env. Assessment history and generated plans are then persisted
 **per user** (keyed by the `X-Forwarded-Email` identity Databricks Apps inject)
 and survive across sessions. Scores are a deterministic function of the technical
-findings, so repeated runs on the same workspace are directly comparable.
+findings, so repeated runs on the same workspace are directly comparable **for a
+given identity**. Under OBO the findings reflect the viewing user's grants, so
+signals gated behind grants a viewer lacks (notably the workspace-wide Adoption
+system tables) can read lower for a restricted viewer than for the SP — use
+`FORCE_SP=true` when you need a single, viewer-independent workspace-wide score.
 
 ## Auth: on-behalf-of-user by default, service-principal fallback
 

@@ -923,7 +923,10 @@ async def probe_adoption() -> dict:
             queries_30d = None
 
         if active_users is None and queries_30d is None:
-            return _empty("System tables (system.access / system.query) are not enabled or not granted to the app SP.")
+            who = ("your user account" if get_user_token()
+                   else "the app service principal")
+            return _empty("System tables (system.access / system.query) are not enabled "
+                          f"or not granted to {who}.")
 
         # Band the (time-windowed) activity counts into fixed tiers so day-to-day
         # drift rarely moves the score — keeps runs comparable while still

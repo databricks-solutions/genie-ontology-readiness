@@ -38,12 +38,31 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     if not get_user_token():
         return await _execute_once(query, parameters, force_sp=True)
 
-    # Default: try OBO (as the viewer); fall back to the SP on any failure.
+    # Default: try OBO (as the viewer). Fall back to the SP only when the failure
+    # looks like an AUTHORIZATION gap (the case the SP can actually cover). Other
+    # failures (timeout, bad SQL, warehouse down) would fail identically as the SP,
+    # so re-raise them instead of doubling latency with a pointless retry.
     try:
         return await _execute_once(query, parameters, force_sp=False)
     except Exception as e:
-        logger.warning(f"OBO read failed ({str(e)[:160]}); falling back to app SP")
+        if not _is_authz_error(e):
+            raise
+        logger.warning(f"OBO read denied ({str(e)[:160]}); falling back to app SP")
         return await _execute_once(query, parameters, force_sp=True)
+
+
+# Substrings that mark a failure as an authorization/permission problem — the only
+# case where retrying as the app SP can succeed. Matched case-insensitively against
+# the SQL Warehouse / Statement Execution error text.
+_AUTHZ_MARKERS = (
+    "permission_denied", "does not have", "not authorized", "access denied",
+    "forbidden", "insufficient priv", "unauthorized", " 403", "requires", "no permission",
+)
+
+
+def _is_authz_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _AUTHZ_MARKERS)
 
 
 async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool) -> list[dict]:

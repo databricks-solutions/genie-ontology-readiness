@@ -37,6 +37,17 @@ def set_user_token(token: str | None) -> None:
 
 
 def get_user_token() -> str | None:
+    """The forwarded end-user token for this request, or None when OBO is not the
+    effective identity.
+
+    Under the deploy-time ``FORCE_SP`` override, OBO is disabled app-wide, so we
+    report None even if a token was forwarded. This makes FORCE_SP a single source
+    of truth: every identity decision keyed off this — auth headers (SQL *and* REST
+    reads via get_auth_headers), the SP source-resolution cache, and the
+    identity-aware user messaging — treats the SP as the identity.
+    """
+    if FORCE_SP:
+        return None
     return _user_token.get()
 
 # Detect if running inside Databricks Apps
@@ -118,15 +129,17 @@ def get_auth_headers(force_sp: bool = False) -> dict:
 
     Returns a dict like {"Authorization": "Bearer <token>"}.
 
-    On-behalf-of-user: unless ``force_sp`` is set, a forwarded end-user token (if
-    present for this request) is used so the query runs with the viewer's Unity
-    Catalog permissions. ``force_sp=True`` always uses the app service principal
-    (the SP-only override — e.g. Genie REST / Lakebase). The OBO-first-with-SP-
-    fallback policy lives in ``sql_client.execute_sql``.
+    On-behalf-of-user: unless ``force_sp`` is set (or the ``FORCE_SP`` deploy knob
+    is on, which get_user_token() reflects), a forwarded end-user token is used so
+    the read runs with the viewer's permissions. ``force_sp=True`` always uses the
+    app service principal (the SP-only override — e.g. Genie REST / Lakebase). The
+    OBO-first-with-SP-fallback policy for SQL lives in ``sql_client.execute_sql``.
     """
-    # On-behalf-of-user (Databricks Apps user authorization)
+    # On-behalf-of-user (Databricks Apps user authorization). get_user_token()
+    # returns None under the FORCE_SP override, so REST reads that call this
+    # directly (Genie/domains/serving) also honor SP-only mode — not just execute_sql.
     if not force_sp:
-        user_token = _user_token.get()
+        user_token = get_user_token()
         if user_token:
             return {"Authorization": f"Bearer {user_token}"}
 
