@@ -8,6 +8,7 @@ import type {
   PlanListItem,
   PlanDetail,
   PlanSaveResponse,
+  Scorecard as ScorecardType,
 } from '../types';
 import Markdown from './Markdown';
 import Spinner from './Spinner';
@@ -19,7 +20,16 @@ function fmtWhen(iso: string): string {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-export default function PlanWizard({ model, active }: { model: string; active: boolean }) {
+export default function PlanWizard({
+  model,
+  active,
+  scorecard,
+}: {
+  model: string;
+  active: boolean;
+  scorecard: ScorecardType | null;
+}) {
+
   const [assessments, setAssessments] = useState<HistorySnapshot[]>([]);
   const [plans, setPlans] = useState<PlanListItem[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<number | null>(null);
@@ -30,6 +40,11 @@ export default function PlanWizard({ model, active }: { model: string; active: b
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [currentPlanId, setCurrentPlanId] = useState<number | null>(null);
+
+  // No saved history (e.g. no Lakebase) but an assessment was run this session →
+  // generate the plan from that in-session scorecard instead of a stored snapshot.
+  const fromCurrent = assessments.length === 0 && !!scorecard;
+  const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
 
   function refreshPlans() {
     apiGet<PlansResponse>('/plan/list').then((r) => setPlans(r.plans || [])).catch(() => {});
@@ -83,29 +98,32 @@ export default function PlanWizard({ model, active }: { model: string; active: b
   }
 
   async function generate() {
-    if (generating || selectedSnapshotId == null) return;
+    // Need either a selected saved snapshot, or an in-session assessment to use.
+    if (generating || (!fromCurrent && selectedSnapshotId == null)) return;
     setError(null);
     setOutput('');
     setCurrentPlanId(null);
     setGenerating(true);
     let acc = '';
+    // Generate from the in-session scorecard when there's no saved history,
+    // otherwise from the selected saved snapshot.
+    const genBody = fromCurrent ? { scorecard } : { snapshot_id: selectedSnapshotId };
     try {
-      for await (const chunk of streamPost('/plan/generate', { snapshot_id: selectedSnapshotId }, model)) {
+      for await (const chunk of streamPost('/plan/generate', genBody, model)) {
         acc += chunk;
         setOutput(acc);
       }
       if (acc.trim()) {
         try {
-          const res = await apiPost<PlanSaveResponse>(
-            '/plan/save',
-            { snapshot_id: selectedSnapshotId, title: titleFor(selectedSnapshotId), markdown: acc },
-            model
-          );
+          const saveBody = fromCurrent
+            ? { snapshot_id: null, title: PLAN_TITLE, markdown: acc }
+            : { snapshot_id: selectedSnapshotId, title: titleFor(selectedSnapshotId), markdown: acc };
+          const res = await apiPost<PlanSaveResponse>('/plan/save', saveBody, model);
           if (res.id != null) setCurrentPlanId(res.id);
           setMode('view');
           refreshPlans();
         } catch {
-          /* saving is best-effort; the plan is still shown */
+          /* saving is best-effort (needs Lakebase); the plan is still shown */
         }
       }
     } catch (e) {
@@ -160,8 +178,8 @@ export default function PlanWizard({ model, active }: { model: string; active: b
     }
   }
 
-  // No assessments yet → point the user at the Assess tab.
-  if (assessments.length === 0) {
+  // No saved assessments AND nothing run this session → point the user at Assess.
+  if (assessments.length === 0 && !scorecard) {
     return (
       <div className="card max-w-2xl mx-auto mt-10 p-8 text-center">
         <div className="w-12 h-12 rounded-xl bg-databricks-50 flex items-center justify-center mx-auto mb-4">
@@ -226,25 +244,33 @@ export default function PlanWizard({ model, active }: { model: string; active: b
             </div>
             <h2 className="text-xl font-bold text-ink-900">Generate an action plan</h2>
             <p className="text-sm text-ink-600 mt-2 leading-relaxed">
-              Pick the assessment to base this plan on. The plan is generated with AI from that
-              assessment's scores and gaps, with clear tactical steps and the Databricks accelerators
-              that close each gap.
+              {fromCurrent
+                ? 'The plan is generated with AI from your current assessment’s scores and gaps, with clear tactical steps and the Databricks accelerators that close each gap.'
+                : 'Pick the assessment to base this plan on. The plan is generated with AI from that assessment’s scores and gaps, with clear tactical steps and the Databricks accelerators that close each gap.'}
             </p>
 
             <label className="block mt-5 text-xs font-semibold uppercase tracking-wider text-ink-400 mb-1.5">
               Base assessment
             </label>
-            <select
-              value={selectedSnapshotId ?? ''}
-              onChange={(e) => setSelectedSnapshotId(Number(e.target.value))}
-              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
-            >
-              {assessments.map((a) => (
-                <option key={a.id} value={Number(a.id)}>
-                  {Math.round(a.overall_score)}/100 · {fmtWhen(a.created_at)}
-                </option>
-              ))}
-            </select>
+            {fromCurrent ? (
+              <div className="w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-ink-700 flex items-center gap-2">
+                <Gauge size={14} className="text-databricks-500 shrink-0" />
+                Current assessment{currentScore != null ? ` · ${currentScore}/100` : ''}
+                <span className="text-ink-400">(this session)</span>
+              </div>
+            ) : (
+              <select
+                value={selectedSnapshotId ?? ''}
+                onChange={(e) => setSelectedSnapshotId(Number(e.target.value))}
+                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
+              >
+                {assessments.map((a) => (
+                  <option key={a.id} value={Number(a.id)}>
+                    {Math.round(a.overall_score)}/100 · {fmtWhen(a.created_at)}
+                  </option>
+                ))}
+              </select>
+            )}
 
             {error && (
               <p className="mt-4 text-sm text-red-600 flex items-center gap-1.5">
@@ -254,13 +280,18 @@ export default function PlanWizard({ model, active }: { model: string; active: b
 
             <button
               onClick={generate}
-              disabled={generating || selectedSnapshotId == null}
+              disabled={generating || (!fromCurrent && selectedSnapshotId == null)}
               className="btn-primary mt-5 inline-flex items-center gap-2"
             >
               <Sparkles size={16} />
               {generating ? 'Generating…' : 'Generate plan'}
             </button>
-            <p className="text-xs text-ink-400 mt-3">Uses your workspace's Foundation Model API. The plan is saved to your history.</p>
+            <p className="text-xs text-ink-400 mt-3">
+              Uses your workspace's Foundation Model API.{' '}
+              {fromCurrent
+                ? 'No Lakebase is attached, so this plan lives only in this session (export it to keep a copy).'
+                : 'The plan is saved to your history.'}
+            </p>
           </div>
         ) : (
           // ---- Viewing / streaming a plan ----------------------------------
@@ -281,7 +312,10 @@ export default function PlanWizard({ model, active }: { model: string; active: b
               )}
             </div>
             <p className="text-xs text-ink-400 flex items-center gap-1 mb-4">
-              <Link2 size={11} /> Based on assessment · {labelForSnapshot(selectedSnapshotId)}
+              <Link2 size={11} /> Based on assessment ·{' '}
+              {fromCurrent
+                ? `Current assessment${currentScore != null ? ` · ${currentScore}/100` : ''}`
+                : labelForSnapshot(selectedSnapshotId)}
             </p>
 
             {error && (

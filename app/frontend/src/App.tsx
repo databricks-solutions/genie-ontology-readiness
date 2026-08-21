@@ -121,7 +121,7 @@ export default function App() {
         </div>
         {planMounted && (
           <div className={tab === 'plan' ? '' : 'hidden'}>
-            <PlanWizard model={activeModel} active={tab === 'plan'} />
+            <PlanWizard model={activeModel} active={tab === 'plan'} scorecard={scorecard} />
           </div>
         )}
         {tab === 'learn' && <CapabilityExplainer scorecard={scorecard} />}
