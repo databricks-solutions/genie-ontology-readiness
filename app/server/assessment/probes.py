@@ -71,7 +71,8 @@ async def _scalar(query: str, force_sp: bool = False):
     format, so COUNT(*) comes back as e.g. "8" — coerce to int/float so callers
     can compare numerically.
 
-    ``force_sp=True`` runs as the app service principal (for system-table reads).
+    ``force_sp=True`` is the SP-only override; by default reads run OBO with an
+    automatic SP fallback (see ``execute_sql``).
     """
     rows = await execute_sql(query, force_sp=force_sp)
     if not rows:
@@ -903,10 +904,11 @@ async def probe_adoption() -> dict:
     try:
         active_users = None
         try:
+            # System tables default to OBO like every other signal; if the viewer
+            # lacks the grant, execute_sql falls back to the app SP automatically.
             active_users = await _scalar(
                 "SELECT COUNT(DISTINCT user_identity.email) FROM system.access.audit "
                 "WHERE event_date >= current_date() - INTERVAL 30 DAYS",
-                force_sp=True,  # system tables: the SP is granted; an OBO viewer may not be
             )
         except Exception:
             active_users = None
@@ -916,7 +918,6 @@ async def probe_adoption() -> dict:
             queries_30d = await _scalar(
                 "SELECT COUNT(*) FROM system.query.history "
                 "WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS",
-                force_sp=True,
             )
         except Exception:
             queries_30d = None

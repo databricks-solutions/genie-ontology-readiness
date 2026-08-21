@@ -3,15 +3,19 @@
 This app reads the *customer's existing* environment to assess Genie Ontology
 readiness. It does not seed demo data.
 
-Auth is hybrid:
-  - By default reads run as the app **service principal** (SP).
-  - If Databricks Apps **user authorization** (on-behalf-of-user) is enabled and
-    a user token is forwarded (``x-forwarded-access-token``), metadata reads run
-    as the **logged-in user** — inheriting their Unity Catalog permissions, so
-    the SP need not be granted on every catalog. The per-request token is held in
-    a contextvar; ``get_auth_headers(force_sp=True)`` opts back to the SP for
-    system-table reads (``system.access`` / ``system.query``) that the SP is
-    granted but an arbitrary viewer may not be.
+Auth is on-behalf-of-user (OBO) by default:
+  - When Databricks Apps **user authorization** is enabled and a user token is
+    forwarded (``x-forwarded-access-token``), every signal runs as the
+    **logged-in user**, inheriting their Unity Catalog permissions — so the app
+    SP need not be granted on every catalog. The per-request token is held in a
+    contextvar.
+  - If an OBO read fails (e.g. the viewer lacks a grant the SP holds, such as
+    system tables), ``execute_sql`` transparently **falls back to the app SP**.
+  - ``get_auth_headers(force_sp=True)`` is the SP-only override, for reads the
+    OBO token can't perform (Genie REST API — not covered by the ``sql`` scope;
+    Lakebase credential minting — the SP owns the Postgres role).
+  - With no forwarded token (local dev / unattended / scheduled), reads run as
+    the SP directly.
 """
 
 import os
@@ -52,6 +56,13 @@ SCHEMA = os.environ.get("SCHEMA_NAME", "information_schema")
 ASSESS_CATALOGS = [
     c.strip() for c in os.environ.get("ASSESS_CATALOGS", "").split(",") if c.strip()
 ]
+
+# Deploy-time identity override. When true, EVERY read runs as the app service
+# principal and OBO is never attempted, even if a viewer token is forwarded.
+# Off by default (OBO-first with SP fallback — see sql_client.execute_sql). Set
+# via the FORCE_SP env in app.yml, e.g. to guarantee consistent, workspace-wide
+# system-table signals regardless of the viewer's grants.
+FORCE_SP = os.environ.get("FORCE_SP", "false").lower() == "true"
 
 # Lakebase toggle — only used to persist assessment snapshots over time.
 # Defaults OFF so the app deploys stateless into any workspace.
@@ -110,7 +121,8 @@ def get_auth_headers(force_sp: bool = False) -> dict:
     On-behalf-of-user: unless ``force_sp`` is set, a forwarded end-user token (if
     present for this request) is used so the query runs with the viewer's Unity
     Catalog permissions. ``force_sp=True`` always uses the app service principal
-    (for system-table reads the SP is granted but the viewer may not be).
+    (the SP-only override — e.g. Genie REST / Lakebase). The OBO-first-with-SP-
+    fallback policy lives in ``sql_client.execute_sql``.
     """
     # On-behalf-of-user (Databricks Apps user authorization)
     if not force_sp:

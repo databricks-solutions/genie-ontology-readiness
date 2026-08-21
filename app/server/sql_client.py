@@ -4,7 +4,7 @@ import aiohttp
 import asyncio
 import logging
 from typing import Any, Optional
-from server.config import get_workspace_host, get_auth_headers, WAREHOUSE_ID, CATALOG, SCHEMA
+from server.config import get_workspace_host, get_auth_headers, get_user_token, FORCE_SP, WAREHOUSE_ID, CATALOG, SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -12,13 +12,42 @@ logger = logging.getLogger(__name__)
 async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
-    Uses the Statement Execution API:
-    POST /api/2.0/sql/statements
+    Identity model — every signal defaults to on-behalf-of-user (OBO):
 
-    ``force_sp=True`` runs as the app service principal even when a forwarded
-    end-user token is present — use it for system-table reads (system.access /
-    system.query) that the SP is granted but an arbitrary viewer may not be.
+    * ``force_sp=True`` is the **override**: run as the app service principal and
+      never attempt OBO (for reads the OBO token can't do — e.g. the Genie REST
+      API, which the ``sql`` scope doesn't cover, or Lakebase credential minting).
+    * Otherwise, when a forwarded end-user token is present, run **as the viewer**
+      (OBO). If that read fails (typically because the viewer lacks a grant the
+      app SP holds — e.g. system tables), transparently **fall back to the SP**.
+    * With no forwarded token (local dev / unattended / scheduled), there is no
+      OBO identity, so the read runs as the SP directly.
+    * The deploy-time ``FORCE_SP`` knob (config) forces SP-only mode for the whole
+      app — OBO is never attempted — regardless of a forwarded token.
+
+    NOTE: the SP fallback trades a little of the "reflects exactly what *you* can
+    see" OBO promise for completeness — a viewer may see a signal via the SP that
+    they couldn't read themselves. That is the intended behaviour here.
     """
+    # Override: SP only, no OBO attempt, no fallback. Either the per-call override
+    # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
+    if force_sp or FORCE_SP:
+        return await _execute_once(query, parameters, force_sp=True)
+
+    # No forwarded viewer token → nothing to run OBO as; go straight to the SP.
+    if not get_user_token():
+        return await _execute_once(query, parameters, force_sp=True)
+
+    # Default: try OBO (as the viewer); fall back to the SP on any failure.
+    try:
+        return await _execute_once(query, parameters, force_sp=False)
+    except Exception as e:
+        logger.warning(f"OBO read failed ({str(e)[:160]}); falling back to app SP")
+        return await _execute_once(query, parameters, force_sp=True)
+
+
+async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool) -> list[dict]:
+    """Run the query once with a single resolved identity (OBO or SP)."""
     host = get_workspace_host()
     auth_headers = get_auth_headers(force_sp=force_sp)
 

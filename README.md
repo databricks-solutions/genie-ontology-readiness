@@ -57,16 +57,21 @@ assessment needs, local development, optional Lakebase history, and branding.
 ## Permissions required
 
 The app reads only **metadata** (`information_schema`, tags) and **system tables**
-(`system.access.*`, `system.query.*`) — never your actual table data. It can run two
-ways, and **every signal uses the same identity**:
+(`system.access.*`, `system.query.*`) — never your actual table data. Every signal
+defaults to **on-behalf-of-user (OBO)** with an automatic **SP fallback**:
 
 - **Interactive** — a person viewing the app. With **on-behalf-of-user (OBO)**
-  authorization enabled, **all reads run as the viewing user** (their own Unity
-  Catalog + system-table grants), so the app SP does not need any grants. The
-  assessment reflects exactly what *you* can see.
+  authorization enabled, **every signal runs as the viewing user** (their own Unity
+  Catalog + system-table grants), so the assessment reflects exactly what *you* can
+  see. If a given read fails because you lack a grant the app SP holds (system
+  tables are the common case), that read **falls back to the app SP** rather than
+  dropping the signal.
 - **Scheduled / unattended** — snapshot history or any background run with no user
-  present (also local dev). Every read falls back to the app **service principal
-  (SP)**, so the SP must hold the grants below.
+  present (also local dev). With no forwarded token every read runs as the app
+  **service principal (SP)**, so the SP must hold the grants below.
+
+A few reads are **always** the SP (they can't run OBO): the Genie REST API (not
+covered by the `sql` user scope) and Lakebase credential minting.
 
 ### Who needs what
 
@@ -79,6 +84,23 @@ ways, and **every signal uses the same identity**:
 | Adoption & Activity | `system.access.audit`, `system.query.history` | `USE`+`SELECT` on `system.access` and `system.query` |
 | Top‑10 most‑accessed + certified | `system.access.table_lineage` + `information_schema.table_tags` | `USE`+`SELECT` on `system.access` + catalog metadata |
 | Plan / Assistant (LLM) | Foundation Model API | model serving / FMAPI enabled for the workspace |
+
+> [!NOTE]
+> **SP fallback.** Under OBO each signal is attempted **as the viewer first**. If
+> that read fails — most commonly because the viewer lacks a grant the app SP holds
+> (system tables such as `system.access` / `system.query`) — the app **transparently
+> retries the same read as the service principal** instead of dropping the signal.
+> This means a signal can appear in the assessment even when the viewer can't read
+> it directly, *provided the SP is granted*. If neither the viewer nor the SP holds
+> the grant, the signal degrades to "not available." The fallback is per-read and
+> lives in `app/server/sql_client.py` (`execute_sql`); the SP-only reads that never
+> attempt OBO (Genie REST, Lakebase) are opted out with `force_sp=True`.
+>
+> **SP-only mode.** To disable OBO entirely at deploy time, set the `FORCE_SP=true`
+> env (in `app.yml`, or `export FORCE_SP=true` before `post_deploy.py`). Every read
+> then runs as the app SP regardless of any forwarded viewer token — useful when you
+> want consistent, workspace-wide system-table signals (e.g. Adoption) that don't
+> vary by who's viewing. The SP must hold the grants below. Default is `false`.
 
 `scripts/setup_app_permissions.py` (run by `post_deploy.py`) applies the SP grants; see
 **[CLAUDE.md](./CLAUDE.md)** for the exact statements and the OBO details.

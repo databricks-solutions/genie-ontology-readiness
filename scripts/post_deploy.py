@@ -11,6 +11,7 @@ Usage:
     #   export ASSESS_CATALOGS="cat_a,cat_b"
     #   export GENIE_SPACE_ID=<id>
     #   export BRAND_NAME="Acme"
+    #   export FORCE_SP=true                         # SP-only mode (never attempt OBO)
     #   export USE_LAKEBASE=true                     # enable per-user history/plans
     #   export LAKEBASE_INSTANCE_NAME=<instance>     # existing Lakebase instance to reuse
     #   export LAKEBASE_DATABASE=ontology_readiness
@@ -56,6 +57,7 @@ def render_app_yml():
     set_env("ASSESS_CATALOGS", os.environ.get("ASSESS_CATALOGS", ""))
     set_env("GENIE_SPACE_ID", os.environ.get("GENIE_SPACE_ID", ""))
     set_env("BRAND_NAME", os.environ.get("BRAND_NAME", "Databricks"))
+    set_env("FORCE_SP", os.environ.get("FORCE_SP", "false"))
     set_env("USE_LAKEBASE", "true" if (USE_LAKEBASE and _LAKEBASE["host"]) else "false")
     set_env("LAKEBASE_HOST", _LAKEBASE["host"])
     set_env("LAKEBASE_USER", _LAKEBASE["sp_client_id"])
