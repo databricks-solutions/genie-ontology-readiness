@@ -4,8 +4,8 @@ A self-contained Databricks App that helps a customer **prepare for Genie Ontolo
 Deploy it into a workspace and it will:
 
 - **Assess** the live environment and score maturity across the readiness pillars
-  Genie Ontology depends on (Unity Catalog, metadata, relationships, metric views /
-  Business Semantics, Genie Spaces, domains, adoption).
+  Genie Ontology depends on (Unity Catalog, metadata, relationships, metrics /
+  metric views, Genie Agents, domains, adoption).
 - **Explain** each capability from a **technical** and a **business** standpoint, with
   accurate GA / preview status.
 - **Recommend** best practices for both technical enablement and business adoption.
@@ -73,9 +73,9 @@ ways, and **every signal uses the same identity**:
 | Assessment area | Reads from | Grant needed (held by the **viewer** under OBO, or by the **SP** when unattended) |
 |---|---|---|
 | Run any query | SQL warehouse | `CAN USE` on the warehouse |
-| UC Foundation · Metadata · Relationships · Semantic Layer · Domains (tags) | catalog / `system.information_schema` | `BROWSE` on each assessed catalog (metadata-only, least privilege) — or `USE CATALOG`+`USE SCHEMA`+`SELECT` |
+| UC Foundation · Metadata · Relationships · Metrics · Domains (tags) | catalog / `system.information_schema` | `BROWSE` on each assessed catalog (metadata-only, least privilege) — or `USE CATALOG`+`USE SCHEMA`+`SELECT` |
 | "Not in Unity Catalog" coverage | `hive_metastore.information_schema` | read on `hive_metastore` (if legacy access is enabled) |
-| Genie Spaces (count + activity) | `system.access.audit` (`aibiGenie` events) | `USE`+`SELECT` on `system.access` |
+| Genie Agents (count + activity) | `system.access.audit` (`aibiGenie` events) | `USE`+`SELECT` on `system.access` |
 | Adoption & Activity | `system.access.audit`, `system.query.history` | `USE`+`SELECT` on `system.access` and `system.query` |
 | Top‑10 most‑accessed + certified | `system.access.table_lineage` + `information_schema.table_tags` | `USE`+`SELECT` on `system.access` + catalog metadata |
 | Plan / Assistant (LLM) | Foundation Model API | model serving / FMAPI enabled for the workspace |

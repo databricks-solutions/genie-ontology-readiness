@@ -70,7 +70,7 @@ function fmtWhen(iso: string): string {
 }
 
 // Wrap a pillar name to <=~16-char lines so long titles like
-// "Semantic Layer (Business Semantics)" don't clip off the radar chart.
+// "Relationships & Modeling" don't clip off the radar chart.
 function wrapLabel(text: string, maxChars = 16): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
@@ -294,7 +294,7 @@ export default function Scorecard({
         <h2 className="text-xl font-bold text-ink-900">Assess your Genie Ontology readiness</h2>
         <p className="text-sm text-ink-600 mt-2 leading-relaxed">
           This reads your Unity Catalog metadata (catalogs, comments, constraints, metric views,
-          Genie Spaces, tags) to score your readiness across seven pillars. It runs read-only as the
+          Genie Agents, tags) to score your readiness across seven pillars. It runs read-only as the
           app's service principal and typically takes 30–60 seconds.
         </p>
       </div>
@@ -307,9 +307,9 @@ export default function Scorecard({
         <p className="text-sm text-ink-700 leading-relaxed">
           Genie Ontology is the business-aware context layer that lets Genie answer from your
           <span className="font-medium"> authoritative </span> source instead of guessing. It combines
-          the context you govern and certify — metric views, domains, and a business glossary — with
+          the context you govern and certify — metric views, domains, and Pages — with
           context Genie learns from the assets you already have (dashboards, saved queries, Genie
-          Spaces), and ranks every signal by authority so answers stay accurate, governed, and
+          Agents), and ranks every signal by authority so answers stay accurate, governed, and
           permission-aware. Getting ready for it means maturing that governed foundation, which is
           exactly what this assessment measures.
         </p>
@@ -324,7 +324,7 @@ export default function Scorecard({
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>A workspace with <span className="font-medium">Unity Catalog</span> enabled.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>A <span className="font-medium">SQL warehouse</span> for the read-only metadata queries.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>Read access for the app's <span className="font-medium">service principal</span>: <code className="text-xs">USE CATALOG</code> / <code className="text-xs">USE SCHEMA</code> / <code className="text-xs">SELECT</code> on <code className="text-xs">system.information_schema</code>, <code className="text-xs">system.access</code>, <code className="text-xs">system.query</code>, plus the catalogs you want assessed. Deploy applies these automatically; it falls back to each catalog's own <code className="text-xs">information_schema</code> if system tables aren't granted.</span></li>
-          <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">CAN_RUN</code> on your Genie Spaces so the Genie pillar can count and assess them.</span></li>
+          <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">CAN_RUN</code> on your Genie Agents so the Genie pillar can count and assess them.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>The <span className="font-medium">Plan</span> tab additionally uses your workspace's Foundation Model API to generate a plan against a saved assessment.</span></li>
         </ul>
         <p className="text-xs text-ink-400 mt-2.5">

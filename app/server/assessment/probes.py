@@ -459,7 +459,7 @@ async def probe_relationships() -> dict:
 # ---------------------------------------------------------------------------
 # 4. Semantic layer (metric views)
 # ---------------------------------------------------------------------------
-async def probe_semantic_layer() -> dict:
+async def probe_metrics() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
     if tbl is None:
@@ -483,7 +483,7 @@ async def probe_semantic_layer() -> dict:
             return {
                 "available": True,
                 "score": 0.0,
-                "signals": [{"label": "Metric views", "value": 0, "detail": "UC metric views (Business Semantics)"}],
+                "signals": [{"label": "Metric views", "value": 0, "detail": "UC metric views"}],
                 "gaps": ["No metric views found. Metric views are the GA foundation that feeds Genie Ontology — define KPIs centrally here."],
                 "note": None,
                 "metrics": {"metric_views": 0},
@@ -509,7 +509,7 @@ async def probe_semantic_layer() -> dict:
 
         # Build signals
         signals = [
-            {"label": "Metric views", "value": metric_views, "detail": "UC metric views (Business Semantics)"}
+            {"label": "Metric views", "value": metric_views, "detail": "UC metric views"}
         ]
         if metric_views > 0:
             signals.append({
@@ -539,12 +539,12 @@ async def probe_semantic_layer() -> dict:
             "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
         }
     except Exception as e:
-        logger.warning(f"probe_semantic_layer failed: {e}")
+        logger.warning(f"probe_metrics failed: {e}")
         return _empty(f"Could not count metric views ({str(e)[:120]}).")
 
 
 # ---------------------------------------------------------------------------
-# 5. Genie Spaces (REST) — deep curation assessment
+# 5. Genie Agents (REST) — deep curation assessment
 # ---------------------------------------------------------------------------
 _MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
 
@@ -606,16 +606,16 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
 # Reading a space's curation (serialized_space) requires CAN_EDIT; listing/asking
 # only needs CAN_RUN. So the deep per-space breakdown is best-effort: we assess
 # whatever the app can read and never report a space we can't read as "uncurated".
-_EDIT_HINT = ("Reading a space's curation detail requires CAN_EDIT on that space; the app only needs "
-              "CAN_RUN to list and count spaces. Grant the app service principal CAN_EDIT on the "
-              "spaces you want curation-assessed (or run this assessment as a user who can edit them).")
+_EDIT_HINT = ("Reading an agent's curation detail requires CAN_EDIT on that agent; the app only needs "
+              "CAN_RUN to list and count agents. Grant the app service principal CAN_EDIT on the "
+              "agents you want curation-assessed (or run this assessment as a user who can edit them).")
 
 
 async def _genie_audit_counts() -> dict:
     """Best-effort Genie usage from the audit system table.
 
     system.access.audit records Genie activity under service_name='aibiGenie'
-    with the space id in request_params.space_id. The count of Genie Spaces is
+    with the space id in request_params.space_id. The count of Genie Agents is
     the number of distinct space_ids, excluding any space that has ever been
     trashed (a `trashSpace` action; there is no deleteSpace — see the docs at
     https://docs.databricks.com/aws/en/ai-bi/admin/audit).
@@ -650,16 +650,16 @@ async def _genie_audit_counts() -> dict:
 def _genie_audit_signals(audit: dict) -> list:
     sig = []
     if audit.get("total") is not None:
-        sig.append({"label": "Genie Spaces", "value": audit["total"],
-                    "detail": "Distinct existing spaces in system.access.audit (aibiGenie)"})
+        sig.append({"label": "Genie Agents", "value": audit["total"],
+                    "detail": "Distinct existing agents in system.access.audit (aibiGenie)"})
     if audit.get("active_30d") is not None:
-        sig.append({"label": "Active spaces (30d)", "value": audit["active_30d"],
-                    "detail": "Distinct spaces with activity in the last 30 days — audit log"})
+        sig.append({"label": "Active agents (30d)", "value": audit["active_30d"],
+                    "detail": "Distinct agents with activity in the last 30 days — audit log"})
     return sig
 
 
-async def probe_genie_spaces() -> dict:
-    """Count Genie Spaces from the audit log ONLY (system.access.audit / aibiGenie).
+async def probe_genie_agents() -> dict:
+    """Count Genie Agents from the audit log ONLY (system.access.audit / aibiGenie).
 
     We deliberately do not use the Genie REST API "spaces visible to the app": it is
     permission- and scope-gated (on-behalf-of-user tokens lack the genie scope), and
@@ -683,9 +683,9 @@ async def probe_genie_spaces() -> dict:
 
     gaps = []
     if total == 0:
-        gaps.append("No Genie Spaces found in the audit log — create a curated Genie Space as the entry point to natural-language analytics.")
+        gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
     elif active == 0:
-        gaps.append(f"{total} Genie Space(s) exist but none were active in the last 30 days — drive adoption or retire stale spaces.")
+        gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
 
     return {
         "available": True,
@@ -694,8 +694,8 @@ async def probe_genie_spaces() -> dict:
         "gaps": gaps,
         "note": "Counted from system.access.audit (aibiGenie). Curation quality — instructions, "
                 "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
-                "Genie Space Quality Workshop accelerator to assess and lift it.",
-        "metrics": {"genie_spaces": total, "active_30d": active, "genie_audit": audit},
+                "Genie Agent Quality Workshop accelerator to assess and lift it.",
+        "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit},
     }
 
 
@@ -962,8 +962,8 @@ PROBES = {
     "uc_foundation": probe_uc_foundation,
     "metadata": probe_metadata,
     "relationships": probe_relationships,
-    "semantic_layer": probe_semantic_layer,
-    "genie_spaces": probe_genie_spaces,
+    "metrics": probe_metrics,
+    "genie_agents": probe_genie_agents,
     "domains": probe_domains,
     "adoption": probe_adoption,
 }

@@ -21,8 +21,8 @@ const REQUIREMENTS: { label: string; detail: string }[] = [
     detail: 'Model serving enabled — powers the guided Plan conversation and the generated action plan (and the model picker in the header).',
   },
   {
-    label: 'Genie Spaces (optional)',
-    detail: 'Grant the app SP CAN_RUN to list and count spaces; CAN_EDIT to assess curation depth (instructions, example SQL, benchmarks, functions).',
+    label: 'Genie Agents (optional)',
+    detail: 'Grant the app SP CAN_RUN to list and count agents; CAN_EDIT to assess curation depth (instructions, example SQL, benchmarks, functions).',
   },
   {
     label: 'Lakebase (optional)',

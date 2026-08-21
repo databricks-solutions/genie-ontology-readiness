@@ -4,7 +4,7 @@ import { apiGet, apiPost } from '../hooks/useApi';
 import type { GenieSpace, GenieSpacesResponse, GenieResult } from '../types';
 import Spinner from './Spinner';
 
-// "Test a question" widget shown inside the Genie Spaces pillar when a Genie
+// "Test a question" widget shown inside the Genie Agents pillar when a Genie
 // space is configured. Starts a conversation and renders the SQL + result grid.
 export default function GenieTester() {
   const [spaces, setSpaces] = useState<GenieSpace[]>([]);
@@ -71,7 +71,7 @@ export default function GenieTester() {
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && ask()}
-          placeholder="Ask the Genie space a question..."
+          placeholder="Ask the Genie agent a question..."
           className="flex-1 rounded-md border border-gray-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
         />
         <button onClick={ask} disabled={loading} className="btn-primary py-1.5 px-3 flex items-center gap-1">
