@@ -34,12 +34,12 @@ READINESS_STAGES = [
     {
         "min_score": 55,
         "label": "Ready for Session 2 — Genie Room Setup & Tuning",
-        "detail": "Metadata and a semantic layer exist; stand up and tune Genie Spaces.",
+        "detail": "Metadata and a semantic layer exist; stand up and tune Genie Agents.",
     },
     {
         "min_score": 72,
         "label": "Ready for Session 3 — Validation & Business Onboarding",
-        "detail": "Genie Spaces are curated; validate accuracy and onboard business users.",
+        "detail": "Genie Agents are curated; validate accuracy and onboard business users.",
     },
     {
         "min_score": 85,
@@ -72,18 +72,18 @@ PILLARS = [
         "capability": "relationships",
     },
     {
-        "key": "semantic_layer",
-        "name": "Semantic Layer (Business Semantics)",
+        "key": "metrics",
+        "name": "Metrics",
         "weight": 20,
-        "short": "Metric views, glossary, synonyms — the foundation that feeds the ontology.",
+        "short": "Metric views — the governed metrics foundation that feeds the ontology.",
         "capability": "metric_views",
     },
     {
-        "key": "genie_spaces",
-        "name": "Genie Spaces",
+        "key": "genie_agents",
+        "name": "Genie Agents",
         "weight": 16,
-        "short": "Curated Genie Spaces with instructions, example SQL, and benchmarks.",
-        "capability": "genie_spaces",
+        "short": "Curated Genie Agents with instructions, example SQL, and benchmarks.",
+        "capability": "genie_agents",
     },
     {
         "key": "domains",

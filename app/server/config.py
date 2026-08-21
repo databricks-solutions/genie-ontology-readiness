@@ -60,7 +60,7 @@ USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
 # Workspace id (for building deep links into the customer's workspace UI)
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 
-# Optional Genie space to test answer quality against (pillar 5)
+# Optional Genie agent to test answer quality against (pillar 5)
 GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 
 # Cache workspace client to avoid repeated creation
