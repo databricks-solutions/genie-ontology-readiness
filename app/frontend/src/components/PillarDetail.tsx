@@ -63,7 +63,7 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-gray-50 text-left">
-              <th className="px-3 py-2 text-xs font-semibold text-ink-600">Genie Space</th>
+              <th className="px-3 py-2 text-xs font-semibold text-ink-600">Genie Agent</th>
               {GENIE_COLS.map((c) => (
                 <th key={c.key} className="px-3 py-2 text-xs font-semibold text-ink-600 text-center whitespace-nowrap">
                   {c.label}
@@ -178,13 +178,13 @@ export default function PillarDetail({
           <LegacyBreakdown rows={pillar.metrics.legacy_by_schema as UcSchemaCount[]} />
         )}
 
-      {pillar.key === 'genie_spaces' &&
+      {pillar.key === 'genie_agents' &&
         Array.isArray(pillar.metrics?.spaces) &&
         (pillar.metrics.spaces as GenieSpaceCuration[]).length > 0 && (
           <GenieSpacesTable spaces={pillar.metrics.spaces as GenieSpaceCuration[]} />
         )}
 
-      {pillar.key === 'genie_spaces' && config.genie_space_configured && (
+      {pillar.key === 'genie_agents' && config.genie_space_configured && (
         <GenieTester />
       )}
     </div>

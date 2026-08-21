@@ -2,7 +2,7 @@
 
 Where `library.py` explains *what* each pillar is and `accelerators.py` gives
 the customer something *runnable*, this module encodes the *method*: the
-phased, iterative process for curating metric views, Genie Spaces, and the
+phased, iterative process for curating metric views, Genie Agents, and the
 governed tags/domains that make them discoverable — so an AI agent can answer
 accurately and consistently.
 
@@ -55,12 +55,12 @@ PHASES: list[dict] = [
     {
         "key": "organize",
         "name": "Organize by domain",
-        "goal": "Structure Genie Spaces and metric views around the business, not around reports.",
+        "goal": "Structure Genie Agents and metric views around the business, not around reports.",
         "steps": [
-            "Model a Genie Space as a business domain/subdomain (e.g. 'Online Marketing'); model a metric view as a KPI group within it (e.g. 'Conversion Metrics').",
+            "Model a Genie Agent as a business domain/subdomain (e.g. 'Online Marketing'); model a metric view as a KPI group within it (e.g. 'Conversion Metrics').",
             "Name metric views by convention — {subdomain}_{kpi_group} — so they sort and read predictably.",
-            "Tag Genie Spaces and metric views with their domain/subdomain for discoverability and observability. Optionally mirror the structure as one Unity Catalog schema per domain.",
-            "Keep each space focused — a Genie Space supports up to 30 tables/views/metric views, and tighter domains answer better. If you approach the limit, split into more granular subdomain spaces.",
+            "Tag Genie Agents and metric views with their domain/subdomain for discoverability and observability. Optionally mirror the structure as one Unity Catalog schema per domain.",
+            "Keep each agent focused — a Genie Agent supports up to 30 tables/views/metric views, and tighter domains answer better. If you approach the limit, split into more granular subdomain agents.",
         ],
     },
     {
@@ -68,11 +68,11 @@ PHASES: list[dict] = [
         "name": "Test incrementally",
         "goal": "Onboard one measure at a time, prove it, and capture what worked as reusable examples and benchmarks.",
         "steps": [
-            "Add one measure to the space, ask sample questions, and validate the answer before adding the next measure.",
-            "Save each validated query as an example SQL query in the space so the agent reuses it. Keep example SQL simple (prefer WHERE over CASE) — complexity adds reasoning load.",
+            "Add one measure to the agent, ask sample questions, and validate the answer before adding the next measure.",
+            "Save each validated query as an example SQL query in the agent so it reuses it. Keep example SQL simple (prefer WHERE over CASE) — complexity adds reasoning load.",
             "Leave prompt matching enabled on columns so the agent maps user language to real values and tolerates misspellings; for ambiguous categorical values, add exact-match filter instructions.",
-            "Always give the Space itself a name AND a description — multi-agent/multi-space routing depends on the description to delegate the question correctly.",
-            "Write space instructions as: (1) trigger condition — when the user asks about X, (2) required action — always do Y, (3) an example question and expected behavior.",
+            "Always give the Agent itself a name AND a description — multi-agent/multi-agent routing depends on the description to delegate the question correctly.",
+            "Write agent instructions as: (1) trigger condition — when the user asks about X, (2) required action — always do Y, (3) an example question and expected behavior.",
             "Build benchmarks: for each validated measure, add two to four phrasings of the same question with ground-truth SQL; add more phrasings for questions likely to be misread.",
         ],
     },
@@ -82,8 +82,8 @@ PHASES: list[dict] = [
         "goal": "Regression-test every change, then pilot with real business users and loop their feedback back in.",
         "steps": [
             "Re-run all benchmarks after every change (new measure, new instruction). If a previously passing benchmark now fails, the latest addition is the likely cause.",
-            "Regression testing is per space; if you connect multiple spaces (a supervisor/multi-agent setup), also test the cross-space interactions.",
-            "Share the curated space with pilot business users; have them use the built-in feedback and keep conversations reviewable by space managers so curators can see and act on responses.",
+            "Regression testing is per agent; if you connect multiple agents (a supervisor/multi-agent setup), also test the cross-agent interactions.",
+            "Share the curated agent with pilot business users; have them use the built-in feedback and keep conversations reviewable by agent managers so curators can see and act on responses.",
             "Feed both regression failures and user feedback back into the testing phase — this is a loop, not a one-time release.",
         ],
     },
@@ -100,19 +100,19 @@ PRACTICES: dict[str, list[str]] = {
         "Comment at all three levels (view, dimension, measure) and add synonyms + format specification — the agent reasons over every level.",
         "Use MEASURE() for composability so a measure can build on other measures/dimensions in the same view.",
         "For multi-fact or nested KPIs, build a base view (CTEs) first, then the metric view on top — the metric view pre-defines aggregation and cuts hallucination risk.",
-        "Once a metric view sits on top of a base view, remove the raw base view/tables from the Genie Space — expose only the metric view to avoid redundancy and ambiguity.",
+        "Once a metric view sits on top of a base view, remove the raw base view/tables from the Genie Agent — expose only the metric view to avoid redundancy and ambiguity.",
     ],
-    "genie_spaces": [
-        "Scope a space to one business domain/subdomain and keep it under the 30-item limit; split when it grows.",
-        "Always add a space description — routing across spaces depends on it.",
+    "genie_agents": [
+        "Scope an agent to one business domain/subdomain and keep it under the 30-item limit; split when it grows.",
+        "Always add an agent description — routing across agents depends on it.",
         "Save validated queries as example SQL and keep them simple.",
         "Structure instructions as trigger condition → required action → example.",
         "Enable prompt matching; add exact-match instructions for ambiguous categorical values.",
         "Benchmark with two to four phrasings per question and ground-truth SQL; regression-test after every change.",
     ],
     "domains": [
-        "Genie Space = domain/subdomain; metric view = KPI group within it.",
-        "Name metric views {subdomain}_{kpi_group}; tag spaces and metric views with their domain for discoverability and observability.",
+        "Genie Agent = domain/subdomain; metric view = KPI group within it.",
+        "Name metric views {subdomain}_{kpi_group}; tag agents and metric views with their domain for discoverability and observability.",
         "Assign a named owner/steward per domain and certify the canonical assets so the agent (and users) know what to trust.",
     ],
 }
@@ -144,8 +144,8 @@ def methodology_prompt() -> str:
     lines.append(
         "Non-negotiable techniques: one source per metric view; validate one measure at a time against the trusted number; "
         "comment at view/dimension/measure level and add synonyms; build a base view (CTEs) first for multi-fact/nested KPIs, then the metric view on top; "
-        "one Genie Space per domain (<=30 items) with a description; save validated queries as example SQL and keep it simple; "
-        "structure space instructions as trigger->action->example; benchmark 2-4 phrasings per question with ground-truth SQL and regression-test after every change; "
-        "name metric views {subdomain}_{kpi_group} and tag spaces/metric views with their domain; certify canonical assets and name a steward per domain."
+        "one Genie Agent per domain (<=30 items) with a description; save validated queries as example SQL and keep it simple; "
+        "structure agent instructions as trigger->action->example; benchmark 2-4 phrasings per question with ground-truth SQL and regression-test after every change; "
+        "name metric views {subdomain}_{kpi_group} and tag agents/metric views with their domain; certify canonical assets and name a steward per domain."
     )
     return "\n".join(lines)

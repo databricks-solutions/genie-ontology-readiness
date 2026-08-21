@@ -23,7 +23,7 @@ variables:
     description: "Optional comma-separated catalogs to assess (empty = all non-system catalogs the app SP can see)"
     default: ""
   genie_space_id:
-    description: "Optional Genie Space ID to enable the live answer-quality test (pillar 5)"
+    description: "Optional Genie Agent ID to enable the live answer-quality test (pillar 5)"
     default: ""
   lakebase_instance_name:
     description: "Lakebase instance that hosts this app's per-user history DB (the app gets its own database on it). Only needed when USE_LAKEBASE=true. Leave empty to let post_deploy.py skip history persistence; set to an existing instance name to reuse it."
