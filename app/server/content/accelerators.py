@@ -434,7 +434,7 @@ ACCELERATORS: list[dict] = [
         },
         "valid_as_of": "2026-07",
     },
-    # ---- Metrics / Metric Views (weight 18) -------------------------
+    # ---- Metrics / Metric Views (weight 20) -------------------------
     {
         # Build accelerator (per plan §3): scaffold metric-view YAML from a KPI
         # inventory or query history — a hand-authored complement to the
