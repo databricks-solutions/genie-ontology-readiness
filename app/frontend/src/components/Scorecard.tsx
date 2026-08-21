@@ -70,7 +70,7 @@ function fmtWhen(iso: string): string {
 }
 
 // Wrap a pillar name to <=~16-char lines so long titles like
-// "Relationships & Modeling" don't clip off the radar chart.
+// "Domains & Stewardship" don't clip off the radar chart.
 function wrapLabel(text: string, maxChars = 16): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
@@ -143,12 +143,16 @@ export default function Scorecard({
 
   const radarData = useMemo(
     () =>
-      config.pillars.map((p) => ({
-        // Use the pillar's card title (name), not its long description, so the
-        // radar labels match the 7 pillar cards below.
-        pillar: p.name,
-        score: Math.round(pillarsByKey[p.key]?.score ?? 0),
-      })),
+      config.pillars
+        // Drop score-exempt pillars (e.g. the Beta Pages placeholder) — they
+        // carry no real score and would show as a misleading 0 on the radar.
+        .filter((p) => !pillarsByKey[p.key]?.score_exempt)
+        .map((p) => ({
+          // Use the pillar's card title (name), not its long description, so the
+          // radar labels match the scored pillar cards below.
+          pillar: p.name,
+          score: Math.round(pillarsByKey[p.key]?.score ?? 0),
+        })),
     [config.pillars, pillarsByKey]
   );
 
@@ -294,7 +298,7 @@ export default function Scorecard({
         <h2 className="text-xl font-bold text-ink-900">Assess your Genie Ontology readiness</h2>
         <p className="text-sm text-ink-600 mt-2 leading-relaxed">
           This reads your Unity Catalog metadata (catalogs, comments, constraints, metric views,
-          Genie Agents, tags) to score your readiness across seven pillars. It runs read-only as the
+          Genie Agents, tags) to score your readiness across eight pillars. It runs read-only as the
           app's service principal and typically takes 30–60 seconds.
         </p>
       </div>
@@ -487,29 +491,44 @@ export default function Scorecard({
           }
           const open = expanded === p.key;
           const s = levelStyle(p.level);
+          const exempt = p.score_exempt;
           return (
-            <div key={p.key} className={`card overflow-hidden ${!p.available ? 'opacity-80' : ''}`}>
+            <div key={p.key} className={`card overflow-hidden ${!p.available && !exempt ? 'opacity-80' : ''}`}>
               <button
                 onClick={() => setExpanded(open ? null : p.key)}
                 className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
               >
                 <div className="w-12 text-center shrink-0">
-                  <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
-                    {Math.round(p.score)}
-                  </div>
+                  {exempt ? (
+                    <div className="text-lg font-bold text-ink-300">—</div>
+                  ) : (
+                    <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
+                      {Math.round(p.score)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-ink-900">{p.name}</span>
-                    <LevelBadge level={p.level} label={p.level_label} />
-                    {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                    {exempt ? (
+                      <span className="text-[11px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                        Beta · not scored
+                      </span>
+                    ) : (
+                      <>
+                        <LevelBadge level={p.level} label={p.level_label} />
+                        {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                      </>
+                    )}
                   </div>
                   <p className="text-xs text-ink-500 mt-0.5 truncate">{p.short}</p>
                 </div>
                 <div className="hidden sm:block w-24 shrink-0">
-                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                    <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
-                  </div>
+                  {!exempt && (
+                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
+                    </div>
+                  )}
                 </div>
                 <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
               </button>

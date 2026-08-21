@@ -18,7 +18,10 @@ import type { Accelerator, AcceleratorType } from '../src/types';
 // Fully hermetic: no live network, no running backend, no jsdom — the component
 // is rendered to static HTML via react-dom/server.
 
-// The 7 capability keys the app scores. Each MUST have >=1 accelerator.
+// The scored capability keys — each MUST have >=1 accelerator. The Beta "pages"
+// pillar is score_exempt (shown/explained but not scored) and ships with Learn
+// guidance but no runnable accelerator yet, so it is intentionally excluded from
+// this accelerator-coverage invariant.
 const CAPABILITY_KEYS = [
   'unity_catalog',
   'metadata',

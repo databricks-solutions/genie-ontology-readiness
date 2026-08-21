@@ -115,6 +115,12 @@ PRACTICES: dict[str, list[str]] = {
         "Name metric views {subdomain}_{kpi_group}; tag agents and metric views with their domain for discoverability and observability.",
         "Assign a named owner/steward per domain and certify the canonical assets so the agent (and users) know what to trust.",
     ],
+    "pages": [
+        "Author a Page for each contested business concept — a governed, owned definition beats a dozen inferred ones.",
+        "Give every published Page an owner and a domain; add synonyms and link the metrics/tables it defines.",
+        "Publish and certify canonical definitions so Genie One cites them over inferred context; keep unfinished Pages as drafts.",
+        "Keep definitions fresh via the review/suggestion workflow — Genie One trusts and cites Pages, so stale ones mislead.",
+    ],
 }
 
 
@@ -146,6 +152,7 @@ def methodology_prompt() -> str:
         "comment at view/dimension/measure level and add synonyms; build a base view (CTEs) first for multi-fact/nested KPIs, then the metric view on top; "
         "one Genie Agent per domain (<=30 items) with a description; save validated queries as example SQL and keep it simple; "
         "structure agent instructions as trigger->action->example; benchmark 2-4 phrasings per question with ground-truth SQL and regression-test after every change; "
-        "name metric views {subdomain}_{kpi_group} and tag agents/metric views with their domain; certify canonical assets and name a steward per domain."
+        "name metric views {subdomain}_{kpi_group} and tag agents/metric views with their domain; certify canonical assets and name a steward per domain; "
+        "author and certify Pages for the business concepts users argue about so Genie One cites authoritative definitions over inferred ones."
     )
     return "\n".join(lines)

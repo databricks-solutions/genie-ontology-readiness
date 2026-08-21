@@ -76,7 +76,7 @@ export default function HelpButton({ config }: { config: AppConfig }) {
               </h3>
               <p className="text-sm text-ink-700 leading-relaxed">
                 {config.app_name} assesses your Databricks workspace&apos;s maturity for Genie
-                Ontology across seven readiness pillars, explains each capability, and generates a
+                Ontology across eight readiness pillars, explains each capability, and generates a
                 tailored, prioritized action plan. The assessment is read-only.
               </p>
             </div>

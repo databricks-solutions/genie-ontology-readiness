@@ -59,6 +59,10 @@ export interface PillarScore {
   level: number;
   level_label: string;
   available: boolean;
+  // True when the pillar is shown/explained but deliberately excluded from the
+  // overall score (e.g. a placeholder probe for a Beta capability with no
+  // detection API yet). Render it as "Beta · not scored", not a failing L0.
+  score_exempt?: boolean;
   note: string | null;
   signals: Signal[];
   gaps: string[];

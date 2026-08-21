@@ -300,12 +300,40 @@ CAPABILITIES: dict[str, dict] = {
             {"title": "System tables reference (docs)", "url": "https://docs.databricks.com/aws/en/admin/system-tables/"},
         ],
     },
+    "pages": {
+        "name": "Pages & Business Concepts",
+        "tagline": "Governed, authoritative definitions of your business concepts — cited by Genie.",
+        "what": "A Page is a governed definition of a business concept — a critical term, entity, or acronym — authored in Unity Catalog. Pages are the human-modeled layer of Genie Ontology: structured fields (domain, owner, synonyms, description) plus a rich body, linked to the metrics and tables the concept depends on. When answering, Genie One prioritizes a Page's definition over context it infers automatically and cites the Page so users can confirm the source.",
+        "technical_value": "One authoritative definition per concept that agents reason over and cite — resolving conflicting or inferred definitions and raising answer trust.",
+        "business_value": "A shared business vocabulary: everyone (and every agent) uses the same definition of 'active user', 'qualified lead', or 'net revenue', with a named owner and an auditable source.",
+        "technical_enablement": [
+            "Have an account admin enable Pages (Previews), then author Pages for your highest-traffic terms, entities, and acronyms.",
+            "Give each Page an owner and place it in the right domain/subdomain; add synonyms and link the related metrics, tables, and sources.",
+            "Publish the canonical definitions (draft Pages stay private) and certify them so Genie One prefers and cites them.",
+            "Use AI-assisted bulk import to extract terms from an existing glossary or documents, then dedupe and resolve conflicts.",
+        ],
+        "business_adoption": [
+            "Start with the handful of contested metrics that cause the most 'which number is right?' debates.",
+            "Name an owner per concept and route edit suggestions and comments through them so definitions stay trusted and current.",
+            "Review Genie One answers for citations — where it cites a Page the definition is landing; where it doesn't, author or publish one.",
+        ],
+        "best_practices": [
+            "Author Pages for the concepts people argue about first — authority beats coverage early on.",
+            "Every published Page has an owner, a domain, synonyms, and links to the metrics/tables it defines.",
+            "Publish and certify canonical definitions so Genie One cites them over inferred context; keep drafts private until they're ready.",
+            "Keep Pages fresh — a stale authoritative definition is worse than none; use the review/suggestion workflow.",
+        ],
+        "sources": [
+            {"title": "Pages (Unity Catalog Semantics docs)", "url": "https://docs.databricks.com/aws/en/uc-semantics/pages"},
+            {"title": "Introducing Genie One, Genie Agents, and Genie Ontology (blog)", "url": "https://www.databricks.com/blog/introducing-genie-one-genie-ontology-and-genie-agents"},
+        ],
+    },
 }
 
 # Display order for the Learn tab.
 CAPABILITY_ORDER = [
     "ontology", "unity_catalog", "metadata", "relationships",
-    "metric_views", "genie_agents", "domains", "adoption",
+    "metric_views", "genie_agents", "domains", "pages", "adoption",
 ]
 
 

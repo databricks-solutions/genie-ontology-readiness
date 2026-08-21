@@ -127,7 +127,7 @@ app/
     genie_client.py          — Genie Conversation API (answer-quality test)
     lakebase_client.py       — optional snapshot persistence pool
     snapshots.py             — optional assessment history (Lakebase)
-    pillars.py               — canonical 7 readiness pillars + maturity model
+    pillars.py               — canonical 8 readiness pillars + maturity model
     assessment/
       probes.py              — read-only SQL/REST probes (graceful degradation)
       scoring.py             — combine technical + self-assessment → scorecard
@@ -146,7 +146,7 @@ databricks.yml               — DABs: app + sql-warehouse resource
 ## Readiness pillars (each scored 0-4)
 
 Unity Catalog Foundation · Metadata Richness · Relationships & Modeling ·
-Metrics · Genie Agents · Domains & Stewardship ·
+Metrics · Genie Agents · Domains & Stewardship · Pages & Business Concepts ·
 Adoption & Activity. The overall score maps to a **Genie Foundations** session
 ("Ready for Session 2 — Genie Room Setup", etc.).
 

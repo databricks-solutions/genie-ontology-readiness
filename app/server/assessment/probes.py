@@ -957,6 +957,38 @@ async def probe_adoption() -> dict:
         return _empty(f"Could not read adoption signals ({str(e)[:120]}).")
 
 
+async def probe_pages() -> dict:
+    """Placeholder probe for the Pages & Business Concepts pillar.
+
+    Pages — governed, authoritative definitions of business concepts (terms,
+    entities, acronyms) and the human-modeled, *cited* layer of Genie Ontology —
+    are a Beta Unity Catalog Semantics feature with no public metadata API (no
+    information_schema view, system table, or documented REST endpoint) as of
+    this writing, so there is no reliable read-only signal to score yet.
+
+    We return score_exempt=True: scoring.py shows and explains the pillar but
+    EXCLUDES it from the overall score, so this top-weighted-but-unmeasurable
+    pillar never drags the headline number down. When a detection API lands,
+    replace this with a real probe and drop score_exempt so Pages counts at its
+    full weight. Docs: https://docs.databricks.com/aws/en/uc-semantics/pages
+    """
+    return {
+        "available": False,
+        "score_exempt": True,
+        "score": 0.0,
+        "signals": [],
+        "gaps": [
+            "Pages readiness can't be auto-detected yet (Beta; no public metadata API) — assess it manually via the Learn tab.",
+            "Have an account admin enable Pages (Previews), then author governed Pages for your top business concepts, terms, and acronyms.",
+            "Give each Page an owner and a domain, link related metrics/tables, and publish + certify the canonical definitions so Genie One cites them over inferred context.",
+        ],
+        "note": ("Pages is a Beta Unity Catalog Semantics feature with no public metadata API yet, so it is "
+                 "explained and planned for here but not scored automatically. See the Learn tab and "
+                 "https://docs.databricks.com/aws/en/uc-semantics/pages."),
+        "metrics": {},
+    }
+
+
 # Map pillar key -> probe coroutine
 PROBES = {
     "uc_foundation": probe_uc_foundation,
@@ -965,5 +997,6 @@ PROBES = {
     "metrics": probe_metrics,
     "genie_agents": probe_genie_agents,
     "domains": probe_domains,
+    "pages": probe_pages,
     "adoption": probe_adoption,
 }

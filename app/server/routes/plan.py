@@ -50,6 +50,16 @@ def _scorecard_digest(sc: Optional[dict]) -> str:
     overall = sc.get("overall", {})
     lines = [f"Overall readiness: {overall.get('score')}/100 ({overall.get('level_label')}) — {overall.get('readiness_stage')}."]
     for p in sc.get("pillars", []):
+        # Score-exempt pillars (e.g. the Beta Pages placeholder) carry no real
+        # score and are excluded from the overall number and top gaps. Present
+        # them as "not scored" so the plan LLM can still recommend them where
+        # relevant but never treats a placeholder 0 as the worst-scoring gap.
+        if p.get("score_exempt"):
+            lines.append(
+                f"- {p.get('name')}: not scored (Beta capability — include in the plan where "
+                f"relevant, but it does not affect the readiness score)"
+            )
+            continue
         sigs = ", ".join(f"{s.get('label')}={s.get('value')}{s.get('unit','')}" for s in (p.get("signals") or [])[:3])
         avail = "" if p.get("available", True) else " [not available]"
         line = f"- {p.get('name')}: {p.get('score')} ({p.get('level_label')}){avail}"

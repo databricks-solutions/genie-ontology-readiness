@@ -5,7 +5,7 @@ Deploy it into a workspace and it will:
 
 - **Assess** the live environment and score maturity across the readiness pillars
   Genie Ontology depends on (Unity Catalog, metadata, relationships, metrics /
-  metric views, Genie Agents, domains, adoption).
+  metric views, Genie Agents, domains, Pages, adoption).
 - **Explain** each capability from a **technical** and a **business** standpoint, with
   accurate GA / preview status.
 - **Recommend** best practices for both technical enablement and business adoption.
@@ -22,9 +22,9 @@ The assessment is **read-only** and degrades gracefully when a signal isn't avai
 
 The app has three tabs. Each walkthrough below is a short, sped-up screen capture.
 
-### Assess — the 7-pillar readiness scorecard
+### Assess — the 8-pillar readiness scorecard
 
-Run a read-only assessment that scores your workspace across seven pillars, rolls up to a
+Run a read-only assessment that scores your workspace across eight pillars, rolls up to a
 0–100 readiness score and maturity stage, and expands each pillar to its signals and gaps.
 
 ![Assess tab walkthrough: running the readiness assessment, viewing the overall score and pillar-maturity radar, and expanding a pillar to see its signals and gaps.](assets/assess-cuj.gif)
