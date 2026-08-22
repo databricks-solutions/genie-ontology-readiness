@@ -923,7 +923,12 @@ async def probe_adoption() -> dict:
             queries_30d = None
 
         if active_users is None and queries_30d is None:
-            who = ("your user account" if get_user_token()
+            # Under OBO, execute_sql already transparently retried as the app SP
+            # before we landed here, so BOTH identities failed to read. Name both
+            # (the SP grant is usually the real fix for this workspace-wide signal)
+            # rather than pointing only at the viewer's account.
+            who = ("your user account or the app service principal (OBO tried both)"
+                   if get_user_token()
                    else "the app service principal")
             return _empty("System tables (system.access / system.query) are not enabled "
                           f"or not granted to {who}.")

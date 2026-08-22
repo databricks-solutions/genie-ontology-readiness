@@ -44,19 +44,35 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     # so re-raise them instead of doubling latency with a pointless retry.
     try:
         return await _execute_once(query, parameters, force_sp=False)
-    except Exception as e:
-        if not _is_authz_error(e):
+    except Exception as obo_err:
+        if not _is_authz_error(obo_err):
             raise
-        logger.warning(f"OBO read denied ({str(e)[:160]}); falling back to app SP")
-        return await _execute_once(query, parameters, force_sp=True)
+        logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
+        try:
+            return await _execute_once(query, parameters, force_sp=True)
+        except Exception as sp_err:
+            # The SP fallback failed too (neither the viewer nor the app SP can
+            # read this). Chain the original OBO denial so it stays visible in the
+            # traceback instead of being masked by the SP's error.
+            raise sp_err from obo_err
 
 
 # Substrings that mark a failure as an authorization/permission problem — the only
 # case where retrying as the app SP can succeed. Matched case-insensitively against
 # the SQL Warehouse / Statement Execution error text.
 _AUTHZ_MARKERS = (
+    # Explicit permission / authorization denials.
     "permission_denied", "does not have", "not authorized", "access denied",
-    "forbidden", "insufficient priv", "unauthorized", " 403", "requires", "no permission",
+    "forbidden", "insufficient priv", "unauthorized", "no permission",
+    "privilege",            # "requires ... privilege", "insufficient privileges" (narrower than bare "requires")
+    "(401)", "(403)",       # HTTP status is wrapped as "SQL Warehouse error (403): ..." — no leading space
+    # UC often surfaces a missing catalog/schema grant as the object simply not
+    # existing (e.g. [TABLE_OR_VIEW_NOT_FOUND] "... cannot be found", "Catalog system
+    # not found"). For the fixed system / information_schema probes here, not-found
+    # almost always means a grant the app SP holds is missing for the viewer — so
+    # treat it as an authz gap worth the SP fallback rather than dropping the signal.
+    # Cover both the error-class token ("not_found") and the prose forms.
+    "not found", "not_found", "cannot be found", "does not exist",
 )
 
 
