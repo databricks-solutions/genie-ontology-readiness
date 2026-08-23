@@ -16,6 +16,13 @@ env:
   # Branding shown in the app header.
   - name: BRAND_NAME
     value: "Databricks"
+  # Identity override: "true" forces EVERY read to run as the app service
+  # principal (OBO is never attempted), even when user authorization is enabled.
+  # Default "false" = OBO-first with automatic SP fallback. Set "true" to
+  # guarantee consistent workspace-wide system-table signals regardless of the
+  # viewer's own grants (the SP must then hold the read grants below).
+  - name: FORCE_SP
+    value: "false"
   # Per-user assessment/plan history persistence (Lakebase). post_deploy.py sets
   # these: it creates the database on the shared instance, attaches the
   # 'lakebase-db' app resource, and pins the host/user/database/instance below. The app

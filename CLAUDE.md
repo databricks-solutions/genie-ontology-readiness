@@ -56,6 +56,7 @@ export LAKEBASE_DATABASE=ontology_readiness     # a dedicated DB created on that
 # export ASSESS_CATALOGS="sales,finance"     # restrict scope (default: all non-system catalogs)
 # export GENIE_SPACE_ID=<id>                  # enable the live Genie answer test (pillar 5)
 # export BRAND_NAME="Acme"                    # header branding
+# export FORCE_SP=true                        # SP-only mode: never attempt OBO, run every read as the app SP
 
 python3 scripts/post_deploy.py   # requires: pip install asyncpg
 ```
@@ -67,22 +68,44 @@ Lakebase instance, attaches the `lakebase-db` app resource, and pins the
 connection env. Assessment history and generated plans are then persisted
 **per user** (keyed by the `X-Forwarded-Email` identity Databricks Apps inject)
 and survive across sessions. Scores are a deterministic function of the technical
-findings, so repeated runs on the same workspace are directly comparable.
+findings, so repeated runs on the same workspace are directly comparable **for a
+given identity**. Under OBO the findings reflect the viewing user's grants, so
+signals gated behind grants a viewer lacks (notably the workspace-wide Adoption
+system tables) can read lower for a restricted viewer than for the SP — use
+`FORCE_SP=true` when you need a single, viewer-independent workspace-wide score.
 
-## Auth: service principal + optional on-behalf-of-user
+## Auth: on-behalf-of-user by default, service-principal fallback
 
-By default the assessment runs as the app **service principal (SP)**, so the SP
-must be granted read access to what it assesses.
+The assessment runs **on-behalf-of-user (OBO)** by default, falling back to the
+app **service principal (SP)** whenever OBO isn't available or a specific read
+can't succeed as the viewer.
 
 **On-behalf-of-user (OBO):** if the workspace admin enables **user authorization**
 (Public Preview) and the app carries the `sql` user scope, Databricks forwards the
-viewer's token in `x-forwarded-access-token`. The app then runs **every** read — both
-`information_schema`/tags **and** the system-table signals (`system.access.audit`,
-`system.query.history`, `system.access.table_lineage`) — as the **logged-in user**,
-so the assessment reflects exactly what that user can see and the SP need not be
-granted anything. Each signal is deliberately on-behalf-of-user, not SP. With no
-forwarded token (OBO disabled, scheduled/unattended, or local dev), all reads fall
-back to the SP (`execute_sql`/`get_auth_headers` accept `force_sp` for that path).
+viewer's token in `x-forwarded-access-token`. The app then runs **every** signal —
+both `information_schema`/tags **and** the system-table signals
+(`system.access.audit`, `system.query.history`, `system.access.table_lineage`) — as
+the **logged-in user**, so the assessment reflects what that user can see. The
+policy lives in `sql_client.execute_sql`:
+
+1. `force_sp=True` → **SP-only override** (no OBO attempt); used for reads the OBO
+   token can't do — the Genie REST API (not covered by the `sql` scope) and
+   Lakebase credential minting.
+2. Otherwise, when a forwarded token is present, the read runs **OBO**; if it
+   fails (e.g. the viewer lacks a system-table grant the SP holds) it
+   **transparently falls back to the SP** rather than dropping the signal.
+3. With no forwarded token (OBO disabled, scheduled/unattended, local dev), the
+   read runs as the **SP** directly.
+
+**Deploy-time override:** set `FORCE_SP=true` (env in `app.yml`, or
+`export FORCE_SP=true` before `post_deploy.py`) to force **SP-only mode** — the
+app never attempts OBO and runs every read as the service principal, even when
+user authorization is enabled. Use it to guarantee consistent workspace-wide
+system-table signals (e.g. Adoption) independent of the viewer's grants; the SP
+must then hold the read grants. Default is `false` (OBO-first with SP fallback).
+
+So the SP still needs the grants below to cover the unattended path and the
+fallback; under OBO with a fully-granted viewer the SP need not be granted.
 
 Enabling the scope: `user_api_scopes: [sql]` is declared in `databricks.yml`, but
 `bundle deploy` only applies it on app **create** — on an already-created app set it
