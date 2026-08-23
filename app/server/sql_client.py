@@ -2,23 +2,175 @@
 
 import aiohttp
 import asyncio
+import contextvars
 import logging
 from typing import Any, Optional
-from server.config import get_workspace_host, get_auth_headers, WAREHOUSE_ID, CATALOG, SCHEMA
+from server.config import get_workspace_host, get_auth_headers, get_user_token, FORCE_SP, WAREHOUSE_ID, CATALOG, SCHEMA
 
 logger = logging.getLogger(__name__)
+
+
+# --- Per-signal identity attribution ------------------------------------------
+# Records which identity actually served each read, so the assessment output can
+# tell the end user whether a signal reflects THEIR grants (OBO) or the app service
+# principal's. Scoped to the current task's context: the scorer calls
+# start_identity_capture() at the head of each probe task (contextvars are copied
+# per task), execute_sql appends the resolved mode, and resolved_identity()
+# summarizes it after the probe returns.
+_identity_recorder: contextvars.ContextVar = contextvars.ContextVar("identity_recorder", default=None)
+
+
+def start_identity_capture() -> None:
+    """Begin (or reset) identity capture for the current context/task."""
+    _identity_recorder.set([])
+
+
+def record_identity(mode: str) -> None:
+    """Record one resolved-identity event ('obo', 'sp_fallback', 'sp_forced_env',
+    'sp_forced_call', 'sp_no_token'). No-op when capture isn't active."""
+    rec = _identity_recorder.get()
+    if rec is not None:
+        rec.append(mode)
+
+
+def record_rest_identity() -> None:
+    """Record the identity for a REST read that ALREADY succeeded and bypassed
+    execute_sql (so it can't be captured centrally). Mirrors execute_sql's base
+    OBO-vs-SP decision in one place, so REST callers don't hand-duplicate the mode
+    vocabulary: FORCE_SP → the SP (sp_forced_env; get_user_token() is already None
+    under it), a forwarded viewer token → OBO, otherwise the SP. REST reads have no
+    per-call force_sp or fallback, so those modes don't apply here."""
+    if FORCE_SP:
+        record_identity("sp_forced_env")
+    elif get_user_token():
+        record_identity("obo")
+    else:
+        record_identity("sp_no_token")
+
+
+def resolved_identity() -> Optional[dict]:
+    """Summarize the identities recorded since start_identity_capture().
+
+    Returns None when nothing was recorded (e.g. a signal that did no instrumented
+    read), else {ran_as, via, label, detail} describing the identity that served it.
+    """
+    rec = _identity_recorder.get()
+    if not rec:
+        return None
+    modes = set(rec)
+    obo = "obo" in modes
+    fell_back = "sp_fallback" in modes
+    sp_only = bool(modes & {"sp_forced_call", "sp_no_token"})
+
+    if "sp_forced_env" in modes:
+        return {"ran_as": "service_principal", "via": "sp_forced_env",
+                "label": "App service principal (FORCE_SP)",
+                "detail": "This deploy runs in SP-only mode (FORCE_SP); the signal reflects the app "
+                          "service principal's grants, not any individual viewer."}
+    if obo and (fell_back or sp_only):
+        return {"ran_as": "mixed", "via": "sp_fallback",
+                "label": "You + app service principal",
+                "detail": "Some reads ran on-behalf-of-you and others as the app service principal "
+                          "(fallback or an SP-only read), so this signal is a mix of both identities."}
+    if fell_back:
+        return {"ran_as": "service_principal", "via": "sp_fallback",
+                "label": "App service principal (fell back)",
+                "detail": "Your account couldn't read this, so it fell back to the app service "
+                          "principal — the signal reflects the SP's grants, not yours."}
+    if sp_only:
+        return {"ran_as": "service_principal", "via": "sp_only",
+                "label": "App service principal",
+                "detail": "Read as the app service principal, so the signal reflects the SP's grants "
+                          "rather than any individual viewer."}
+    return {"ran_as": "user", "via": "obo",
+            "label": "Your account (on-behalf-of-you)",
+            "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
 async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
-    Uses the Statement Execution API:
-    POST /api/2.0/sql/statements
+    Identity model — every signal defaults to on-behalf-of-user (OBO):
 
-    ``force_sp=True`` runs as the app service principal even when a forwarded
-    end-user token is present — use it for system-table reads (system.access /
-    system.query) that the SP is granted but an arbitrary viewer may not be.
+    * ``force_sp=True`` is the **override**: run as the app service principal and
+      never attempt OBO (for reads the OBO token can't do — e.g. the Genie REST
+      API, which the ``sql`` scope doesn't cover, or Lakebase credential minting).
+    * Otherwise, when a forwarded end-user token is present, run **as the viewer**
+      (OBO). If that read fails (typically because the viewer lacks a grant the
+      app SP holds — e.g. system tables), transparently **fall back to the SP**.
+    * With no forwarded token (local dev / unattended / scheduled), there is no
+      OBO identity, so the read runs as the SP directly.
+    * The deploy-time ``FORCE_SP`` knob (config) forces SP-only mode for the whole
+      app — OBO is never attempted — regardless of a forwarded token.
+
+    NOTE: the SP fallback trades a little of the "reflects exactly what *you* can
+    see" OBO promise for completeness — a viewer may see a signal via the SP that
+    they couldn't read themselves. That is the intended behaviour here.
     """
+    # Override: SP only, no OBO attempt, no fallback. Either the per-call override
+    # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
+    if force_sp or FORCE_SP:
+        record_identity("sp_forced_env" if FORCE_SP else "sp_forced_call")
+        return await _execute_once(query, parameters, force_sp=True)
+
+    # No forwarded viewer token → nothing to run OBO as; go straight to the SP.
+    if not get_user_token():
+        record_identity("sp_no_token")
+        return await _execute_once(query, parameters, force_sp=True)
+
+    # Default: try OBO (as the viewer). Fall back to the SP only when the failure
+    # looks like an AUTHORIZATION gap (the case the SP can actually cover). Other
+    # failures (timeout, bad SQL, warehouse down) would fail identically as the SP,
+    # so re-raise them instead of doubling latency with a pointless retry.
+    try:
+        rows = await _execute_once(query, parameters, force_sp=False)
+    except Exception as obo_err:
+        if not _is_authz_error(obo_err):
+            raise
+        logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
+        try:
+            sp_rows = await _execute_once(query, parameters, force_sp=True)
+        except Exception as sp_err:
+            # The SP fallback failed too (neither the viewer nor the app SP can
+            # read this). Chain the original OBO denial so it stays visible in the
+            # traceback instead of being masked by the SP's error. Do NOT record an
+            # identity here: the read was served by no one, so the signal is
+            # unavailable and must not be attributed to the SP.
+            raise sp_err from obo_err
+        # Record the fallback only once the SP has actually served the read.
+        record_identity("sp_fallback")
+        return sp_rows
+    else:
+        record_identity("obo")
+        return rows
+
+
+# Substrings that mark a failure as an authorization/permission problem — the only
+# case where retrying as the app SP can succeed. Matched case-insensitively against
+# the SQL Warehouse / Statement Execution error text.
+_AUTHZ_MARKERS = (
+    # Explicit permission / authorization denials.
+    "permission_denied", "does not have", "not authorized", "access denied",
+    "forbidden", "insufficient priv", "unauthorized", "no permission",
+    "privilege",            # "requires ... privilege", "insufficient privileges" (narrower than bare "requires")
+    "(401)", "(403)",       # HTTP status is wrapped as "SQL Warehouse error (403): ..." — no leading space
+    # UC often surfaces a missing catalog/schema grant as the object simply not
+    # existing (e.g. [TABLE_OR_VIEW_NOT_FOUND] "... cannot be found", "Catalog system
+    # not found"). For the fixed system / information_schema probes here, not-found
+    # almost always means a grant the app SP holds is missing for the viewer — so
+    # treat it as an authz gap worth the SP fallback rather than dropping the signal.
+    # Cover both the error-class tokens ("not_found", "does_not_exist") and the prose forms.
+    "not found", "not_found", "cannot be found", "does not exist", "does_not_exist",
+)
+
+
+def _is_authz_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _AUTHZ_MARKERS)
+
+
+async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool) -> list[dict]:
+    """Run the query once with a single resolved identity (OBO or SP)."""
     host = get_workspace_host()
     auth_headers = get_auth_headers(force_sp=force_sp)
 

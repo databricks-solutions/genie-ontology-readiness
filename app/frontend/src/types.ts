@@ -65,6 +65,16 @@ export interface PillarScore {
   best_practices: string[];
   summary: string;
   metrics: Record<string, unknown>;
+  identity: SignalIdentity | null;
+}
+
+// Which identity actually served a pillar's reads, so the UI can show whether the
+// signal reflects the viewer's own grants (OBO) or the app service principal's.
+export interface SignalIdentity {
+  ran_as: 'user' | 'service_principal' | 'mixed';
+  via: string;
+  label: string;
+  detail: string;
 }
 
 export interface ScorecardOverall {

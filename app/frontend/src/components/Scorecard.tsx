@@ -19,6 +19,7 @@ import type {
   Scorecard as ScorecardType,
   ScorecardOverall,
   PillarScore,
+  SignalIdentity,
   TopGap,
   HistoryResponse,
   HistorySnapshot,
@@ -60,6 +61,27 @@ function LevelBadge({ level, label }: { level: number; label: string }) {
     <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold ${s.bg} ${s.text}`}>
       <span className="tabular-nums">L{level}</span>
       <span className="font-medium">{label}</span>
+    </span>
+  );
+}
+
+// Shows which identity actually served a pillar's reads — so the viewer knows
+// whether the signal reflects THEIR own grants (OBO) or the app service
+// principal's. Full explanation on hover (title).
+function IdentityBadge({ identity }: { identity: SignalIdentity }) {
+  const short =
+    identity.ran_as === 'user' ? 'You' :
+    identity.ran_as === 'mixed' ? 'You + SP' : 'App SP';
+  const cls =
+    identity.ran_as === 'user' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+    identity.ran_as === 'mixed' ? 'bg-violet-50 text-violet-700 border-violet-200' :
+    'bg-amber-50 text-amber-700 border-amber-200';
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[11px] font-medium ${cls}`}
+      title={`Ran as: ${identity.label} — ${identity.detail}`}
+    >
+      {short}
     </span>
   );
 }
@@ -503,6 +525,7 @@ export default function Scorecard({
                     <span className="font-semibold text-ink-900">{p.name}</span>
                     <LevelBadge level={p.level} label={p.level_label} />
                     {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                    {p.identity && <IdentityBadge identity={p.identity} />}
                   </div>
                   <p className="text-xs text-ink-500 mt-0.5 truncate">{p.short}</p>
                 </div>

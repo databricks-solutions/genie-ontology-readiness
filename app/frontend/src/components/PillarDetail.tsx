@@ -1,7 +1,22 @@
 import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Info, Database, ChevronDown } from 'lucide-react';
-import type { PillarScore, AppConfig, GenieSpaceCuration, UcSchemaCount } from '../types';
+import type { PillarScore, AppConfig, GenieSpaceCuration, UcSchemaCount, SignalIdentity } from '../types';
 import GenieTester from './GenieTester';
+
+// A visible "read as" line naming the identity that served this pillar's reads
+// (OBO viewer / SP fallback / SP-forced), so viewers know whose grants the signal
+// reflects — without relying on a hover tooltip.
+function IdentityLine({ identity }: { identity: SignalIdentity }) {
+  return (
+    <p className="flex items-start gap-1.5 text-xs text-ink-500 leading-relaxed">
+      <Info size={13} className="mt-0.5 shrink-0" />
+      <span>
+        <span className="font-semibold text-ink-600">Read as {identity.label}.</span>{' '}
+        {identity.detail}
+      </span>
+    </p>
+  );
+}
 
 // Click-to-expand breakdown of the tables that are NOT in Unity Catalog, grouped
 // by legacy hive_metastore schema. Collapsed by default so a long list doesn't
@@ -105,11 +120,12 @@ export default function PillarDetail({
 }) {
   if (!pillar.available) {
     return (
-      <div className="px-4 pb-4 pt-1">
+      <div className="px-4 pb-4 pt-1 space-y-2">
         <div className="flex items-start gap-2 rounded-md bg-gray-50 border border-gray-200 px-3 py-3 text-sm text-ink-500">
           <Info size={16} className="mt-0.5 shrink-0" />
           <span>{pillar.note || 'This signal is not available in the current workspace context.'}</span>
         </div>
+        {pillar.identity && <IdentityLine identity={pillar.identity} />}
       </div>
     );
   }
@@ -119,6 +135,8 @@ export default function PillarDetail({
       {pillar.summary && (
         <p className="text-sm text-ink-700 leading-relaxed">{pillar.summary}</p>
       )}
+
+      {pillar.identity && <IdentityLine identity={pillar.identity} />}
 
       {pillar.signals.length > 0 && (
         <div>

@@ -16,6 +16,7 @@ from server.pillars import (
     readiness_stage,
 )
 from server.assessment.probes import PROBES, prime_request_sources
+from server.sql_client import start_identity_capture, resolved_identity
 from server.content.library import best_practices_for, capability_summary
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,10 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         "best_practices": best_practices_for(key),
         "summary": capability_summary(pillar_def["capability"]),
         "metrics": probe.get("metrics", {}),
+        # Which identity actually served this signal's reads (OBO viewer / SP
+        # fallback / SP-forced), so the UI can show whether it reflects the
+        # viewer's grants or the app SP's. None when the probe did no instrumented read.
+        "identity": probe.get("identity"),
     }
 
 
@@ -87,12 +92,22 @@ def _finalize(pillars_out: list[dict]) -> dict:
 
 
 async def _run_probe(key: str) -> tuple[str, dict]:
-    """Run a single probe, converting any exception into an unavailable result."""
+    """Run a single probe, converting any exception into an unavailable result.
+
+    Each probe runs in its own task (gather/ensure_future copy the context), so
+    starting identity capture here scopes the recording to this probe's reads; we
+    then attach the resolved identity to the probe result.
+    """
+    start_identity_capture()
     try:
-        return key, await PROBES[key]()
+        probe = await PROBES[key]()
     except Exception as e:
         logger.warning(f"probe {key} raised: {e}")
-        return key, _error_probe(f"Probe error: {str(e)[:120]}")
+        probe = _error_probe(f"Probe error: {str(e)[:120]}")
+    ident = resolved_identity()
+    if ident is not None:
+        probe = {**probe, "identity": ident}
+    return key, probe
 
 
 async def run_assessment() -> dict:

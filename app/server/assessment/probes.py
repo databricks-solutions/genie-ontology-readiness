@@ -32,7 +32,7 @@ import json
 import logging
 import aiohttp
 
-from server.sql_client import execute_sql
+from server.sql_client import execute_sql, record_rest_identity
 from server.config import (
     get_workspace_host,
     get_auth_headers,
@@ -54,12 +54,13 @@ def _empty(note: str) -> dict:
 
 
 def _no_catalogs_note(what: str) -> str:
-    """Zero-readable-catalogs message that points at the identity actually being
-    used. Under on-behalf-of-user the reads run as the viewer, so blame the user's
-    grants; otherwise blame the app service principal."""
+    """Zero-readable-catalogs message. Under on-behalf-of-user the reads run as the
+    viewer and fall back to the app SP on authorization errors, so when nothing is
+    readable the fix may be a grant on either identity — name both. Without a viewer
+    token the reads run as the app SP only, so blame that."""
     if get_user_token():
-        return (f"No catalogs are readable by your user account for the {what}. Ensure you have "
-                f"USE CATALOG + SELECT on the catalogs to assess.")
+        return (f"No catalogs are readable for the {what}. Ensure your user account — or the "
+                f"app service principal — has USE CATALOG + SELECT on the catalogs to assess.")
     return (f"No readable catalogs for the {what}. Grant the app service principal "
             f"USE CATALOG + SELECT on the catalogs to assess.")
 
@@ -71,7 +72,8 @@ async def _scalar(query: str, force_sp: bool = False):
     format, so COUNT(*) comes back as e.g. "8" — coerce to int/float so callers
     can compare numerically.
 
-    ``force_sp=True`` runs as the app service principal (for system-table reads).
+    ``force_sp=True`` is the SP-only override; by default reads run OBO with an
+    automatic SP fallback (see ``execute_sql``).
     """
     rows = await execute_sql(query, force_sp=force_sp)
     if not rows:
@@ -725,6 +727,10 @@ async def _native_domains() -> int | None:
                     if resp.status == 200:
                         data = await resp.json()
                         domains = data.get("data_domains") or data.get("domains") or data.get("data") or []
+                        # This REST read doesn't go through execute_sql, so record its
+                        # identity via the shared helper (mirrors execute_sql's base
+                        # OBO-vs-SP decision, keeping the mode vocabulary in one place).
+                        record_rest_identity()
                         return len(domains)
         except Exception:
             continue
@@ -903,10 +909,11 @@ async def probe_adoption() -> dict:
     try:
         active_users = None
         try:
+            # System tables default to OBO like every other signal; if the viewer
+            # lacks the grant, execute_sql falls back to the app SP automatically.
             active_users = await _scalar(
                 "SELECT COUNT(DISTINCT user_identity.email) FROM system.access.audit "
                 "WHERE event_date >= current_date() - INTERVAL 30 DAYS",
-                force_sp=True,  # system tables: the SP is granted; an OBO viewer may not be
             )
         except Exception:
             active_users = None
@@ -916,13 +923,22 @@ async def probe_adoption() -> dict:
             queries_30d = await _scalar(
                 "SELECT COUNT(*) FROM system.query.history "
                 "WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS",
-                force_sp=True,
             )
         except Exception:
             queries_30d = None
 
         if active_users is None and queries_30d is None:
-            return _empty("System tables (system.access / system.query) are not enabled or not granted to the app SP.")
+            # Neither read returned. Under OBO the read ran as the viewer and, on an
+            # authorization error, would have fallen back to the app SP — but a
+            # non-authz failure (timeout/5xx) skips that fallback, so we can't assert
+            # the SP was actually tried. Point at both grant targets instead; for this
+            # workspace-wide signal the SP grant is usually the right fix.
+            who = ("the app service principal (recommended for this workspace-wide "
+                   "signal) or your user account"
+                   if get_user_token()
+                   else "the app service principal")
+            return _empty("System tables (system.access / system.query) are not enabled "
+                          f"or not granted to {who}.")
 
         # Band the (time-windowed) activity counts into fixed tiers so day-to-day
         # drift rarely moves the score — keeps runs comparable while still
