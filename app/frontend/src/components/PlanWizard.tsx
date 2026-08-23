@@ -31,12 +31,13 @@ export default function PlanWizard({
 }) {
 
   const [assessments, setAssessments] = useState<HistorySnapshot[]>([]);
-  // Whether /assess/history has resolved successfully at least once. Distinguishes
-  // "history loaded and genuinely empty" (→ use the in-session scorecard) from
-  // "not loaded yet / fetch failed" (→ don't assume there's no history and silently
-  // save a plan with no snapshot link). Note: without Lakebase the endpoint returns
-  // 200 with an empty list, so the in-session path still engages there.
-  const [assessmentsLoaded, setAssessmentsLoaded] = useState(false);
+  // Load state of /assess/history: 'loading' until the first resolve, then 'loaded'
+  // (success — the list may be empty) or 'error' (fetch failed). Lets us (a) show a
+  // spinner instead of a premature "run an assessment first" flash, and (b) on
+  // error fall back to the in-session path rather than blocking the user. Without
+  // Lakebase the endpoint returns 200 with an empty list, so it resolves to 'loaded'
+  // and the in-session path still engages.
+  const [historyStatus, setHistoryStatus] = useState<'loading' | 'loaded' | 'error'>('loading');
   const [plans, setPlans] = useState<PlanListItem[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<number | null>(null);
   const [mode, setMode] = useState<'new' | 'view'>('new');
@@ -51,11 +52,14 @@ export default function PlanWizard({
   // `fromCurrent`/history state changes later in the session.
   const [viewBasis, setViewBasis] = useState<string | null>(null);
 
-  // No saved history (e.g. no Lakebase) but an assessment was run this session →
-  // generate the plan from that in-session scorecard instead of a stored snapshot.
-  // Gate on a successful history load so a not-yet-loaded / failed fetch isn't
-  // mistaken for "no history" (which would drop a real snapshot link on save).
-  const fromCurrent = assessmentsLoaded && assessments.length === 0 && !!scorecard;
+  // Use the in-session scorecard when history loaded and is genuinely empty (e.g. no
+  // Lakebase), OR when the history fetch failed — on error prefer letting the user
+  // generate from this session over blocking them (the rare cost is a
+  // Lakebase-present save that lacks a snapshot link). While still 'loading',
+  // fromCurrent stays false and the UI shows a spinner rather than deciding.
+  const fromCurrent =
+    !!scorecard &&
+    ((historyStatus === 'loaded' && assessments.length === 0) || historyStatus === 'error');
   const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
   // Single source of truth for the "Current assessment · N/100" base label, so the
   // composer and the view-pane provenance line can't drift.
@@ -71,7 +75,7 @@ export default function PlanWizard({
       .then((h) => {
         const snaps = h.snapshots || [];
         setAssessments(snaps);
-        setAssessmentsLoaded(true);
+        setHistoryStatus('loaded');
         // Default to the newest assessment; keep the current selection if it still exists.
         setSelectedSnapshotId((cur) =>
           cur != null && snaps.some((s) => Number(s.id) === cur)
@@ -81,7 +85,7 @@ export default function PlanWizard({
             : null
         );
       })
-      .catch(() => {});
+      .catch(() => setHistoryStatus('error'));
   }
 
   // Refetch whenever the Plan tab becomes active, so an assessment just run on the
@@ -204,6 +208,17 @@ export default function PlanWizard({
     } finally {
       setExporting(false);
     }
+  }
+
+  // History still loading with nothing to show yet → spinner, so we don't flash
+  // "run an assessment first" before /assess/history resolves (it would show even
+  // when saved history exists).
+  if (historyStatus === 'loading' && assessments.length === 0 && !scorecard) {
+    return (
+      <div className="card max-w-2xl mx-auto mt-10 p-8 text-center">
+        <Spinner label="Loading…" />
+      </div>
+    );
   }
 
   // No saved assessments AND nothing run this session → point the user at Assess.
