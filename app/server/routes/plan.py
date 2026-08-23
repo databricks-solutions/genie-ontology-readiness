@@ -116,20 +116,20 @@ async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[st
             return JSONResponse(status_code=404, content={"error": "Assessment not found."})
         scorecard = snap.get("scorecard") or {}
     elif req.scorecard is not None:
+        # Client-supplied (in-session assessment, when history isn't persisted).
         scorecard = req.scorecard
-        # The inline scorecard is client-supplied (in-session assessment). Validate
-        # it actually has pillars — an empty/malformed dict passes `is not None` but
-        # would otherwise produce a generic "no assessment available" plan instead of
-        # a clear error.
-        if not isinstance(scorecard, dict) or not scorecard.get("pillars"):
-            return JSONResponse(
-                status_code=400,
-                content={"error": "The provided assessment is empty — run an assessment first."},
-            )
     else:
         return JSONResponse(
             status_code=400,
             content={"error": "Provide a snapshot_id or an assessment scorecard."},
+        )
+    # Validate the resolved scorecard from EITHER source has real content — an empty
+    # or malformed one (client dict, or a degraded/legacy snapshot) would otherwise
+    # stream a generic "no assessment available" plan instead of a clear error.
+    if not isinstance(scorecard, dict) or not scorecard.get("pillars"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "The assessment is empty — run an assessment first."},
         )
     system = _generate_system(scorecard)
     messages = [

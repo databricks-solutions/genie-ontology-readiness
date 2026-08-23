@@ -31,6 +31,12 @@ export default function PlanWizard({
 }) {
 
   const [assessments, setAssessments] = useState<HistorySnapshot[]>([]);
+  // Whether /assess/history has resolved successfully at least once. Distinguishes
+  // "history loaded and genuinely empty" (→ use the in-session scorecard) from
+  // "not loaded yet / fetch failed" (→ don't assume there's no history and silently
+  // save a plan with no snapshot link). Note: without Lakebase the endpoint returns
+  // 200 with an empty list, so the in-session path still engages there.
+  const [assessmentsLoaded, setAssessmentsLoaded] = useState(false);
   const [plans, setPlans] = useState<PlanListItem[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<number | null>(null);
   const [mode, setMode] = useState<'new' | 'view'>('new');
@@ -47,7 +53,9 @@ export default function PlanWizard({
 
   // No saved history (e.g. no Lakebase) but an assessment was run this session →
   // generate the plan from that in-session scorecard instead of a stored snapshot.
-  const fromCurrent = assessments.length === 0 && !!scorecard;
+  // Gate on a successful history load so a not-yet-loaded / failed fetch isn't
+  // mistaken for "no history" (which would drop a real snapshot link on save).
+  const fromCurrent = assessmentsLoaded && assessments.length === 0 && !!scorecard;
   const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
   // Single source of truth for the "Current assessment · N/100" base label, so the
   // composer and the view-pane provenance line can't drift.
@@ -63,6 +71,7 @@ export default function PlanWizard({
       .then((h) => {
         const snaps = h.snapshots || [];
         setAssessments(snaps);
+        setAssessmentsLoaded(true);
         // Default to the newest assessment; keep the current selection if it still exists.
         setSelectedSnapshotId((cur) =>
           cur != null && snaps.some((s) => Number(s.id) === cur)
