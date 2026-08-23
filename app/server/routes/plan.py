@@ -25,7 +25,11 @@ router = APIRouter()
 
 
 class PlanGenerateRequest(BaseModel):
-    snapshot_id: int          # the assessment this plan is generated against
+    # A plan is generated against EITHER a saved assessment (snapshot_id) or an
+    # in-session assessment passed inline (scorecard). The inline path lets Plan
+    # work when history isn't persisted (no Lakebase attached).
+    snapshot_id: Optional[int] = None
+    scorecard: Optional[dict] = None
 
 
 class PlanSaveRequest(BaseModel):
@@ -99,21 +103,41 @@ Do not invent scores or accelerators that are not listed above. Be specific to t
 
 @router.post("/plan/generate")
 async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[str] = Header(default=None)):
-    """Generate the action plan against a SELECTED, stored assessment (no conversation).
+    """Generate the action plan against an assessment (no conversation).
 
-    The scorecard is loaded server-side from the user's own snapshot, so a plan is
-    always tied to a real, persisted assessment.
+    The assessment comes from EITHER a saved snapshot (``snapshot_id``, loaded
+    server-side from the user's own history) or an inline ``scorecard`` sent by the
+    client — the latter lets the Plan tab work from the in-session assessment even
+    when history isn't persisted (no Lakebase attached).
     """
-    snap = await snapshots.get_snapshot(req.snapshot_id, created_by=x_forwarded_email)
-    if snap is None:
-        return JSONResponse(status_code=404, content={"error": "Assessment not found."})
-    scorecard = snap.get("scorecard") or {}
+    if req.snapshot_id is not None:
+        snap = await snapshots.get_snapshot(req.snapshot_id, created_by=x_forwarded_email)
+        if snap is None:
+            return JSONResponse(status_code=404, content={"error": "Assessment not found."})
+        scorecard = snap.get("scorecard") or {}
+    elif req.scorecard is not None:
+        # Client-supplied (in-session assessment, when history isn't persisted).
+        scorecard = req.scorecard
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Provide a snapshot_id or an assessment scorecard."},
+        )
+    # Validate the resolved scorecard from EITHER source has real content — an empty
+    # or malformed one (client dict, or a degraded/legacy snapshot) would otherwise
+    # stream a generic "no assessment available" plan instead of a clear error.
+    if not isinstance(scorecard, dict) or not scorecard.get("pillars"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "The assessment is empty — run an assessment first."},
+        )
     system = _generate_system(scorecard)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": "Generate the action plan now."},
     ]
-    logger.info("Plan generate for snapshot %s", req.snapshot_id)
+    logger.info("Plan generate for %s",
+                f"snapshot {req.snapshot_id}" if req.snapshot_id is not None else "in-session assessment")
     return StreamingResponse(
         stream_llm_chat(messages, max_tokens=2000, temperature=0.4),
         media_type="text/event-stream",
