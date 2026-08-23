@@ -40,11 +40,19 @@ export default function PlanWizard({
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [currentPlanId, setCurrentPlanId] = useState<number | null>(null);
+  // Provenance label frozen at the moment a plan is generated or loaded, so the
+  // view pane keeps showing what THIS plan was actually based on even if the live
+  // `fromCurrent`/history state changes later in the session.
+  const [viewBasis, setViewBasis] = useState<string | null>(null);
 
   // No saved history (e.g. no Lakebase) but an assessment was run this session →
   // generate the plan from that in-session scorecard instead of a stored snapshot.
   const fromCurrent = assessments.length === 0 && !!scorecard;
   const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
+  // Single source of truth for the "Current assessment · N/100" base label, so the
+  // composer and the view-pane provenance line can't drift.
+  const currentBaseLabel = (score: number | null) =>
+    `Current assessment${score != null ? ` · ${score}/100` : ''}`;
 
   function refreshPlans() {
     apiGet<PlansResponse>('/plan/list').then((r) => setPlans(r.plans || [])).catch(() => {});
@@ -100,14 +108,24 @@ export default function PlanWizard({
   async function generate() {
     // Need either a selected saved snapshot, or an in-session assessment to use.
     if (generating || (!fromCurrent && selectedSnapshotId == null)) return;
+    // Freeze the basis at generation time: the stream body, the saved metadata, and
+    // the displayed provenance all use these captured values, so nothing shifts if
+    // `fromCurrent`/history resolves differently mid-stream.
+    const genFromCurrent = fromCurrent;
+    const genSnapshotId = selectedSnapshotId;
+    const genBasisLabel = genFromCurrent ? currentBaseLabel(currentScore) : labelForSnapshot(genSnapshotId);
     setError(null);
     setOutput('');
     setCurrentPlanId(null);
+    setViewBasis(genBasisLabel);
+    // Switch to the view pane BEFORE streaming so the plan renders live as it
+    // arrives and survives a save failure (saving is best-effort). Previously
+    // setMode('view') ran only after /plan/save resolved, so streaming was never
+    // shown and a save error discarded the generated plan.
+    setMode('view');
     setGenerating(true);
     let acc = '';
-    // Generate from the in-session scorecard when there's no saved history,
-    // otherwise from the selected saved snapshot.
-    const genBody = fromCurrent ? { scorecard } : { snapshot_id: selectedSnapshotId };
+    const genBody = genFromCurrent ? { scorecard } : { snapshot_id: genSnapshotId };
     try {
       for await (const chunk of streamPost('/plan/generate', genBody, model)) {
         acc += chunk;
@@ -115,12 +133,11 @@ export default function PlanWizard({
       }
       if (acc.trim()) {
         try {
-          const saveBody = fromCurrent
+          const saveBody = genFromCurrent
             ? { snapshot_id: null, title: PLAN_TITLE, markdown: acc }
-            : { snapshot_id: selectedSnapshotId, title: titleFor(selectedSnapshotId), markdown: acc };
+            : { snapshot_id: genSnapshotId, title: titleFor(genSnapshotId), markdown: acc };
           const res = await apiPost<PlanSaveResponse>('/plan/save', saveBody, model);
           if (res.id != null) setCurrentPlanId(res.id);
-          setMode('view');
           refreshPlans();
         } catch {
           /* saving is best-effort (needs Lakebase); the plan is still shown */
@@ -141,6 +158,8 @@ export default function PlanWizard({
       setOutput(p.plan_markdown);
       setCurrentPlanId(p.id);
       if (p.snapshot_id != null) setSelectedSnapshotId(p.snapshot_id);
+      // Freeze this loaded plan's provenance from its own linked snapshot.
+      setViewBasis(labelForSnapshot(p.snapshot_id));
       setMode('view');
     } catch (e) {
       setError((e as Error).message);
@@ -255,7 +274,7 @@ export default function PlanWizard({
             {fromCurrent ? (
               <div className="w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-ink-700 flex items-center gap-2">
                 <Gauge size={14} className="text-databricks-500 shrink-0" />
-                Current assessment{currentScore != null ? ` · ${currentScore}/100` : ''}
+                {currentBaseLabel(currentScore)}
                 <span className="text-ink-400">(this session)</span>
               </div>
             ) : (
@@ -312,10 +331,7 @@ export default function PlanWizard({
               )}
             </div>
             <p className="text-xs text-ink-400 flex items-center gap-1 mb-4">
-              <Link2 size={11} /> Based on assessment ·{' '}
-              {fromCurrent
-                ? `Current assessment${currentScore != null ? ` · ${currentScore}/100` : ''}`
-                : labelForSnapshot(selectedSnapshotId)}
+              <Link2 size={11} /> Based on assessment · {viewBasis ?? '—'}
             </p>
 
             {error && (
