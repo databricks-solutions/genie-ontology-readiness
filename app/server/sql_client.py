@@ -33,6 +33,21 @@ def record_identity(mode: str) -> None:
         rec.append(mode)
 
 
+def record_rest_identity() -> None:
+    """Record the identity for a REST read that ALREADY succeeded and bypassed
+    execute_sql (so it can't be captured centrally). Mirrors execute_sql's base
+    OBO-vs-SP decision in one place, so REST callers don't hand-duplicate the mode
+    vocabulary: FORCE_SP → the SP (sp_forced_env; get_user_token() is already None
+    under it), a forwarded viewer token → OBO, otherwise the SP. REST reads have no
+    per-call force_sp or fallback, so those modes don't apply here."""
+    if FORCE_SP:
+        record_identity("sp_forced_env")
+    elif get_user_token():
+        record_identity("obo")
+    else:
+        record_identity("sp_no_token")
+
+
 def resolved_identity() -> Optional[dict]:
     """Summarize the identities recorded since start_identity_capture().
 
