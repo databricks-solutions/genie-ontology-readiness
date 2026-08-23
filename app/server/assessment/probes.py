@@ -39,6 +39,7 @@ from server.config import (
     ASSESS_CATALOGS,
     GENIE_SPACE_ID,
     get_user_token,
+    FORCE_SP,
 )
 
 logger = logging.getLogger(__name__)
@@ -728,9 +729,12 @@ async def _native_domains() -> int | None:
                         data = await resp.json()
                         domains = data.get("data_domains") or data.get("domains") or data.get("data") or []
                         # This REST read doesn't go through execute_sql, so record its
-                        # identity explicitly: get_auth_headers() uses the viewer token
-                        # when present (OBO), else the app SP.
-                        record_identity("obo" if get_user_token() else "sp_no_token")
+                        # identity explicitly, using the same vocabulary: FORCE_SP →
+                        # sp_forced_env (get_user_token() is already None under it, so
+                        # get_auth_headers ran as the SP); else viewer token → obo; else SP.
+                        record_identity("sp_forced_env" if FORCE_SP
+                                        else "obo" if get_user_token()
+                                        else "sp_no_token")
                         return len(domains)
         except Exception:
             continue

@@ -113,14 +113,18 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
         if not _is_authz_error(obo_err):
             raise
         logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
-        record_identity("sp_fallback")
         try:
-            return await _execute_once(query, parameters, force_sp=True)
+            sp_rows = await _execute_once(query, parameters, force_sp=True)
         except Exception as sp_err:
             # The SP fallback failed too (neither the viewer nor the app SP can
             # read this). Chain the original OBO denial so it stays visible in the
-            # traceback instead of being masked by the SP's error.
+            # traceback instead of being masked by the SP's error. Do NOT record an
+            # identity here: the read was served by no one, so the signal is
+            # unavailable and must not be attributed to the SP.
             raise sp_err from obo_err
+        # Record the fallback only once the SP has actually served the read.
+        record_identity("sp_fallback")
+        return sp_rows
     else:
         record_identity("obo")
         return rows
