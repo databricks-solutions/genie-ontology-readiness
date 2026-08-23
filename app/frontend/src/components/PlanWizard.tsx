@@ -8,6 +8,7 @@ import type {
   PlanListItem,
   PlanDetail,
   PlanSaveResponse,
+  Scorecard as ScorecardType,
 } from '../types';
 import Markdown from './Markdown';
 import Spinner from './Spinner';
@@ -19,8 +20,24 @@ function fmtWhen(iso: string): string {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-export default function PlanWizard({ model, active }: { model: string; active: boolean }) {
+export default function PlanWizard({
+  model,
+  active,
+  scorecard,
+}: {
+  model: string;
+  active: boolean;
+  scorecard: ScorecardType | null;
+}) {
+
   const [assessments, setAssessments] = useState<HistorySnapshot[]>([]);
+  // Load state of /assess/history: 'loading' until the first resolve, then 'loaded'
+  // (success — the list may be empty) or 'error' (fetch failed). Lets us (a) show a
+  // spinner instead of a premature "run an assessment first" flash, and (b) on
+  // error fall back to the in-session path rather than blocking the user. Without
+  // Lakebase the endpoint returns 200 with an empty list, so it resolves to 'loaded'
+  // and the in-session path still engages.
+  const [historyStatus, setHistoryStatus] = useState<'loading' | 'loaded' | 'error'>('loading');
   const [plans, setPlans] = useState<PlanListItem[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<number | null>(null);
   const [mode, setMode] = useState<'new' | 'view'>('new');
@@ -30,6 +47,23 @@ export default function PlanWizard({ model, active }: { model: string; active: b
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [currentPlanId, setCurrentPlanId] = useState<number | null>(null);
+  // Provenance label frozen at the moment a plan is generated or loaded, so the
+  // view pane keeps showing what THIS plan was actually based on even if the live
+  // `fromCurrent`/history state changes later in the session.
+  const [viewBasis, setViewBasis] = useState<string | null>(null);
+
+  // Use the in-session scorecard only when there are NO saved snapshots to pick
+  // from and history is no longer loading. Empty covers both 'loaded && empty'
+  // (e.g. no Lakebase) and a failed fetch that never populated `assessments` — in
+  // the failure case we still let the user generate from this session rather than
+  // block them. Crucially this stays false whenever `assessments` is populated
+  // (even if a later refetch errored), so a real snapshot picker is never discarded.
+  const fromCurrent = !!scorecard && assessments.length === 0 && historyStatus !== 'loading';
+  const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
+  // Single source of truth for the "Current assessment · N/100" base label, so the
+  // composer and the view-pane provenance line can't drift.
+  const currentBaseLabel = (score: number | null) =>
+    `Current assessment${score != null ? ` · ${score}/100` : ''}`;
 
   function refreshPlans() {
     apiGet<PlansResponse>('/plan/list').then((r) => setPlans(r.plans || [])).catch(() => {});
@@ -40,6 +74,7 @@ export default function PlanWizard({ model, active }: { model: string; active: b
       .then((h) => {
         const snaps = h.snapshots || [];
         setAssessments(snaps);
+        setHistoryStatus('loaded');
         // Default to the newest assessment; keep the current selection if it still exists.
         setSelectedSnapshotId((cur) =>
           cur != null && snaps.some((s) => Number(s.id) === cur)
@@ -49,7 +84,7 @@ export default function PlanWizard({ model, active }: { model: string; active: b
             : null
         );
       })
-      .catch(() => {});
+      .catch(() => setHistoryStatus('error'));
   }
 
   // Refetch whenever the Plan tab becomes active, so an assessment just run on the
@@ -83,29 +118,41 @@ export default function PlanWizard({ model, active }: { model: string; active: b
   }
 
   async function generate() {
-    if (generating || selectedSnapshotId == null) return;
+    // Need either a selected saved snapshot, or an in-session assessment to use.
+    if (generating || (!fromCurrent && selectedSnapshotId == null)) return;
+    // Freeze the basis at generation time: the stream body, the saved metadata, and
+    // the displayed provenance all use these captured values, so nothing shifts if
+    // `fromCurrent`/history resolves differently mid-stream.
+    const genFromCurrent = fromCurrent;
+    const genSnapshotId = selectedSnapshotId;
+    const genBasisLabel = genFromCurrent ? currentBaseLabel(currentScore) : labelForSnapshot(genSnapshotId);
     setError(null);
     setOutput('');
     setCurrentPlanId(null);
+    setViewBasis(genBasisLabel);
+    // Switch to the view pane BEFORE streaming so the plan renders live as it
+    // arrives and survives a save failure (saving is best-effort). Previously
+    // setMode('view') ran only after /plan/save resolved, so streaming was never
+    // shown and a save error discarded the generated plan.
+    setMode('view');
     setGenerating(true);
     let acc = '';
+    const genBody = genFromCurrent ? { scorecard } : { snapshot_id: genSnapshotId };
     try {
-      for await (const chunk of streamPost('/plan/generate', { snapshot_id: selectedSnapshotId }, model)) {
+      for await (const chunk of streamPost('/plan/generate', genBody, model)) {
         acc += chunk;
         setOutput(acc);
       }
       if (acc.trim()) {
         try {
-          const res = await apiPost<PlanSaveResponse>(
-            '/plan/save',
-            { snapshot_id: selectedSnapshotId, title: titleFor(selectedSnapshotId), markdown: acc },
-            model
-          );
+          const saveBody = genFromCurrent
+            ? { snapshot_id: null, title: PLAN_TITLE, markdown: acc }
+            : { snapshot_id: genSnapshotId, title: titleFor(genSnapshotId), markdown: acc };
+          const res = await apiPost<PlanSaveResponse>('/plan/save', saveBody, model);
           if (res.id != null) setCurrentPlanId(res.id);
-          setMode('view');
           refreshPlans();
         } catch {
-          /* saving is best-effort; the plan is still shown */
+          /* saving is best-effort (needs Lakebase); the plan is still shown */
         }
       }
     } catch (e) {
@@ -123,6 +170,8 @@ export default function PlanWizard({ model, active }: { model: string; active: b
       setOutput(p.plan_markdown);
       setCurrentPlanId(p.id);
       if (p.snapshot_id != null) setSelectedSnapshotId(p.snapshot_id);
+      // Freeze this loaded plan's provenance from its own linked snapshot.
+      setViewBasis(labelForSnapshot(p.snapshot_id));
       setMode('view');
     } catch (e) {
       setError((e as Error).message);
@@ -160,8 +209,22 @@ export default function PlanWizard({ model, active }: { model: string; active: b
     }
   }
 
-  // No assessments yet → point the user at the Assess tab.
-  if (assessments.length === 0) {
+  // While history is loading, show a spinner rather than deciding what to render —
+  // this avoids both a premature "run an assessment first" flash (when saved history
+  // exists) and a flash of an empty base-assessment dropdown (when a scorecard
+  // exists but snapshots haven't loaded yet). historyStatus only sits at 'loading'
+  // until the first resolve; later refetches keep it 'loaded'/'error', so this
+  // doesn't re-spinner on tab revisits.
+  if (historyStatus === 'loading') {
+    return (
+      <div className="card max-w-2xl mx-auto mt-10 p-8 text-center">
+        <Spinner label="Loading…" />
+      </div>
+    );
+  }
+
+  // No saved assessments AND nothing run this session → point the user at Assess.
+  if (assessments.length === 0 && !scorecard) {
     return (
       <div className="card max-w-2xl mx-auto mt-10 p-8 text-center">
         <div className="w-12 h-12 rounded-xl bg-databricks-50 flex items-center justify-center mx-auto mb-4">
@@ -226,25 +289,33 @@ export default function PlanWizard({ model, active }: { model: string; active: b
             </div>
             <h2 className="text-xl font-bold text-ink-900">Generate an action plan</h2>
             <p className="text-sm text-ink-600 mt-2 leading-relaxed">
-              Pick the assessment to base this plan on. The plan is generated with AI from that
-              assessment's scores and gaps, with clear tactical steps and the Databricks accelerators
-              that close each gap.
+              {fromCurrent
+                ? 'The plan is generated with AI from your current assessment’s scores and gaps, with clear tactical steps and the Databricks accelerators that close each gap.'
+                : 'Pick the assessment to base this plan on. The plan is generated with AI from that assessment’s scores and gaps, with clear tactical steps and the Databricks accelerators that close each gap.'}
             </p>
 
             <label className="block mt-5 text-xs font-semibold uppercase tracking-wider text-ink-400 mb-1.5">
               Base assessment
             </label>
-            <select
-              value={selectedSnapshotId ?? ''}
-              onChange={(e) => setSelectedSnapshotId(Number(e.target.value))}
-              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
-            >
-              {assessments.map((a) => (
-                <option key={a.id} value={Number(a.id)}>
-                  {Math.round(a.overall_score)}/100 · {fmtWhen(a.created_at)}
-                </option>
-              ))}
-            </select>
+            {fromCurrent ? (
+              <div className="w-full rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-ink-700 flex items-center gap-2">
+                <Gauge size={14} className="text-databricks-500 shrink-0" />
+                {currentBaseLabel(currentScore)}
+                <span className="text-ink-400">(this session)</span>
+              </div>
+            ) : (
+              <select
+                value={selectedSnapshotId ?? ''}
+                onChange={(e) => setSelectedSnapshotId(Number(e.target.value))}
+                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
+              >
+                {assessments.map((a) => (
+                  <option key={a.id} value={Number(a.id)}>
+                    {Math.round(a.overall_score)}/100 · {fmtWhen(a.created_at)}
+                  </option>
+                ))}
+              </select>
+            )}
 
             {error && (
               <p className="mt-4 text-sm text-red-600 flex items-center gap-1.5">
@@ -254,13 +325,18 @@ export default function PlanWizard({ model, active }: { model: string; active: b
 
             <button
               onClick={generate}
-              disabled={generating || selectedSnapshotId == null}
+              disabled={generating || (!fromCurrent && selectedSnapshotId == null)}
               className="btn-primary mt-5 inline-flex items-center gap-2"
             >
               <Sparkles size={16} />
               {generating ? 'Generating…' : 'Generate plan'}
             </button>
-            <p className="text-xs text-ink-400 mt-3">Uses your workspace's Foundation Model API. The plan is saved to your history.</p>
+            <p className="text-xs text-ink-400 mt-3">
+              Uses your workspace's Foundation Model API.{' '}
+              {fromCurrent
+                ? 'No Lakebase is attached, so this plan lives only in this session (export it to keep a copy).'
+                : 'The plan is saved to your history.'}
+            </p>
           </div>
         ) : (
           // ---- Viewing / streaming a plan ----------------------------------
@@ -281,7 +357,7 @@ export default function PlanWizard({ model, active }: { model: string; active: b
               )}
             </div>
             <p className="text-xs text-ink-400 flex items-center gap-1 mb-4">
-              <Link2 size={11} /> Based on assessment · {labelForSnapshot(selectedSnapshotId)}
+              <Link2 size={11} /> Based on assessment · {viewBasis ?? '—'}
             </p>
 
             {error && (
