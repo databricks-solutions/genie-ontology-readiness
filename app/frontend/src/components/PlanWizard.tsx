@@ -52,14 +52,13 @@ export default function PlanWizard({
   // `fromCurrent`/history state changes later in the session.
   const [viewBasis, setViewBasis] = useState<string | null>(null);
 
-  // Use the in-session scorecard when history loaded and is genuinely empty (e.g. no
-  // Lakebase), OR when the history fetch failed — on error prefer letting the user
-  // generate from this session over blocking them (the rare cost is a
-  // Lakebase-present save that lacks a snapshot link). While still 'loading',
-  // fromCurrent stays false and the UI shows a spinner rather than deciding.
-  const fromCurrent =
-    !!scorecard &&
-    ((historyStatus === 'loaded' && assessments.length === 0) || historyStatus === 'error');
+  // Use the in-session scorecard only when there are NO saved snapshots to pick
+  // from and history is no longer loading. Empty covers both 'loaded && empty'
+  // (e.g. no Lakebase) and a failed fetch that never populated `assessments` — in
+  // the failure case we still let the user generate from this session rather than
+  // block them. Crucially this stays false whenever `assessments` is populated
+  // (even if a later refetch errored), so a real snapshot picker is never discarded.
+  const fromCurrent = !!scorecard && assessments.length === 0 && historyStatus !== 'loading';
   const currentScore = scorecard ? Math.round(scorecard.overall.score) : null;
   // Single source of truth for the "Current assessment · N/100" base label, so the
   // composer and the view-pane provenance line can't drift.
@@ -210,10 +209,13 @@ export default function PlanWizard({
     }
   }
 
-  // History still loading with nothing to show yet → spinner, so we don't flash
-  // "run an assessment first" before /assess/history resolves (it would show even
-  // when saved history exists).
-  if (historyStatus === 'loading' && assessments.length === 0 && !scorecard) {
+  // While history is loading, show a spinner rather than deciding what to render —
+  // this avoids both a premature "run an assessment first" flash (when saved history
+  // exists) and a flash of an empty base-assessment dropdown (when a scorecard
+  // exists but snapshots haven't loaded yet). historyStatus only sits at 'loading'
+  // until the first resolve; later refetches keep it 'loaded'/'error', so this
+  // doesn't re-spinner on tab revisits.
+  if (historyStatus === 'loading') {
     return (
       <div className="card max-w-2xl mx-auto mt-10 p-8 text-center">
         <Spinner label="Loading…" />
