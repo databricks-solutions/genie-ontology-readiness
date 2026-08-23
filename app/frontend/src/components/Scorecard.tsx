@@ -70,7 +70,7 @@ function fmtWhen(iso: string): string {
 }
 
 // Wrap a pillar name to <=~16-char lines so long titles like
-// "Domains & Stewardship" don't clip off the radar chart.
+// "Relationships & Modeling" don't clip off the radar chart.
 function wrapLabel(text: string, maxChars = 16): string[] {
   const words = text.split(' ');
   const lines: string[] = [];
@@ -144,9 +144,11 @@ export default function Scorecard({
   const radarData = useMemo(
     () =>
       config.pillars
-        // Drop score-exempt pillars (e.g. the Beta Pages placeholder) — they
-        // carry no real score and would show as a misleading 0 on the radar.
-        .filter((p) => !pillarsByKey[p.key]?.score_exempt)
+        // Only plot pillars actually present in this scorecard, and drop
+        // score-exempt ones (e.g. the Beta Pages placeholder). This also guards a
+        // snapshot saved before a pillar existed (old run loaded after an upgrade):
+        // without the presence check it would plot a misleading 0 spoke.
+        .filter((p) => pillarsByKey[p.key] && !pillarsByKey[p.key]?.score_exempt)
         .map((p) => ({
           // Use the pillar's card title (name), not its long description, so the
           // radar labels match the scored pillar cards below.
@@ -479,12 +481,24 @@ export default function Scorecard({
         {config.pillars.map((cp) => {
           const p = pillarsByKey[cp.key];
           if (!p) {
+            // Still streaming → show the loading skeleton. But on a completed
+            // scorecard a missing pillar means this snapshot predates it (e.g. an
+            // old run saved before Pages existed, loaded after an upgrade): there's
+            // nothing to wait for, so show a muted "not in this assessment" instead
+            // of a spinner that never resolves.
+            const waiting = phase === 'running';
             return (
               <div key={cp.key} className="card flex items-center gap-4 px-4 py-3 opacity-70">
-                <Loader2 size={16} className="animate-spin text-ink-300 shrink-0 w-12" />
+                {waiting ? (
+                  <Loader2 size={16} className="animate-spin text-ink-300 shrink-0 w-12" />
+                ) : (
+                  <div className="w-12 text-center shrink-0 text-lg font-bold text-ink-300">—</div>
+                )}
                 <div className="flex-1 min-w-0">
                   <span className="font-semibold text-ink-500">{cp.name}</span>
-                  <p className="text-xs text-ink-400 mt-0.5 truncate">Checking…</p>
+                  <p className="text-xs text-ink-400 mt-0.5 truncate">
+                    {waiting ? 'Checking…' : 'Not in this assessment'}
+                  </p>
                 </div>
               </div>
             );
