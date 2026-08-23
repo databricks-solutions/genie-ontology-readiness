@@ -147,13 +147,16 @@ export default function Scorecard({
         .filter((p) => {
           const ps = pillarsByKey[p.key];
           // Always drop score-exempt pillars (e.g. the Beta Pages placeholder) —
-          // they carry no real score and would show as a misleading 0.
-          if (ps?.score_exempt) return false;
-          // While streaming, keep every config pillar so the radar draws a full
-          // polygon filling from 0 (Recharts collapses to a dot/line with <3
-          // points). On a finalized scorecard, drop pillars absent from it (e.g. an
-          // old snapshot saved before a pillar existed) so they don't plot a false
-          // 0 spoke.
+          // they carry no real score and would show as a misleading 0. Prefer the
+          // config flag so it's excluded from the first render, before its stream
+          // event arrives (otherwise the radar briefly plots it at 0 and the spoke
+          // count jumps when the event lands); fall back to the streamed value.
+          if (p.score_exempt || ps?.score_exempt) return false;
+          // While streaming, keep every (non-exempt) config pillar so the radar
+          // draws a full polygon filling from 0 (Recharts collapses to a dot/line
+          // with <3 points). On a finalized scorecard, drop pillars absent from it
+          // (e.g. an old snapshot saved before a pillar existed) so they don't plot
+          // a false 0 spoke.
           if (phase === 'running') return true;
           return !!ps;
         })
@@ -163,7 +166,10 @@ export default function Scorecard({
           pillar: p.name,
           score: Math.round(pillarsByKey[p.key]?.score ?? 0),
         })),
-    [config.pillars, pillarsByKey]
+    // `phase` is read in the filter (running vs finalized), so it must be a dep —
+    // otherwise an errored stream that flips phase→done without changing
+    // pillarsByKey wouldn't re-filter, leaving false 0 spokes plotted.
+    [config.pillars, pillarsByKey, phase]
   );
 
   const trendData = useMemo(
@@ -204,6 +210,12 @@ export default function Scorecard({
           completed = true;
           setOverall(ev.overall);
           setTopGaps(ev.top_gaps);
+          // Reconcile pillarsByKey from the authoritative final list, not just the
+          // discrete 'pillar' events — so any pillar present in the completed run
+          // is never misrendered as "Not in this assessment", and the radar memo
+          // recomputes on completion.
+          for (const p of ev.pillars) collected[p.key] = p;
+          setPillarsByKey({ ...collected });
           setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
           setPhase('done');
           if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);

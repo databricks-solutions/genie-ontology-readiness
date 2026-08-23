@@ -12,6 +12,9 @@ export interface ConfigPillar {
   short: string;
   weight: number;
   capability: string;
+  // True for a pillar shown but excluded from the score (e.g. the Beta Pages
+  // placeholder). Lets the radar drop it from first render, before its event.
+  score_exempt?: boolean;
 }
 
 export interface AppConfig {

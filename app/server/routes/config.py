@@ -29,6 +29,10 @@ async def get_config():
                 "short": p["short"],
                 "weight": p["weight"],
                 "capability": p["capability"],
+                # Expose the score-exempt flag so the UI can exclude a Beta
+                # placeholder pillar (e.g. Pages) from the radar from first render,
+                # before its stream event arrives.
+                "score_exempt": bool(p.get("score_exempt")),
             }
             for p in PILLARS
         ],
