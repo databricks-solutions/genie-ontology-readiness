@@ -71,8 +71,8 @@ _AUTHZ_MARKERS = (
     # not found"). For the fixed system / information_schema probes here, not-found
     # almost always means a grant the app SP holds is missing for the viewer — so
     # treat it as an authz gap worth the SP fallback rather than dropping the signal.
-    # Cover both the error-class token ("not_found") and the prose forms.
-    "not found", "not_found", "cannot be found", "does not exist",
+    # Cover both the error-class tokens ("not_found", "does_not_exist") and the prose forms.
+    "not found", "not_found", "cannot be found", "does not exist", "does_not_exist",
 )
 
 

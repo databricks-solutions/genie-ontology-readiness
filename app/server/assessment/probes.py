@@ -54,12 +54,13 @@ def _empty(note: str) -> dict:
 
 
 def _no_catalogs_note(what: str) -> str:
-    """Zero-readable-catalogs message that points at the identity actually being
-    used. Under on-behalf-of-user the reads run as the viewer, so blame the user's
-    grants; otherwise blame the app service principal."""
+    """Zero-readable-catalogs message. Under on-behalf-of-user the reads run as the
+    viewer and fall back to the app SP on authorization errors, so when nothing is
+    readable the fix may be a grant on either identity — name both. Without a viewer
+    token the reads run as the app SP only, so blame that."""
     if get_user_token():
-        return (f"No catalogs are readable by your user account for the {what}. Ensure you have "
-                f"USE CATALOG + SELECT on the catalogs to assess.")
+        return (f"No catalogs are readable for the {what}. Ensure your user account — or the "
+                f"app service principal — has USE CATALOG + SELECT on the catalogs to assess.")
     return (f"No readable catalogs for the {what}. Grant the app service principal "
             f"USE CATALOG + SELECT on the catalogs to assess.")
 
@@ -923,11 +924,13 @@ async def probe_adoption() -> dict:
             queries_30d = None
 
         if active_users is None and queries_30d is None:
-            # Under OBO, execute_sql already transparently retried as the app SP
-            # before we landed here, so BOTH identities failed to read. Name both
-            # (the SP grant is usually the real fix for this workspace-wide signal)
-            # rather than pointing only at the viewer's account.
-            who = ("your user account or the app service principal (OBO tried both)"
+            # Neither read returned. Under OBO the read ran as the viewer and, on an
+            # authorization error, would have fallen back to the app SP — but a
+            # non-authz failure (timeout/5xx) skips that fallback, so we can't assert
+            # the SP was actually tried. Point at both grant targets instead; for this
+            # workspace-wide signal the SP grant is usually the right fix.
+            who = ("the app service principal (recommended for this workspace-wide "
+                   "signal) or your user account"
                    if get_user_token()
                    else "the app service principal")
             return _empty("System tables (system.access / system.query) are not enabled "
