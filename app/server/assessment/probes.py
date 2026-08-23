@@ -32,7 +32,7 @@ import json
 import logging
 import aiohttp
 
-from server.sql_client import execute_sql
+from server.sql_client import execute_sql, record_identity
 from server.config import (
     get_workspace_host,
     get_auth_headers,
@@ -727,6 +727,10 @@ async def _native_domains() -> int | None:
                     if resp.status == 200:
                         data = await resp.json()
                         domains = data.get("data_domains") or data.get("domains") or data.get("data") or []
+                        # This REST read doesn't go through execute_sql, so record its
+                        # identity explicitly: get_auth_headers() uses the viewer token
+                        # when present (OBO), else the app SP.
+                        record_identity("obo" if get_user_token() else "sp_no_token")
                         return len(domains)
         except Exception:
             continue
