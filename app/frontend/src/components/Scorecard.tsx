@@ -144,11 +144,19 @@ export default function Scorecard({
   const radarData = useMemo(
     () =>
       config.pillars
-        // Only plot pillars actually present in this scorecard, and drop
-        // score-exempt ones (e.g. the Beta Pages placeholder). This also guards a
-        // snapshot saved before a pillar existed (old run loaded after an upgrade):
-        // without the presence check it would plot a misleading 0 spoke.
-        .filter((p) => pillarsByKey[p.key] && !pillarsByKey[p.key]?.score_exempt)
+        .filter((p) => {
+          const ps = pillarsByKey[p.key];
+          // Always drop score-exempt pillars (e.g. the Beta Pages placeholder) —
+          // they carry no real score and would show as a misleading 0.
+          if (ps?.score_exempt) return false;
+          // While streaming, keep every config pillar so the radar draws a full
+          // polygon filling from 0 (Recharts collapses to a dot/line with <3
+          // points). On a finalized scorecard, drop pillars absent from it (e.g. an
+          // old snapshot saved before a pillar existed) so they don't plot a false
+          // 0 spoke.
+          if (phase === 'running') return true;
+          return !!ps;
+        })
         .map((p) => ({
           // Use the pillar's card title (name), not its long description, so the
           // radar labels match the scored pillar cards below.
@@ -481,12 +489,16 @@ export default function Scorecard({
         {config.pillars.map((cp) => {
           const p = pillarsByKey[cp.key];
           if (!p) {
-            // Still streaming → show the loading skeleton. But on a completed
-            // scorecard a missing pillar means this snapshot predates it (e.g. an
-            // old run saved before Pages existed, loaded after an upgrade): there's
-            // nothing to wait for, so show a muted "not in this assessment" instead
-            // of a spinner that never resolves.
+            // Three states for a pillar with no result yet:
+            //  - streaming (phase running): still expected → spinner + "Checking…"
+            //  - finalized scorecard (completed run or loaded snapshot, so `overall`
+            //    is set): genuinely absent — e.g. an old snapshot saved before this
+            //    pillar existed → "Not in this assessment"
+            //  - otherwise (stream errored/ended before completing): it was expected
+            //    but didn't load; don't claim it's absent → "Not loaded"
             const waiting = phase === 'running';
+            const finalized = phase === 'done' && !!overall;
+            const label = waiting ? 'Checking…' : finalized ? 'Not in this assessment' : 'Not loaded';
             return (
               <div key={cp.key} className="card flex items-center gap-4 px-4 py-3 opacity-70">
                 {waiting ? (
@@ -496,9 +508,7 @@ export default function Scorecard({
                 )}
                 <div className="flex-1 min-w-0">
                   <span className="font-semibold text-ink-500">{cp.name}</span>
-                  <p className="text-xs text-ink-400 mt-0.5 truncate">
-                    {waiting ? 'Checking…' : 'Not in this assessment'}
-                  </p>
+                  <p className="text-xs text-ink-400 mt-0.5 truncate">{label}</p>
                 </div>
               </div>
             );
