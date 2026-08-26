@@ -1,8 +1,8 @@
 # Spec — Genie Agents curation & validation signals (informed by Genie Workbench)
 
-**Status:** DRAFT for review (branch `feat/genie-agent-curation-signals`). Not yet implemented — validate before build/PR.
+**Status:** Decisions resolved (§9) — ready to implement on branch `feat/genie-agent-curation-signals`. PR not yet opened.
 **Author:** Allan Cao (with Claude)
-**Date:** 2026-08-26
+**Date:** 2026-08-26 (decisions logged 2026-08-26)
 
 ## 1. Background & motivation
 
@@ -119,15 +119,30 @@ New gaps (drive the plan): "N agents have no benchmarks — add ≥10 ground-tru
 Genie Workbench Auto-Optimize"; "N agents lack example/verified SQL"; "N agents have no
 instructions." Each names **Genie Workbench** as the accelerator (already in `accelerators.py`).
 
-### 4.5 `metadata` — synonyms coverage signal (additive; see Open Questions)
-Genie resolves natural-language phrasing via synonyms; Workbench treats synonyms as first-class
-(`add_column_synonym` lever, entity matching). We count comments+tags but not synonyms.
-- **Reliable path:** metric-view synonyms — parse from metric-view definitions the `metrics` probe
-  already reads; emit "Metric-view fields with synonyms (%)".
-- **Best-effort path:** column-level synonyms — detection surface is uncertain (may not be in
-  `information_schema`); see Open Question Q3. Scope column synonyms as a follow-up if no clean read.
-- Emit as an **additive signal + gap only** on the pillar it's most measurable in (`metrics` for
-  metric-view synonyms). **Do not rescore** `metadata`/`metrics` weights (avoid comparability churn).
+### 4.5 Synonyms — RESOLVED (Q3): not a UC surface; fold into genie_agents curation
+**Research finding (genie-workbench code + dogfood):** synonyms are **not** a Unity Catalog
+`information_schema` attribute. They are a *curation property* held in two places:
+- **Genie serialized space** — columns/measures carry a `synonyms` array (genie-workbench reads
+  `col["synonyms"]` and its scanner warns "No column synonyms defined";
+  `backend/genie_creator.py:21,61`, `backend/tests/test_scanner.py:185`).
+- **Metric-view definition** — dimensions/measures may declare `synonyms` in the MV spec
+  (`genie-workbench/backend/references/schema.md:28,143,153`).
+
+There is **no clean workspace-wide `information_schema` read for column synonyms** — a metastore-wide
+`columns` scan for a synonym field is both nonexistent (UC columns expose comment + tags, not
+synonyms) and impractically slow on a large metastore (confirmed: the dogfood metastore-wide scan
+timed out). So:
+- **Reliable path (adopt):** count `synonyms` per agent in `_inspect_space` (we already fetch the
+  serialized space; add a `synonyms` dimension). This makes synonyms a **genie_agents curation
+  sub-signal**, not a `metadata` signal. Rubric: an agent with described columns but zero synonyms
+  earns a curation warning (mirrors Workbench).
+- **Follow-up (feasibility-gated):** metric-view synonyms require reading each MV's *definition*
+  (`SHOW CREATE` / `information_schema.views.view_definition`) — `probe_metrics` today only counts by
+  `table_type='METRIC_VIEW'` + comment (`probes.py:472,498`), it does not read the spec. Bounded
+  per-MV definition reads are feasible (cap like `_MAX_INSPECT`) but are a separate change; defer to
+  a follow-up rather than block this PR.
+- **Dropped:** the earlier idea of a workspace-wide "column synonyms" `metadata` signal — it has no
+  UC surface. No `metadata` rescore.
 
 ### 4.6 `metadata` — column-noise hygiene signal (additive)
 Workbench IQ check 10 penalizes many noisy visible columns (`id/uuid/hash/etl_*/raw_*/…`). Compute
@@ -142,10 +157,26 @@ Structure the plan's "Top recommendations" by Workbench's 6 levers (descriptions
 instructions/examples; SQL expressions/measures/filters; metric views) so each gap → a concrete
 lever. Light touch in `plan.py` `_generate_system` prompt; the methodology already covers most.
 
-### 4.8 (Future) Genie feedback signal
-Workbench's GenieWatch reads Genie **cost/usage/feedback** from system tables (SP-only). Our
-`adoption` pillar counts generic users+queries; a Genie-specific **thumbs/feedback** signal would
-sharpen it. Deferred pending confirmation of a feedback system-table surface (Open Question Q4).
+### 4.8 Genie feedback signal — RESOLVED (Q4): confirmed, adopt
+**Research finding (genie-workbench GenieWatch + dogfood live):** Genie thumbs feedback is in
+`system.access.audit`:
+```sql
+service_name = 'aibiGenie'
+action_name  = 'updateConversationMessageFeedback'
+request_params.feedback_rating IN ('THUMBS_UP', 'THUMBS_DOWN')
+-- per-space via request_params.space_id ; per-user via user_identity.email
+```
+(Source: `genie-workbench/backend/watch/services/system_tables.py:580`,
+`backend/watch/routers/feedback.py`.) **Validated live on dogfood (60d): 169 THUMBS_UP / 150
+THUMBS_DOWN across ~160 spaces, current through 2026-08-23.**
+
+**Adopt** as a signal — rides the *same* `system.access.audit` grant `adoption`/`genie_agents`
+already need (no new permission). Emit on `adoption` (answer-satisfaction is an adoption-quality
+measure) and/or as a `genie_agents` signal:
+- `Genie answer feedback` — `👍 N / 👎 M (last 30d)` and a **satisfaction ratio** `pos/(pos+neg)`.
+- Optional gap: high 👎 ratio → "review low-rated agents; benchmark & optimize with Genie Workbench."
+Keep it a **signal** (not a rescore) initially to avoid comparability churn; it's a strong
+qualitative indicator regardless.
 
 ## 5. Data sources & permissions
 - **Curation:** `GET /api/2.0/genie/spaces/{id}?include_serialized_space=true` — requires **CAN_EDIT**
@@ -172,9 +203,9 @@ sharpen it. Deferred pending confirmation of a feedback system-table surface (Op
 Changing `genie_agents` internal scoring changes historical comparability for workspaces where
 curation becomes assessable (like the Pages reweight tradeoff). Because the pillar **weight is
 unchanged (16)** and the score is **identical to today whenever curation can't be assessed**, the
-only movement is for CAN_EDIT-enabled runs — an intended improvement. Call it out in release notes;
-consider a scoring-version stamp on snapshots if trend continuity matters (same open item flagged for
-Pages).
+only movement is for CAN_EDIT-enabled runs — an intended improvement. **Decision (Q5): accept the
+one-time step; no scoring-version stamp** (consistent with the Pages reweight call). Note it in
+release notes.
 
 ## 8. Testing & rollout
 - Unit: per-agent tier logic (Ready/Trusted) against fixture serialized spaces; degradation when
@@ -186,15 +217,23 @@ Pages).
   not; per-agent table renders; determinism holds for a fixed identity.
 - Isaac Review on the PR before deploy (per the repo's run-isaac-review-on-every-PR rule).
 
-## 9. Open questions (please validate)
-- **Q1 — scoring blend:** is 40/60 existence-vs-curation with `0.6*ready + 0.4*trusted` the right
-  emphasis, or should validation (benchmarks) weigh more heavily?
-- **Q2 — degradation:** confirm the "fall back to existence-only when no CAN_EDIT" behavior (avoids
-  penalizing the common SP-only case) vs. showing a lower "curation unknown" score.
-- **Q3 — synonyms detection:** is there a clean read for column/metric-view synonyms
-  (`information_schema` or metric-view definition)? If not, defer §4.5 column synonyms.
-- **Q4 — feedback:** is there a Genie feedback/thumbs system-table surface for §4.8?
-- **Q5 — scoring-version stamp:** add one now (for trend continuity) or accept a one-time step?
+## 9. Decisions (resolved 2026-08-26)
+- **Q1 — scoring blend: ✅ APPROVED.** 40/60 existence-vs-curation, `0.6*ready + 0.4*trusted`.
+- **Q2 — degradation: ✅ fall back to existence-only when no CAN_EDIT** — chosen for least customer
+  friction (this is an assessment tool; never penalize a workspace for a grant the app lacks).
+- **Q3 — synonyms: ✅ RESOLVED (§4.5).** No UC/`information_schema` surface; synonyms are a
+  Genie-space property → fold into `genie_agents` curation (`_inspect_space` synonyms count).
+  Metric-view synonyms = feasibility-gated follow-up. No `metadata` synonyms signal.
+- **Q4 — feedback: ✅ RESOLVED (§4.8).** `system.access.audit` / `aibiGenie` /
+  `updateConversationMessageFeedback` / `feedback_rating` — validated live on dogfood. Adopt.
+- **Q5 — scoring-version stamp: ✅ accept one-time step, no stamp** (§7).
+
+### UI decisions (§10)
+- **D1 — palette: ✅ keep the Databricks palette** (`databricks` #FF3621 + `ink`); do not adopt
+  Workbench indigo.
+- **D2 — Tailwind: ✅ upgrade this app v3 → v4** (adopt Workbench's `@theme` token model) so
+  Workbench's `ui/` primitives + tier/check components are drop-in, then re-express our palette as v4
+  `@theme` tokens.
 
 ## 10. UI cohesion with Genie Workbench — viability
 
@@ -216,18 +255,16 @@ version, and brand palette). Details below.
 | Dark mode | none (light only) | full light/dark via CSS vars + `.dark` | Workbench more advanced |
 | Maturity vocab | `LevelBadge` L0–L4 (`levelStyle`) | Not Ready / Ready to Optimize / Trusted (red/blue/emerald) | different scales, but see 10.3 |
 
-### 10.2 The two real decisions (flag for the user)
-- **D1 — Brand palette.** Workbench's indigo is *its own* identity (it's a `databricks-solutions` OSS
-  tool, not Databricks-branded). Our app deliberately uses the real Databricks brand color
-  (#FF3621). "Seamless" can mean either (a) **keep Databricks brand**, adopt only Workbench's
-  *structure* (shapes/spacing/tier pattern/dark mode) → sibling-by-form, on-brand; or (b) **match
-  Workbench's indigo** → sibling-by-color, off Databricks brand. **Recommendation: (a).** Adopt the
-  structural language, keep our palette (map Workbench's semantic success/warning/danger to our
-  emerald/amber/red, which we already use for `IdentityBadge`).
-- **D2 — Tailwind v3 → v4.** Workbench's tokens live in v4's `@theme`. Pragmatic path is **not** a v4
-  migration; instead **translate** the pieces we want (radius scale, semantic color tokens, dark-mode
-  CSS vars) into our v3 `tailwind.config.js` + `index.css`. Full v4 migration only if we want drop-in
-  reuse of their `ui/` primitives verbatim — defer unless separately planned.
+### 10.2 The two decisions — DECIDED (2026-08-26)
+- **D1 — Brand palette: KEEP the Databricks palette.** Workbench's indigo is *its own* identity (it's
+  a `databricks-solutions` OSS tool, not Databricks-branded); our app deliberately uses the real
+  Databricks brand color (#FF3621 + `ink` #1B3139). We adopt Workbench's *structure*
+  (shapes/spacing/tier pattern/components) but keep our palette, mapping Workbench's semantic
+  success/warning/danger to our emerald/amber/red (already used by `IdentityBadge`).
+- **D2 — Tailwind: UPGRADE this app v3 → v4.** Adopt Workbench's `@theme` CSS-variable token model so
+  its `ui/` primitives + tier/check components are drop-in, then **re-express our `databricks`/`ink`
+  palette as v4 `@theme` tokens** (D1). This is a real migration (see 10.5) but the user chose it over
+  token-translation-on-v3, because it makes ongoing component sharing between the two tools clean.
 
 ### 10.3 What's genuinely worth folding in (high value ↔ low friction) — and it aligns with §4
 - **Maturity-tier badges (Not Ready / Ready to Optimize / Trusted).** This is the *lucky alignment*:
@@ -254,14 +291,23 @@ version, and brand palette). Details below.
 - **Recharts 3 upgrade / IterationChart** — only relevant to the optimize-loop UI we are explicitly
   not building (§2). Skip.
 
-### 10.5 Cohesion effort summary
-- **Now (with this spec's signals):** tier badges + check-row grid for the curation UI → sibling look
-  *for the genie_agents surface* with near-zero extra cost, since we're building that UI anyway.
-- **Small follow-up:** `cn()`/CVA + radius/token translation for app-wide shape parity.
-- **Deferred:** MaturityCurve viz, dark mode, any palette/font/Tailwind-v4 change (needs D1/D2 calls).
+### 10.5 Cohesion plan (per D1/D2)
+Sequence the UI work as its own track (can land before or alongside the signal work):
+1. **Tailwind v3 → v4 migration** (D2): switch to `@tailwindcss/vite`, move config into `index.css`
+   via `@theme`, port existing utilities (`.card`/`.btn-*`), verify `tsc`/`vitest`/build stay green.
+   Add `class-variance-authority`, `clsx`, `tailwind-merge` + a `cn()` util (copy
+   `genie-workbench/frontend/src/lib/utils.ts`).
+2. **Re-express our palette as `@theme` tokens** (D1): `databricks`/`ink` scales + semantic
+   success/warning/danger → emerald/amber/red. Do **not** import Workbench's indigo or premium fonts;
+   keep Inter.
+3. **Port drop-in components** from `genie-workbench/frontend/src`: `ui/{button,badge,card,tabs}.tsx`,
+   the `MATURITY_COLORS` tier badge (recolored), and the IQ check-row grid (`IQScoreTab.tsx:104–220`)
+   — these render the §4 curation tiers/checks, so this dovetails with the signal work.
+4. **Optional later:** `MaturityCurve` S-curve viz (recolored), dark mode. **Skip:** premium fonts,
+   Recharts v3 bump (not needed).
 
-**Bottom line:** ~90% of Workbench's UI *code* is portable and ~75% of its *look* — but true seamlessness
-is a branding decision (D1), not a technical blocker. The technically clean, on-brand win is to adopt
-its **structure and the tier/check components** (which we need for §4 regardless) while keeping the
-Databricks palette and Inter.
+**Bottom line:** same core stack → ~90% of Workbench's UI code is portable. With D1/D2 decided, the
+plan is a real-but-bounded **Tailwind v4 upgrade + keep the Databricks palette**, then port the
+tier/check components (which §4 needs anyway) so the two tools read as siblings by form while staying
+on-brand.
 
