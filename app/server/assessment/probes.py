@@ -490,8 +490,29 @@ _MAX_MV_INSPECT = 25  # bound SHOW CREATE calls when measuring synonym coverage
 # In a metric view's YAML spec each dimension/measure begins with "- name:" and may
 # carry an optional per-field "synonyms:" key. Synonyms are NOT in information_schema,
 # so we read the spec via SHOW CREATE and count fields vs. fields declaring synonyms.
-_MV_FIELD_RE = re.compile(r"^\s*-\s*name:", re.MULTILINE)
-_MV_SYNONYMS_RE = re.compile(r"^\s*synonyms:", re.MULTILINE)
+_MV_FIELD_RE = re.compile(r"^\s*-\s*name:")
+_MV_SYNONYMS_RE = re.compile(r"^\s*synonyms:")
+
+
+def _mv_field_synonym_counts(yaml_body: str) -> tuple[int, int]:
+    """Count dimension/measure fields and how many declare synonyms in a metric-view
+    YAML spec. Section-aware: only ``dimensions:``/``measures:`` fields count, so a
+    ``joins:`` block (whose entries are also ``- name:``) doesn't inflate the field
+    denominator."""
+    fields = syn = 0
+    section = None
+    for line in yaml_body.splitlines():
+        # A non-indented, non-list line starts a new top-level section (dimensions:,
+        # measures:, joins:, source:, ...).
+        if line[:1] not in (" ", "\t", "-", "") :
+            section = line.split(":", 1)[0].strip().lower()
+            continue
+        if section in ("dimensions", "measures"):
+            if _MV_FIELD_RE.match(line):
+                fields += 1
+            elif _MV_SYNONYMS_RE.match(line):
+                syn += 1
+    return fields, syn
 
 
 async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | None:
@@ -506,7 +527,8 @@ async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | Non
     try:
         rows = await execute_sql(
             f"SELECT table_catalog, table_schema, table_name FROM {tbl} "
-            f"WHERE table_type = '{type_value}' LIMIT {_MAX_MV_INSPECT}"
+            f"WHERE table_type = '{type_value}' "
+            f"ORDER BY table_catalog, table_schema, table_name LIMIT {_MAX_MV_INSPECT}"
         )
     except Exception:
         return None
@@ -517,10 +539,13 @@ async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | Non
 
     sem = asyncio.Semaphore(8)
 
+    def _q(ident: str) -> str:  # quote a UC identifier, escaping embedded backticks
+        return "`" + str(ident).replace("`", "``") + "`"
+
     async def _one(cat: str, sch: str, name: str):
         async with sem:
             try:
-                cr = await execute_sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`")
+                cr = await execute_sql(f"SHOW CREATE TABLE {_q(cat)}.{_q(sch)}.{_q(name)}")
             except Exception:
                 return None
         if not cr:
@@ -528,7 +553,7 @@ async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | Non
         ddl = list(cr[0].values())[0] or ""
         m = re.search(r"\$\$(.*)\$\$", ddl, re.DOTALL)  # the YAML metrics spec block
         body = m.group(1) if m else ddl
-        return len(_MV_FIELD_RE.findall(body)), len(_MV_SYNONYMS_RE.findall(body))
+        return _mv_field_synonym_counts(body)
 
     results = await asyncio.gather(*(_one(c, s, n) for c, s, n in names))
     ok = [r for r in results if r]
@@ -743,40 +768,40 @@ _EDIT_HINT = ("Reading an agent's curation detail requires CAN_EDIT on that agen
               "agents you want curation-assessed (or run this assessment as a user who can edit them).")
 
 
-async def _genie_audit_counts() -> dict:
-    """Best-effort Genie usage from the audit system table.
-
-    system.access.audit records Genie activity under service_name='aibiGenie'
-    with the space id in request_params.space_id. The count of Genie Agents is
-    the number of distinct space_ids, excluding any space that has ever been
-    trashed (a `trashSpace` action; there is no deleteSpace — see the docs at
-    https://docs.databricks.com/aws/en/ai-bi/admin/audit).
-
-    Single scan: group by space_id and derive per-space "trashed" and
-    "active in last 30 days" flags in one pass (instead of separate COUNT
-    DISTINCT + NOT IN queries that scanned the large audit table repeatedly).
-    Returns total / active_30d (each None if the audit table isn't readable).
+async def _genie_agent_scan(limit: int) -> dict:
+    """Single scan of system.access.audit (aibiGenie): distinct non-trashed Genie
+    spaces with a 30-day-active flag. In one pass it returns the workspace-wide
+    ``total`` and ``active_30d`` counts (window functions over the full non-trashed
+    set) AND the top ``limit`` space ids — most-recently-active first — for curation
+    inspection. Counts are None if the audit table isn't readable. (There is no
+    deleteSpace: a space is gone once trashed —
+    https://docs.databricks.com/aws/en/ai-bi/admin/audit.)
     """
     try:
         rows = await execute_sql(
-            "SELECT COUNT(*) AS total, "
-            "       SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d "
+            "SELECT space_id, "
+            "       COUNT(*) OVER () AS total, "
+            "       SUM(active_30d) OVER () AS active_total "
             "FROM ( "
             "  SELECT request_params.space_id AS space_id, "
-            "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
+            "         MAX(CASE WHEN lower(action_name)='trashspace' THEN 1 ELSE 0 END) AS trashed, "
+            "         MAX(CASE WHEN event_date >= current_date()-INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d, "
+            "         MAX(event_time) AS last_seen "
             "  FROM system.access.audit "
-            "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
+            "  WHERE service_name='aibiGenie' AND request_params.space_id IS NOT NULL "
             "  GROUP BY request_params.space_id "
-            ") WHERE trashed = 0"
+            ") WHERE trashed = 0 "
+            f"ORDER BY active_30d DESC, last_seen DESC LIMIT {limit}"
         )
-        row = rows[0] if rows else {}
-        return {
-            "total": int(row.get("total") or 0),
-            "active_30d": int(row.get("active_30d") or 0),
-        }
     except Exception:
-        return {"total": None, "active_30d": None}
+        return {"total": None, "active_30d": None, "ids": []}
+    if not rows:
+        return {"total": 0, "active_30d": 0, "ids": []}
+    return {
+        "total": int(rows[0].get("total") or 0),
+        "active_30d": int(rows[0].get("active_total") or 0),
+        "ids": [r.get("space_id") for r in rows if r.get("space_id")],
+    }
 
 
 def _genie_audit_signals(audit: dict) -> list:
@@ -788,27 +813,6 @@ def _genie_audit_signals(audit: dict) -> list:
         sig.append({"label": "Active agents (30d)", "value": audit["active_30d"],
                     "detail": "Distinct agents with activity in the last 30 days — audit log"})
     return sig
-
-
-async def _genie_active_space_ids(limit: int) -> list:
-    """Distinct non-trashed Genie space ids from the audit log, most-recently-active
-    first — the bounded sample we deep-inspect for curation."""
-    try:
-        rows = await execute_sql(
-            "SELECT space_id FROM ( "
-            "  SELECT request_params.space_id AS space_id, "
-            "         MAX(CASE WHEN lower(action_name)='trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            "         MAX(CASE WHEN event_date >= current_date()-INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d, "
-            "         MAX(event_time) AS last_seen "
-            "  FROM system.access.audit "
-            "  WHERE service_name='aibiGenie' AND request_params.space_id IS NOT NULL "
-            "  GROUP BY request_params.space_id "
-            ") WHERE trashed = 0 "
-            f"ORDER BY active_30d DESC, last_seen DESC LIMIT {limit}"
-        )
-        return [r.get("space_id") for r in (rows or []) if r.get("space_id")]
-    except Exception:
-        return []
 
 
 def _agent_ready(sp: dict) -> bool:
@@ -824,16 +828,19 @@ async def probe_genie_agents() -> dict:
     Counts come from system.access.audit (aibiGenie) — workspace-wide via the viewer's
     own system-table access (OBO tokens lack the genie scope, and REST 'list spaces'
     reflects only one principal). Curation is a bounded, best-effort deep-inspect of up
-    to _MAX_INSPECT agents, tiered Ready to Optimize / Trusted (mirroring Genie
-    Workbench's IQ scan). When NO agent's curation is readable (no CAN_EDIT — the common
-    SP-only / restricted-viewer case) we fall back to the prior existence-only score, so
-    a restricted identity is never penalized for a grant the app lacks.
+    to _MAX_INSPECT agents, read as the app SERVICE PRINCIPAL (the Genie REST API isn't
+    covered by the OBO `sql` scope — same as genie_client) and gated behind CAN_EDIT,
+    tiered Ready to Optimize / Trusted (mirroring Genie Workbench's IQ scan). Curation
+    only drives the score when a REPRESENTATIVE share of agents is readable; otherwise —
+    or when nothing is readable — we fall back to the prior existence-only score so a
+    small/unreadable sample never unfairly tanks a well-adopted workspace.
     """
-    audit = await _genie_audit_counts()
-    total, active = audit.get("total"), audit.get("active_30d")
+    scan = await _genie_agent_scan(_MAX_INSPECT)
+    total, active = scan["total"], scan["active_30d"]
     if total is None and active is None:
         return _empty("Genie usage can't be read — the assessing identity needs SELECT on system.access.audit.")
     total, active = total or 0, active or 0
+    audit = {"total": total, "active_30d": active}
 
     # Existence/adoption band (max 40) — used only in the curation-inclusive score.
     existence_band = 0.0
@@ -844,29 +851,37 @@ async def probe_genie_agents() -> dict:
     if total > 0 and active / total >= 0.3:
         existence_band += 10.0
 
-    # Best-effort curation pass (reading serialized_space needs CAN_EDIT).
-    host, headers = get_workspace_host(), get_auth_headers()
+    # Curation deep-inspect runs as the app SP: the Genie REST API is not covered by the
+    # OBO `sql` scope, so we must force_sp (same as genie_client). Best-effort — reading
+    # serialized_space also requires CAN_EDIT on the agent.
+    host, headers = get_workspace_host(), get_auth_headers(force_sp=True)
     spaces, forbidden = [], 0
-    if total > 0 and host and headers:
-        ids = await _genie_active_space_ids(_MAX_INSPECT)
-        if ids:
-            sem = asyncio.Semaphore(8)
+    if total > 0 and host and headers and scan["ids"]:
+        sem = asyncio.Semaphore(8)
 
-            async def _do(sid):
-                async with sem:
-                    return await _inspect_space(host, headers, sid, sid)
+        async def _do(sid):
+            async with sem:
+                return await _inspect_space(host, headers, sid, sid)
 
-            for status, data in await asyncio.gather(*(_do(s) for s in ids)):
-                if status == "forbidden":
-                    forbidden += 1
-                elif status == "ok" and data:
-                    ready = _agent_ready(data)
-                    data["tier"] = ("Trusted" if ready and data["benchmarks"] >= 10
-                                    else "Ready to Optimize" if ready else "Not Ready")
-                    spaces.append(data)
+        for status, data in await asyncio.gather(*(_do(s) for s in scan["ids"])):
+            if status == "forbidden":
+                forbidden += 1
+            elif status == "ok" and data:
+                ready = _agent_ready(data)
+                data["tier"] = ("Trusted" if ready and data["benchmarks"] >= 10
+                                else "Ready to Optimize" if ready else "Not Ready")
+                spaces.append(data)
 
     assessed = len(spaces)
-    gaps = []
+    sampled = min(total, _MAX_INSPECT) if total > 0 else 0
+    # Only let curation drive the score when a representative share of agents is readable
+    # — otherwise a tiny, unrepresentative CAN_EDIT sample could wrongly tank a
+    # well-adopted workspace. Below the bar we keep the existence-only score and surface
+    # curation as informational.
+    representative = assessed >= 3 and assessed >= round(0.5 * sampled)
+
+    ready_n = trusted_n = with_bench = with_sql = 0
+    gaps, signals = [], _genie_audit_signals(audit)
     note = "Counts are workspace-wide from system.access.audit (aibiGenie)."
 
     if assessed > 0:
@@ -874,11 +889,9 @@ async def probe_genie_agents() -> dict:
         trusted_n = sum(1 for sp in spaces if sp["tier"] == "Trusted")
         with_bench = sum(1 for sp in spaces if sp["benchmarks"] >= 10)
         with_sql = sum(1 for sp in spaces if sp["example_sqls"] > 0)
-        curation_band = 60.0 * (0.6 * (ready_n / assessed) + 0.4 * (trusted_n / assessed))
-        score = round(min(existence_band + curation_band, 100.0), 1)
-        signals = _genie_audit_signals(audit) + [
+        signals += [
             {"label": "Curation-assessed", "value": f"{assessed} of {total}",
-             "detail": "Agents whose curation could be read (requires CAN_EDIT on the agent)"},
+             "detail": "Agents whose curation the app service principal could read (requires CAN_EDIT)"},
             {"label": "Well-curated agents", "value": ready_n,
              "detail": "Assessed agents meeting the 'Ready to Optimize' bar (instructions + SQL guidance + focused sources)"},
             {"label": "Agents with ≥10 benchmarks", "value": with_bench,
@@ -886,6 +899,10 @@ async def probe_genie_agents() -> dict:
             {"label": "Agents with example SQL", "value": with_sql,
              "detail": "Assessed agents with verified/example SQL curated"},
         ]
+
+    if representative:
+        curation_band = 60.0 * (0.6 * (ready_n / assessed) + 0.4 * (trusted_n / assessed))
+        score = round(min(existence_band + curation_band, 100.0), 1)
         if ready_n < assessed:
             gaps.append(f"{assessed - ready_n} of {assessed} assessed agents aren't fully curated "
                         "(missing instructions, SQL guidance, or too many/few sources) — curate them; "
@@ -894,9 +911,10 @@ async def probe_genie_agents() -> dict:
             gaps.append(f"{assessed - with_bench} of {assessed} assessed agents lack a benchmark set "
                         "(>=10 ground-truth Q&A) — add benchmarks and validate accuracy with Genie Workbench.")
         if forbidden > 0:
-            note += f" Curation read for {assessed} of {min(total, _MAX_INSPECT)} sampled agents; {forbidden} not readable. " + _EDIT_HINT
+            note += f" Curation read for {assessed} of {sampled} sampled agents; {forbidden} not readable. " + _EDIT_HINT
     else:
-        # No curation readable → existence-only score (unchanged from prior behavior).
+        # Existence-only score (unchanged from prior behavior) — curation isn't
+        # representative enough to score, so it can't penalize.
         legacy = 0.0
         if total > 0:
             legacy += 40.0
@@ -905,13 +923,16 @@ async def probe_genie_agents() -> dict:
         if total > 0 and active / total >= 0.3:
             legacy += 20.0
         score = round(min(legacy, 100.0), 1)
-        signals = _genie_audit_signals(audit)
         if total == 0:
             gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
         elif active == 0:
             gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
         if total > 0:
-            note += " Curation quality not assessed. " + _EDIT_HINT
+            if assessed > 0:
+                note += (f" Curation read for only {assessed} of {sampled} sampled agents — too few to "
+                         "score; shown for reference. ") + _EDIT_HINT
+            else:
+                note += " Curation quality not assessed (the app service principal needs CAN_EDIT). " + _EDIT_HINT
 
     return {
         "available": True,
