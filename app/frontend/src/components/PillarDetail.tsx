@@ -59,14 +59,22 @@ function LegacyBreakdown({ rows }: { rows: UcSchemaCount[] }) {
   );
 }
 
-const GENIE_COLS: { key: keyof Omit<GenieSpaceCuration, 'title'>; label: string }[] = [
+const GENIE_COLS: { key: keyof Omit<GenieSpaceCuration, 'title' | 'tier' | 'description_ok'>; label: string }[] = [
   { key: 'instructions', label: 'Instructions' },
   { key: 'sample_questions', label: 'Sample Q' },
   { key: 'example_sqls', label: 'Example SQL' },
   { key: 'functions', label: 'Functions' },
   { key: 'benchmarks', label: 'Benchmarks' },
+  { key: 'synonyms', label: 'Synonyms' },
   { key: 'tables', label: 'Tables' },
 ];
+
+// Per-agent curation tier chip (Genie Workbench IQ vocabulary), in our palette.
+function tierChipClass(tier?: string): string {
+  if (tier === 'Trusted') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  if (tier === 'Ready to Optimize') return 'bg-amber-50 text-amber-700 border-amber-200';
+  return 'bg-gray-100 text-ink-500 border-gray-200';
+}
 
 function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
   return (
@@ -79,6 +87,7 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
           <thead>
             <tr className="bg-gray-50 text-left">
               <th className="px-3 py-2 text-xs font-semibold text-ink-600">Genie Agent</th>
+              <th className="px-3 py-2 text-xs font-semibold text-ink-600 whitespace-nowrap">Tier</th>
               {GENIE_COLS.map((c) => (
                 <th key={c.key} className="px-3 py-2 text-xs font-semibold text-ink-600 text-center whitespace-nowrap">
                   {c.label}
@@ -90,6 +99,15 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
             {spaces.map((sp, i) => (
               <tr key={i} className="border-t border-gray-100">
                 <td className="px-3 py-2 text-ink-800 max-w-[260px] truncate" title={sp.title}>{sp.title}</td>
+                <td className="px-3 py-2">
+                  {sp.tier ? (
+                    <span className={`inline-block text-[11px] font-medium px-1.5 py-0.5 rounded-full border whitespace-nowrap ${tierChipClass(sp.tier)}`}>
+                      {sp.tier}
+                    </span>
+                  ) : (
+                    <span className="text-ink-300">—</span>
+                  )}
+                </td>
                 {GENIE_COLS.map((c) => {
                   const v = sp[c.key];
                   return (

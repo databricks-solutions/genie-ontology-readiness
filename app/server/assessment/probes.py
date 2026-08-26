@@ -370,6 +370,24 @@ async def probe_metadata() -> dict:
             except Exception:
                 tagged_tables = None
 
+        # Column-noise hygiene — additive signal (no score change). A high share of
+        # low-signal columns (ids/keys/hashes/etl scaffolding) distracts Genie; this is
+        # a name heuristic (token-bounded so 'paid'/'grid' don't match). Best-effort.
+        noisy_pct = None
+        try:
+            nrows = await execute_sql(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN lower(column_name) RLIKE '(^|_)(id|uuid|guid|hash|etl|raw|tmp|dbx|sk|pk|fk)(_|$)' "
+                "THEN 1 ELSE 0 END) AS noisy "
+                f"FROM {col} WHERE table_schema <> 'information_schema'"
+            )
+            n_total = int(nrows[0].get("total") or 0)
+            n_noisy = int(nrows[0].get("noisy") or 0)
+            if n_total > 0:
+                noisy_pct = _pct(n_noisy, n_total)
+        except Exception:
+            noisy_pct = None
+
         table_pct = _pct(t_commented, t_total)
         col_pct = _pct(c_commented, c_total)
         score = round(0.5 * table_pct + 0.5 * col_pct, 1)
@@ -381,6 +399,8 @@ async def probe_metadata() -> dict:
             gaps.append(f"Only {col_pct}% of columns are commented; aim for high coverage on gold-layer columns.")
         if tagged_tables is not None and t_total and tagged_tables == 0:
             gaps.append("No governed tags found; tags aid discovery and domain organization.")
+        if noisy_pct is not None and noisy_pct >= 30:
+            gaps.append(f"~{noisy_pct}% of columns look low-signal (ids/keys/hashes/etl scaffolding) — hide or de-prioritize them so Genie focuses on meaningful fields.")
 
         signals = [
             {"label": "Tables commented", "value": table_pct, "unit": "%", "detail": f"{t_commented} of {t_total} tables"},
@@ -388,6 +408,9 @@ async def probe_metadata() -> dict:
         ]
         if tagged_tables is not None:
             signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
+        if noisy_pct is not None:
+            signals.append({"label": "Low-signal columns", "value": noisy_pct, "unit": "%",
+                            "detail": "Columns named like ids/keys/hashes/etl — Genie does better when these are hidden or de-prioritized"})
 
         return {
             "available": True,
@@ -395,7 +418,8 @@ async def probe_metadata() -> dict:
             "signals": signals,
             "gaps": gaps,
             "note": None,
-            "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
+            "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct,
+                        "tagged_tables": tagged_tables, "noisy_column_pct": noisy_pct},
         }
     except Exception as e:
         logger.warning(f"probe_metadata failed: {e}")
@@ -646,6 +670,25 @@ def _count(serialized: dict, *path: str) -> int:
         return 0
 
 
+def _count_synonyms(node) -> int:
+    """Count non-empty ``synonyms`` arrays anywhere in a serialized space.
+
+    Schema-agnostic (synonyms attach to columns / dimensions / measures at paths that
+    vary), so walk the structure and tally every non-empty ``synonyms`` list. Purely a
+    reported curation extra — not a scoring gate."""
+    total = 0
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "synonyms" and isinstance(v, list):
+                total += 1 if v else 0
+            else:
+                total += _count_synonyms(v)
+    elif isinstance(node, list):
+        for item in node:
+            total += _count_synonyms(item)
+    return total
+
+
 async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tuple[str, dict | None]:
     """Fetch one serialized space and count each curation dimension.
 
@@ -678,6 +721,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
     if not isinstance(ss, dict):
         return "forbidden", None
 
+    desc = str(data.get("description") or ss.get("description") or "")
     return "ok", {
         "title": data.get("title") or title or sid,
         "instructions": _count(ss, "instructions", "text_instructions"),
@@ -686,6 +730,8 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
         "functions": _count(ss, "instructions", "sql_functions"),
         "benchmarks": _count(ss, "benchmarks", "questions"),
         "tables": _count(ss, "data_sources", "tables"),
+        "synonyms": _count_synonyms(ss),
+        "description_ok": len(desc) >= 30 and len(desc.split()) >= 5,
     }
 
 
@@ -744,13 +790,44 @@ def _genie_audit_signals(audit: dict) -> list:
     return sig
 
 
-async def probe_genie_agents() -> dict:
-    """Count Genie Agents from the audit log ONLY (system.access.audit / aibiGenie).
+async def _genie_active_space_ids(limit: int) -> list:
+    """Distinct non-trashed Genie space ids from the audit log, most-recently-active
+    first — the bounded sample we deep-inspect for curation."""
+    try:
+        rows = await execute_sql(
+            "SELECT space_id FROM ( "
+            "  SELECT request_params.space_id AS space_id, "
+            "         MAX(CASE WHEN lower(action_name)='trashspace' THEN 1 ELSE 0 END) AS trashed, "
+            "         MAX(CASE WHEN event_date >= current_date()-INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d, "
+            "         MAX(event_time) AS last_seen "
+            "  FROM system.access.audit "
+            "  WHERE service_name='aibiGenie' AND request_params.space_id IS NOT NULL "
+            "  GROUP BY request_params.space_id "
+            ") WHERE trashed = 0 "
+            f"ORDER BY active_30d DESC, last_seen DESC LIMIT {limit}"
+        )
+        return [r.get("space_id") for r in (rows or []) if r.get("space_id")]
+    except Exception:
+        return []
 
-    We deliberately do not use the Genie REST API "spaces visible to the app": it is
-    permission- and scope-gated (on-behalf-of-user tokens lack the genie scope), and
-    it reflects only what one principal can see. The audit log gives a workspace-wide,
-    existing-spaces count via the viewer's own system-table access.
+
+def _agent_ready(sp: dict) -> bool:
+    """Genie Workbench IQ 'Ready to Optimize' bar (adapted to the dims we read):
+    instructions present + at least one SQL-guidance artifact + a focused source set."""
+    return sp["instructions"] > 0 and (sp["functions"] > 0 or sp["example_sqls"] > 0) and 1 <= sp["tables"] <= 12
+
+
+async def probe_genie_agents() -> dict:
+    """Genie Agents readiness: workspace-wide existence/adoption (audit) blended with
+    per-agent CURATION quality (serialized space; best-effort, needs CAN_EDIT).
+
+    Counts come from system.access.audit (aibiGenie) — workspace-wide via the viewer's
+    own system-table access (OBO tokens lack the genie scope, and REST 'list spaces'
+    reflects only one principal). Curation is a bounded, best-effort deep-inspect of up
+    to _MAX_INSPECT agents, tiered Ready to Optimize / Trusted (mirroring Genie
+    Workbench's IQ scan). When NO agent's curation is readable (no CAN_EDIT — the common
+    SP-only / restricted-viewer case) we fall back to the prior existence-only score, so
+    a restricted identity is never penalized for a grant the app lacks.
     """
     audit = await _genie_audit_counts()
     total, active = audit.get("total"), audit.get("active_30d")
@@ -758,30 +835,92 @@ async def probe_genie_agents() -> dict:
         return _empty("Genie usage can't be read — the assessing identity needs SELECT on system.access.audit.")
     total, active = total or 0, active or 0
 
-    score = 0.0
+    # Existence/adoption band (max 40) — used only in the curation-inclusive score.
+    existence_band = 0.0
     if total > 0:
-        score += 40
+        existence_band += 20.0
     if active > 0:
-        score += 40
+        existence_band += 10.0
     if total > 0 and active / total >= 0.3:
-        score += 20
-    score = min(score, 100.0)
+        existence_band += 10.0
 
+    # Best-effort curation pass (reading serialized_space needs CAN_EDIT).
+    host, headers = get_workspace_host(), get_auth_headers()
+    spaces, forbidden = [], 0
+    if total > 0 and host and headers:
+        ids = await _genie_active_space_ids(_MAX_INSPECT)
+        if ids:
+            sem = asyncio.Semaphore(8)
+
+            async def _do(sid):
+                async with sem:
+                    return await _inspect_space(host, headers, sid, sid)
+
+            for status, data in await asyncio.gather(*(_do(s) for s in ids)):
+                if status == "forbidden":
+                    forbidden += 1
+                elif status == "ok" and data:
+                    ready = _agent_ready(data)
+                    data["tier"] = ("Trusted" if ready and data["benchmarks"] >= 10
+                                    else "Ready to Optimize" if ready else "Not Ready")
+                    spaces.append(data)
+
+    assessed = len(spaces)
     gaps = []
-    if total == 0:
-        gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
-    elif active == 0:
-        gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
+    note = "Counts are workspace-wide from system.access.audit (aibiGenie)."
+
+    if assessed > 0:
+        ready_n = sum(1 for sp in spaces if sp["tier"] != "Not Ready")
+        trusted_n = sum(1 for sp in spaces if sp["tier"] == "Trusted")
+        with_bench = sum(1 for sp in spaces if sp["benchmarks"] >= 10)
+        with_sql = sum(1 for sp in spaces if sp["example_sqls"] > 0)
+        curation_band = 60.0 * (0.6 * (ready_n / assessed) + 0.4 * (trusted_n / assessed))
+        score = round(min(existence_band + curation_band, 100.0), 1)
+        signals = _genie_audit_signals(audit) + [
+            {"label": "Curation-assessed", "value": f"{assessed} of {total}",
+             "detail": "Agents whose curation could be read (requires CAN_EDIT on the agent)"},
+            {"label": "Well-curated agents", "value": ready_n,
+             "detail": "Assessed agents meeting the 'Ready to Optimize' bar (instructions + SQL guidance + focused sources)"},
+            {"label": "Agents with ≥10 benchmarks", "value": with_bench,
+             "detail": "Validation: assessed agents carrying a benchmark set (>=10 questions)"},
+            {"label": "Agents with example SQL", "value": with_sql,
+             "detail": "Assessed agents with verified/example SQL curated"},
+        ]
+        if ready_n < assessed:
+            gaps.append(f"{assessed - ready_n} of {assessed} assessed agents aren't fully curated "
+                        "(missing instructions, SQL guidance, or too many/few sources) — curate them; "
+                        "Genie Workbench Auto-Optimize can lift them.")
+        if with_bench < assessed:
+            gaps.append(f"{assessed - with_bench} of {assessed} assessed agents lack a benchmark set "
+                        "(>=10 ground-truth Q&A) — add benchmarks and validate accuracy with Genie Workbench.")
+        if forbidden > 0:
+            note += f" Curation read for {assessed} of {min(total, _MAX_INSPECT)} sampled agents; {forbidden} not readable. " + _EDIT_HINT
+    else:
+        # No curation readable → existence-only score (unchanged from prior behavior).
+        legacy = 0.0
+        if total > 0:
+            legacy += 40.0
+        if active > 0:
+            legacy += 40.0
+        if total > 0 and active / total >= 0.3:
+            legacy += 20.0
+        score = round(min(legacy, 100.0), 1)
+        signals = _genie_audit_signals(audit)
+        if total == 0:
+            gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
+        elif active == 0:
+            gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
+        if total > 0:
+            note += " Curation quality not assessed. " + _EDIT_HINT
 
     return {
         "available": True,
-        "score": round(score, 1),
-        "signals": _genie_audit_signals(audit),
+        "score": score,
+        "signals": signals,
         "gaps": gaps,
-        "note": "Counted from system.access.audit (aibiGenie). Curation quality — instructions, "
-                "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
-                "Genie Agent Quality Workshop accelerator to assess and lift it.",
-        "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit},
+        "note": note,
+        "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit,
+                    "curation_assessed": assessed, "spaces": spaces},
     }
 
 
@@ -989,6 +1128,24 @@ async def probe_domains() -> dict:
 # ---------------------------------------------------------------------------
 # 7. Adoption & activity (system tables — optional)
 # ---------------------------------------------------------------------------
+async def _genie_feedback_30d() -> dict | None:
+    """Genie message thumbs feedback (last 30d) from the audit log:
+    system.access.audit / aibiGenie / updateConversationMessageFeedback with
+    request_params.feedback_rating in (THUMBS_UP, THUMBS_DOWN). None if unreadable."""
+    try:
+        rows = await execute_sql(
+            "SELECT SUM(CASE WHEN request_params.feedback_rating='THUMBS_UP'   THEN 1 ELSE 0 END) AS pos, "
+            "       SUM(CASE WHEN request_params.feedback_rating='THUMBS_DOWN' THEN 1 ELSE 0 END) AS neg "
+            "FROM system.access.audit "
+            "WHERE service_name='aibiGenie' AND action_name='updateConversationMessageFeedback' "
+            "  AND event_date >= current_date() - INTERVAL 30 DAYS"
+        )
+        row = rows[0] if rows else {}
+        return {"pos": int(row.get("pos") or 0), "neg": int(row.get("neg") or 0)}
+    except Exception:
+        return None
+
+
 async def probe_adoption() -> dict:
     try:
         active_users = None
@@ -1050,8 +1207,25 @@ async def probe_adoption() -> dict:
         if queries_30d is not None:
             signals.append({"label": "Queries (30d)", "value": queries_30d, "detail": "Query history volume"})
 
-        return {"available": True, "score": score, "signals": signals, "gaps": [], "note": None,
-                "metrics": {"active_users_30d": active_users, "queries_30d": queries_30d}}
+        # Genie answer satisfaction — additive signal (no score change): thumbs
+        # feedback from the audit log, same grant this pillar already uses.
+        gaps: list[str] = []
+        fb = await _genie_feedback_30d()
+        feedback_metrics = {}
+        if fb and (fb["pos"] + fb["neg"]) > 0:
+            rated = fb["pos"] + fb["neg"]
+            sat = round(100.0 * fb["pos"] / rated, 1)
+            signals.append({
+                "label": "Genie answer satisfaction (30d)", "value": sat, "unit": "%",
+                "detail": f"{fb['pos']} 👍 / {fb['neg']} 👎 message ratings (aibiGenie feedback)",
+            })
+            feedback_metrics = {"genie_feedback_pos": fb["pos"], "genie_feedback_neg": fb["neg"]}
+            if sat < 70.0:
+                gaps.append(f"Genie answer satisfaction is {sat}% ({fb['neg']} 👎 of {rated} ratings) — "
+                            "review low-rated agents and benchmark/optimize them with Genie Workbench.")
+
+        return {"available": True, "score": score, "signals": signals, "gaps": gaps, "note": None,
+                "metrics": {"active_users_30d": active_users, "queries_30d": queries_30d, **feedback_metrics}}
     except Exception as e:
         logger.warning(f"probe_adoption failed: {e}")
         return _empty(f"Could not read adoption signals ({str(e)[:120]}).")

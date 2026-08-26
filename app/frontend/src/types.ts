@@ -197,6 +197,11 @@ export interface GenieSpaceCuration {
   functions: number;
   benchmarks: number;
   tables: number;
+  synonyms: number;
+  // Curation maturity tier (Genie Workbench IQ vocabulary) + whether the agent has a
+  // meaningful description. Optional so older snapshots without them still render.
+  tier?: 'Trusted' | 'Ready to Optimize' | 'Not Ready';
+  description_ok?: boolean;
 }
 
 export interface GenieSpace {
