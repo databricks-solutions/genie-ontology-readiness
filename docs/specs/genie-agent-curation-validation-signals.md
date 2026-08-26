@@ -136,11 +136,14 @@ timed out). So:
   serialized space; add a `synonyms` dimension). This makes synonyms a **genie_agents curation
   sub-signal**, not a `metadata` signal. Rubric: an agent with described columns but zero synonyms
   earns a curation warning (mirrors Workbench).
-- **Follow-up (feasibility-gated):** metric-view synonyms require reading each MV's *definition*
-  (`SHOW CREATE` / `information_schema.views.view_definition`) — `probe_metrics` today only counts by
-  `table_type='METRIC_VIEW'` + comment (`probes.py:472,498`), it does not read the spec. Bounded
-  per-MV definition reads are feasible (cap like `_MAX_INSPECT`) but are a separate change; defer to
-  a follow-up rather than block this PR.
+- **Metric-view synonyms — IMPLEMENTED (this branch).** Feasibility confirmed on gor-serverless:
+  `SHOW CREATE TABLE <mv>` returns `… WITH METRICS LANGUAGE YAML AS $$ <yaml> $$`, and each
+  dimension/measure may carry a `synonyms:` key. `probe_metrics` now does a bounded
+  (`_MAX_MV_INSPECT=25`, concurrency-capped) SHOW CREATE pass over the metric views it already finds,
+  extracts the `$$…$$` YAML, and counts fields (`- name:`) vs. fields declaring synonyms
+  (`synonyms:`). Emits an **additive** `Fields with synonyms (%)` signal + a low-coverage gap; **no
+  score change**. Best-effort: unreadable views are skipped; signal omitted if none readable.
+  (`probes.py` `_metric_view_synonym_coverage`.)
 - **Dropped:** the earlier idea of a workspace-wide "column synonyms" `metadata` signal — it has no
   UC surface. No `metadata` rescore.
 

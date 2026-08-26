@@ -30,6 +30,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import aiohttp
 
 from server.sql_client import execute_sql, record_rest_identity
@@ -461,6 +462,61 @@ async def probe_relationships() -> dict:
 # ---------------------------------------------------------------------------
 # 4. Semantic layer (metric views)
 # ---------------------------------------------------------------------------
+_MAX_MV_INSPECT = 25  # bound SHOW CREATE calls when measuring synonym coverage
+# In a metric view's YAML spec each dimension/measure begins with "- name:" and may
+# carry an optional per-field "synonyms:" key. Synonyms are NOT in information_schema,
+# so we read the spec via SHOW CREATE and count fields vs. fields declaring synonyms.
+_MV_FIELD_RE = re.compile(r"^\s*-\s*name:", re.MULTILINE)
+_MV_SYNONYMS_RE = re.compile(r"^\s*synonyms:", re.MULTILINE)
+
+
+async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | None:
+    """Best-effort synonym coverage across metric views.
+
+    Synonyms live in the metric-view YAML spec (per-dimension/measure ``synonyms``),
+    not in ``information_schema`` — so read each view's definition via SHOW CREATE
+    (bounded to ``_MAX_MV_INSPECT``, concurrency-capped) and count fields vs. fields
+    declaring synonyms. Best-effort: views we can't read are skipped; returns None if
+    nothing is readable. Genie uses synonyms to map users' phrasing to the right field.
+    """
+    try:
+        rows = await execute_sql(
+            f"SELECT table_catalog, table_schema, table_name FROM {tbl} "
+            f"WHERE table_type = '{type_value}' LIMIT {_MAX_MV_INSPECT}"
+        )
+    except Exception:
+        return None
+    names = [(r.get("table_catalog"), r.get("table_schema"), r.get("table_name"))
+             for r in (rows or []) if r.get("table_name")]
+    if not names:
+        return None
+
+    sem = asyncio.Semaphore(8)
+
+    async def _one(cat: str, sch: str, name: str):
+        async with sem:
+            try:
+                cr = await execute_sql(f"SHOW CREATE TABLE `{cat}`.`{sch}`.`{name}`")
+            except Exception:
+                return None
+        if not cr:
+            return None
+        ddl = list(cr[0].values())[0] or ""
+        m = re.search(r"\$\$(.*)\$\$", ddl, re.DOTALL)  # the YAML metrics spec block
+        body = m.group(1) if m else ddl
+        return len(_MV_FIELD_RE.findall(body)), len(_MV_SYNONYMS_RE.findall(body))
+
+    results = await asyncio.gather(*(_one(c, s, n) for c, s, n in names))
+    ok = [r for r in results if r]
+    if not ok:
+        return None
+    return {
+        "inspected": len(ok),
+        "fields": sum(f for f, _ in ok),
+        "with_synonyms": sum(sy for _, sy in ok),
+    }
+
+
 async def probe_metrics() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
@@ -532,13 +588,41 @@ async def probe_metrics() -> dict:
                     f"{uncommented} metric view(s) lack a description — Genie reads metric-view, dimension, and measure comments to reason; add them."
                 )
 
+        # Synonym coverage — additive signal only (no score change): synonyms live in
+        # the metric-view YAML spec, so this is a bounded, best-effort SHOW CREATE pass.
+        syn_metrics = {}
+        try:
+            syn = await _metric_view_synonym_coverage(tbl, type_value)
+        except Exception:
+            syn = None
+        if syn and syn["fields"] > 0:
+            syn_pct = _pct(syn["with_synonyms"], syn["fields"])
+            signals.append({
+                "label": "Fields with synonyms",
+                "value": syn_pct,
+                "unit": "%",
+                "detail": (f"{syn['with_synonyms']} of {syn['fields']} dimensions/measures across "
+                           f"{syn['inspected']} metric view(s) declare synonyms — Genie maps the words "
+                           f"users say to the right field via synonyms"),
+            })
+            if syn_pct < 20:
+                gaps.append(
+                    "Few metric-view fields declare synonyms — add synonyms to dimensions/measures so "
+                    "Genie resolves business phrasing (e.g. \"revenue\", \"sales\") to the right field."
+                )
+            syn_metrics = {
+                "mv_synonym_fields": syn["with_synonyms"],
+                "mv_fields_inspected": syn["fields"],
+                "mv_synonym_inspected_views": syn["inspected"],
+            }
+
         return {
             "available": True,
             "score": score,
             "signals": signals,
             "gaps": gaps,
             "note": None,
-            "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
+            "metrics": {"metric_views": metric_views, "metric_views_commented": commented, **syn_metrics},
         }
     except Exception as e:
         logger.warning(f"probe_metrics failed: {e}")
