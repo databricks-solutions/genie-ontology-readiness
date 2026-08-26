@@ -221,7 +221,12 @@ release notes.
 - Isaac Review on the PR before deploy (per the repo's run-isaac-review-on-every-PR rule).
 
 ## 9. Decisions (resolved 2026-08-26)
-- **Q1 — scoring blend: ✅ APPROVED.** 40/60 existence-vs-curation, `0.6*ready + 0.4*trusted`.
+- **Q1 — scoring: ✅ APPROVED (mechanism revised 2026-08-26 after Isaac review, signed off).**
+  Originally an additive 40/60 blend; that was discontinuous (one more readable agent could drop a
+  workspace 100→40). Revised to a **continuous coverage-weighted penalty**:
+  `score = legacy(40/40/20) × (1 − 0.6·coverage·(1−quality))`, `quality = 0.6·ready + 0.4·trusted`,
+  `coverage = assessed/total`. Preserves the prior score exactly when curation is unreadable,
+  monotonic, small samples barely move it, max dock 60% (keeps curation's weight). **Signed off.**
 - **Q2 — degradation: ✅ fall back to existence-only when no CAN_EDIT** — chosen for least customer
   friction (this is an assessment tool; never penalize a workspace for a grant the app lacks).
 - **Q3 — synonyms: ✅ RESOLVED (§4.5).** No UC/`information_schema` surface; synonyms are a
