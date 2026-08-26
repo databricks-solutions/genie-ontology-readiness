@@ -109,7 +109,7 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
                   )}
                 </td>
                 {GENIE_COLS.map((c) => {
-                  const v = sp[c.key];
+                  const v = sp[c.key] ?? 0;
                   return (
                     <td key={c.key} className="px-3 py-2 text-center tabular-nums">
                       {v > 0 ? (

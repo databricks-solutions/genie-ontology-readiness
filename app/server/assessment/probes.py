@@ -495,23 +495,39 @@ _MV_SYNONYMS_RE = re.compile(r"^\s*synonyms:")
 
 
 def _mv_field_synonym_counts(yaml_body: str) -> tuple[int, int]:
-    """Count dimension/measure fields and how many declare synonyms in a metric-view
-    YAML spec. Section-aware: only ``dimensions:``/``measures:`` fields count, so a
-    ``joins:`` block (whose entries are also ``- name:``) doesn't inflate the field
-    denominator."""
+    """Count dimension/measure fields and how many declare a NON-EMPTY synonyms list in
+    a metric-view YAML spec. Section-aware: only ``dimensions:``/``measures:`` fields
+    count, so a ``joins:`` block (whose entries are also ``- name:``) doesn't inflate the
+    denominator. Handles inline (``synonyms: [a, b]``), empty (``synonyms:`` / ``[]``),
+    and block (``synonyms:`` then ``- item``) forms — consistent with _count_synonyms
+    (empty declarations don't count)."""
     fields = syn = 0
     section = None
+    pending = False  # saw a bare 'synonyms:' awaiting its block items on the next line
     for line in yaml_body.splitlines():
-        # A non-indented, non-list line starts a new top-level section (dimensions:,
-        # measures:, joins:, source:, ...).
-        if line[:1] not in (" ", "\t", "-", "") :
+        # A non-indented, non-list line starts a new top-level section.
+        if line[:1] not in (" ", "\t", "-", ""):
             section = line.split(":", 1)[0].strip().lower()
+            pending = False
             continue
-        if section in ("dimensions", "measures"):
-            if _MV_FIELD_RE.match(line):
-                fields += 1
-            elif _MV_SYNONYMS_RE.match(line):
+        if section not in ("dimensions", "measures"):
+            pending = False
+            continue
+        s = line.strip()
+        if pending:
+            pending = False
+            if s.startswith("-"):     # a list item → the bare 'synonyms:' block was non-empty
                 syn += 1
+                continue              # this line is a synonym value, not a field
+        if _MV_FIELD_RE.match(line):
+            fields += 1
+        elif s.startswith("synonyms:"):
+            val = s[len("synonyms:"):].strip()
+            if val and val != "[]":   # inline non-empty list
+                syn += 1
+            elif not val:             # bare 'synonyms:' → confirm on the next line
+                pending = True
+            # val == "[]" → empty, ignore
     return fields, syn
 
 
@@ -556,7 +572,9 @@ async def _metric_view_synonym_coverage(tbl: str, type_value: str) -> dict | Non
         return _mv_field_synonym_counts(body)
 
     results = await asyncio.gather(*(_one(c, s, n) for c, s, n in names))
-    ok = [r for r in results if r]
+    # Keep only views we actually parsed fields from — a (0,0) means no $$-YAML block
+    # / unparseable spec, which shouldn't count toward "across N metric view(s)".
+    ok = [r for r in results if r and r[0] > 0]
     if not ok:
         return None
     return {
@@ -791,7 +809,7 @@ async def _genie_agent_scan(limit: int) -> dict:
             "  WHERE service_name='aibiGenie' AND request_params.space_id IS NOT NULL "
             "  GROUP BY request_params.space_id "
             ") WHERE trashed = 0 "
-            f"ORDER BY active_30d DESC, last_seen DESC LIMIT {limit}"
+            f"ORDER BY active_30d DESC, last_seen DESC, space_id LIMIT {limit}"
         )
     except Exception:
         return {"total": None, "active_30d": None, "ids": []}
@@ -842,15 +860,6 @@ async def probe_genie_agents() -> dict:
     total, active = total or 0, active or 0
     audit = {"total": total, "active_30d": active}
 
-    # Existence/adoption band (max 40) — used only in the curation-inclusive score.
-    existence_band = 0.0
-    if total > 0:
-        existence_band += 20.0
-    if active > 0:
-        existence_band += 10.0
-    if total > 0 and active / total >= 0.3:
-        existence_band += 10.0
-
     # Curation deep-inspect runs as the app SP: the Genie REST API is not covered by the
     # OBO `sql` scope, so we must force_sp (same as genie_client). Best-effort — reading
     # serialized_space also requires CAN_EDIT on the agent.
@@ -874,21 +883,39 @@ async def probe_genie_agents() -> dict:
 
     assessed = len(spaces)
     sampled = min(total, _MAX_INSPECT) if total > 0 else 0
-    # Only let curation drive the score when a representative share of agents is readable
-    # — otherwise a tiny, unrepresentative CAN_EDIT sample could wrongly tank a
-    # well-adopted workspace. Below the bar we keep the existence-only score and surface
-    # curation as informational.
-    representative = assessed >= 3 and assessed >= round(0.5 * sampled)
+    ready_n = sum(1 for sp in spaces if sp["tier"] != "Not Ready")
+    trusted_n = sum(1 for sp in spaces if sp["tier"] == "Trusted")
+    with_bench = sum(1 for sp in spaces if sp["benchmarks"] >= 10)
+    with_sql = sum(1 for sp in spaces if sp["example_sqls"] > 0)
 
-    ready_n = trusted_n = with_bench = with_sql = 0
-    gaps, signals = [], _genie_audit_signals(audit)
+    # Base existence/adoption score — unchanged from the original pillar (40/40/20).
+    legacy = 0.0
+    if total > 0:
+        legacy += 40.0
+    if active > 0:
+        legacy += 40.0
+    if total > 0 and active / total >= 0.3:
+        legacy += 20.0
+
+    # Curation adjusts the score as a PENALTY proportional to how much of the estate we
+    # could read (coverage) and how poorly it scored (1 - quality). This (a) preserves the
+    # existing score EXACTLY when curation is unreadable (coverage 0 → no penalty), (b) is
+    # continuous & monotonic — more evidence of poor curation lowers the score smoothly,
+    # good curation keeps it, and a tiny sample barely moves it — and (c) caps the dock at
+    # 60% (curation's weight). Coverage is over ALL agents, so a large estate assessed from
+    # a bounded sample is only lightly adjusted.
+    if assessed > 0 and total > 0:
+        coverage = min(assessed / total, 1.0)
+        quality = 0.6 * (ready_n / assessed) + 0.4 * (trusted_n / assessed)
+        score = round(legacy * (1.0 - 0.6 * coverage * (1.0 - quality)), 1)
+    else:
+        score = round(min(legacy, 100.0), 1)
+
+    signals = _genie_audit_signals(audit)
+    gaps = []
     note = "Counts are workspace-wide from system.access.audit (aibiGenie)."
 
     if assessed > 0:
-        ready_n = sum(1 for sp in spaces if sp["tier"] != "Not Ready")
-        trusted_n = sum(1 for sp in spaces if sp["tier"] == "Trusted")
-        with_bench = sum(1 for sp in spaces if sp["benchmarks"] >= 10)
-        with_sql = sum(1 for sp in spaces if sp["example_sqls"] > 0)
         signals += [
             {"label": "Curation-assessed", "value": f"{assessed} of {total}",
              "detail": "Agents whose curation the app service principal could read (requires CAN_EDIT)"},
@@ -899,10 +926,6 @@ async def probe_genie_agents() -> dict:
             {"label": "Agents with example SQL", "value": with_sql,
              "detail": "Assessed agents with verified/example SQL curated"},
         ]
-
-    if representative:
-        curation_band = 60.0 * (0.6 * (ready_n / assessed) + 0.4 * (trusted_n / assessed))
-        score = round(min(existence_band + curation_band, 100.0), 1)
         if ready_n < assessed:
             gaps.append(f"{assessed - ready_n} of {assessed} assessed agents aren't fully curated "
                         "(missing instructions, SQL guidance, or too many/few sources) — curate them; "
@@ -912,27 +935,15 @@ async def probe_genie_agents() -> dict:
                         "(>=10 ground-truth Q&A) — add benchmarks and validate accuracy with Genie Workbench.")
         if forbidden > 0:
             note += f" Curation read for {assessed} of {sampled} sampled agents; {forbidden} not readable. " + _EDIT_HINT
+        elif total > _MAX_INSPECT:
+            note += f" Curation sampled the {assessed} most-active of {total} agents."
     else:
-        # Existence-only score (unchanged from prior behavior) — curation isn't
-        # representative enough to score, so it can't penalize.
-        legacy = 0.0
-        if total > 0:
-            legacy += 40.0
-        if active > 0:
-            legacy += 40.0
-        if total > 0 and active / total >= 0.3:
-            legacy += 20.0
-        score = round(min(legacy, 100.0), 1)
         if total == 0:
             gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
         elif active == 0:
             gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
         if total > 0:
-            if assessed > 0:
-                note += (f" Curation read for only {assessed} of {sampled} sampled agents — too few to "
-                         "score; shown for reference. ") + _EDIT_HINT
-            else:
-                note += " Curation quality not assessed (the app service principal needs CAN_EDIT). " + _EDIT_HINT
+            note += " Curation quality not assessed (the app service principal needs CAN_EDIT). " + _EDIT_HINT
 
     return {
         "available": True,
