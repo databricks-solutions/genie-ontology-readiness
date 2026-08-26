@@ -1,6 +1,34 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Tailwind v4 design tokens. Re-express our brand scales as @theme color vars so every
+   existing `bg-databricks-500` / `text-ink-900` utility keeps resolving unchanged (this
+   extends v4's default palette — gray/emerald/amber/etc. remain available). Keep the
+   Databricks brand; do NOT adopt Genie Workbench's indigo. */
+@theme {
+  --color-databricks-50: #fff1ee;
+  --color-databricks-100: #ffded6;
+  --color-databricks-200: #ffc1b3;
+  --color-databricks-300: #ff9883;
+  --color-databricks-400: #ff6347;
+  --color-databricks-500: #FF3621;
+  --color-databricks-600: #e62614;
+  --color-databricks-700: #bf1c0e;
+  --color-databricks-800: #9e1a10;
+  --color-databricks-900: #831c14;
+
+  --color-ink-50: #f3f6f6;
+  --color-ink-100: #dfe7e8;
+  --color-ink-200: #c1d0d2;
+  --color-ink-300: #97afb2;
+  --color-ink-400: #65868a;
+  --color-ink-500: #4a6a6e;
+  --color-ink-600: #3f595e;
+  --color-ink-700: #374b4f;
+  --color-ink-800: #2a393d;
+  --color-ink-900: #1B3139;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
 
 @layer base {
   body {
