@@ -26,6 +26,7 @@ import type {
   SnapshotResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
+import { Badge, levelTone, type BadgeTone } from './ui/Badge';
 import PillarDetail from './PillarDetail';
 
 type AssessEvent =
@@ -56,12 +57,11 @@ function Gauge({ score, color }: { score: number; color: string }) {
 }
 
 function LevelBadge({ level, label }: { level: number; label: string }) {
-  const s = levelStyle(level);
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold ${s.bg} ${s.text}`}>
+    <Badge tone={levelTone(level)}>
       <span className="tabular-nums">L{level}</span>
-      <span className="font-medium">{label}</span>
-    </span>
+      <span>{label}</span>
+    </Badge>
   );
 }
 
@@ -72,17 +72,12 @@ function IdentityBadge({ identity }: { identity: SignalIdentity }) {
   const short =
     identity.ran_as === 'user' ? 'You' :
     identity.ran_as === 'mixed' ? 'You + SP' : 'App SP';
-  const cls =
-    identity.ran_as === 'user' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
-    identity.ran_as === 'mixed' ? 'bg-violet-50 text-violet-700 border-violet-200' :
-    'bg-amber-50 text-amber-700 border-amber-200';
+  const tone: BadgeTone =
+    identity.ran_as === 'user' ? 'emerald' : identity.ran_as === 'mixed' ? 'violet' : 'amber';
   return (
-    <span
-      className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[11px] font-medium ${cls}`}
-      title={`Ran as: ${identity.label} — ${identity.detail}`}
-    >
+    <Badge tone={tone} className="px-1.5 text-[11px]" title={`Ran as: ${identity.label} — ${identity.detail}`}>
       {short}
-    </span>
+    </Badge>
   );
 }
 

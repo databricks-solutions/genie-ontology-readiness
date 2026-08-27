@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Info, Database, ChevronDown } from 'lucide-react';
 import type { PillarScore, AppConfig, GenieSpaceCuration, UcSchemaCount, SignalIdentity } from '../types';
+import { Badge, type BadgeTone } from './ui/Badge';
 import GenieTester from './GenieTester';
 
 // A visible "read as" line naming the identity that served this pillar's reads
@@ -69,11 +70,11 @@ const GENIE_COLS: { key: keyof Omit<GenieSpaceCuration, 'title' | 'tier' | 'desc
   { key: 'tables', label: 'Tables' },
 ];
 
-// Per-agent curation tier chip (Genie Workbench IQ vocabulary), in our palette.
-function tierChipClass(tier?: string): string {
-  if (tier === 'Trusted') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
-  if (tier === 'Ready to Optimize') return 'bg-amber-50 text-amber-700 border-amber-200';
-  return 'bg-gray-100 text-ink-500 border-gray-200';
+// Per-agent curation tier (Genie Workbench IQ vocabulary) → shared Badge tone.
+function tierTone(tier?: string): BadgeTone {
+  if (tier === 'Trusted') return 'emerald';
+  if (tier === 'Ready to Optimize') return 'amber';
+  return 'gray';
 }
 
 function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
@@ -101,9 +102,7 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
                 <td className="px-3 py-2 text-ink-800 max-w-[260px] truncate" title={sp.title}>{sp.title}</td>
                 <td className="px-3 py-2">
                   {sp.tier ? (
-                    <span className={`inline-block text-[11px] font-medium px-1.5 py-0.5 rounded-full border whitespace-nowrap ${tierChipClass(sp.tier)}`}>
-                      {sp.tier}
-                    </span>
+                    <Badge tone={tierTone(sp.tier)} className="px-1.5 text-[11px]">{sp.tier}</Badge>
                   ) : (
                     <span className="text-ink-300">—</span>
                   )}

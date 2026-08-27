@@ -39,7 +39,7 @@
 
 @layer components {
   .card {
-    @apply bg-white rounded-lg border border-gray-200 shadow-sm;
+    @apply bg-white rounded-xl border border-gray-200 shadow-sm;
   }
   .btn-primary {
     @apply bg-databricks-500 hover:bg-databricks-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium py-2 px-4 rounded-md transition-colors;
