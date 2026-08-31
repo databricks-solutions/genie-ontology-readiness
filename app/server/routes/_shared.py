@@ -64,6 +64,25 @@ AI_MODELS = {
 # ---------------------------------------------------------------------------
 _llm_session: Optional[aiohttp.ClientSession] = None
 
+# Newer Anthropic models no longer expose sampling knobs: temperature/top_p/top_k
+# are REMOVED and the FM API returns 400 ("Model ... does not support the
+# temperature parameter") if you send one. Omit temperature for these proactively
+# so the common case never wastes a round-trip; the send loop below also drops it
+# on a temperature-400 as a fallback for any other model the list doesn't cover.
+# (Opus 5 / 4.8 / 4.7, Sonnet 5, Fable 5 reject it; Opus/Sonnet 4.6 and older accept it.)
+_NO_TEMPERATURE_TOKENS = ("opus-5", "opus-4-8", "opus-4-7", "sonnet-5", "fable", "mythos")
+
+
+def _supports_temperature(model: str) -> bool:
+    """Whether the given serving-endpoint model accepts a `temperature` param.
+
+    Matches on the dot-normalized, lowercased model name so both the endpoint
+    name (``databricks-claude-opus-5``) and the underlying model id
+    (``us.anthropic.claude-opus-5``) are covered.
+    """
+    m = (model or "").lower().replace(".", "-")
+    return not any(tok in m for tok in _NO_TEMPERATURE_TOKENS)
+
 
 async def _get_llm_session() -> aiohttp.ClientSession:
     global _llm_session
@@ -96,39 +115,56 @@ async def _stream_from_fmapi(
     payload = {
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "stream": True,
     }
+    # Only send temperature to models that accept it (newer Anthropic models 400 on it).
+    if _supports_temperature(model):
+        payload["temperature"] = temperature
 
     try:
         session = await _get_llm_session()
-        async with session.post(url, json=payload, headers=headers) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"LLM API error ({response.status}): {error_text[:200]}")
-                yield f"data: {json.dumps({'error': f'LLM API error: {response.status}'})}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            async for line in response.content:
-                decoded = line.decode("utf-8").strip()
-                if not decoded or not decoded.startswith("data: "):
-                    continue
-                data_str = decoded[6:]
-                if data_str == "[DONE]":
+        # At most two attempts: if the model unexpectedly rejects `temperature`
+        # (a model not in the denylist above), drop it and retry once.
+        for attempt in range(2):
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    if (
+                        attempt == 0
+                        and response.status == 400
+                        and "temperature" in payload
+                        and "temperature" in error_text.lower()
+                    ):
+                        logger.warning(
+                            f"Model {model} rejected temperature; retrying without it"
+                        )
+                        payload.pop("temperature", None)
+                        continue
+                    logger.error(f"LLM API error ({response.status}): {error_text[:200]}")
+                    yield f"data: {json.dumps({'error': f'LLM API error: {response.status}'})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
-                try:
-                    chunk = json.loads(data_str)
-                    choices = chunk.get("choices", [])
-                    if not choices:
+
+                async for line in response.content:
+                    decoded = line.decode("utf-8").strip()
+                    if not decoded or not decoded.startswith("data: "):
                         continue
-                    content = choices[0].get("delta", {}).get("content", "")
-                    if content:
-                        yield f"data: {json.dumps({'content': content})}\n\n"
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    continue
-        yield "data: [DONE]\n\n"
+                    data_str = decoded[6:]
+                    if data_str == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        return
+                    try:
+                        chunk = json.loads(data_str)
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+                        content = choices[0].get("delta", {}).get("content", "")
+                        if content:
+                            yield f"data: {json.dumps({'content': content})}\n\n"
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        continue
+                yield "data: [DONE]\n\n"
+                return
     except Exception as e:
         logger.error(f"LLM streaming error: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
