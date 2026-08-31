@@ -68,19 +68,37 @@ _llm_session: Optional[aiohttp.ClientSession] = None
 # are REMOVED and the FM API returns 400 ("Model ... does not support the
 # temperature parameter") if you send one. Omit temperature for these proactively
 # so the common case never wastes a round-trip; the send loop below also drops it
-# on a temperature-400 as a fallback for any other model the list doesn't cover.
+# and retries when *any* model returns a 400 while temperature is set.
+#
+# Tokens are version-specific to avoid matching an unrelated custom endpoint whose
+# name merely happens to contain a family word. Anything not listed here that turns
+# out to reject temperature at runtime is learned into _TEMP_UNSUPPORTED (below), so
+# the doubled round-trip is paid at most once per model per process.
 # (Opus 5 / 4.8 / 4.7, Sonnet 5, Fable 5 reject it; Opus/Sonnet 4.6 and older accept it.)
-_NO_TEMPERATURE_TOKENS = ("opus-5", "opus-4-8", "opus-4-7", "sonnet-5", "fable", "mythos")
+_NO_TEMPERATURE_TOKENS = ("opus-5", "opus-4-8", "opus-4-7", "sonnet-5", "fable-5")
+
+# Runtime-learned: normalized names of models observed to 400 on `temperature`.
+# The send loop adds a model here once it's confident temperature was the cause
+# (the error names it, or dropping it made the retry succeed), so subsequent calls
+# skip temperature proactively — no recurring wasted round-trip or WARNING spam.
+_TEMP_UNSUPPORTED: set[str] = set()
+
+
+def _normalize_model(model: str) -> str:
+    return (model or "").lower().replace(".", "-")
 
 
 def _supports_temperature(model: str) -> bool:
     """Whether the given serving-endpoint model accepts a `temperature` param.
 
-    Matches on the dot-normalized, lowercased model name so both the endpoint
-    name (``databricks-claude-opus-5``) and the underlying model id
+    Consults the static version denylist AND the runtime-learned set, matching on
+    the dot-normalized, lowercased name so both the endpoint name
+    (``databricks-claude-opus-5``) and the underlying model id
     (``us.anthropic.claude-opus-5``) are covered.
     """
-    m = (model or "").lower().replace(".", "-")
+    m = _normalize_model(model)
+    if m in _TEMP_UNSUPPORTED:
+        return False
     return not any(tok in m for tok in _NO_TEMPERATURE_TOKENS)
 
 
@@ -121,29 +139,41 @@ async def _stream_from_fmapi(
     if _supports_temperature(model):
         payload["temperature"] = temperature
 
+    normalized_model = _normalize_model(model)
+    retried_without_temp = False
+
     try:
         session = await _get_llm_session()
-        # At most two attempts: if the model unexpectedly rejects `temperature`
-        # (a model not in the denylist above), drop it and retry once.
+        # At most two attempts: if a model returns a 400 while temperature is set,
+        # drop temperature and retry once. This self-heals for any model that
+        # rejects the param but isn't in the static denylist (finding-driven:
+        # rejections can be worded differently, so we don't gate on the error text).
         for attempt in range(2):
             async with session.post(url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    if (
-                        attempt == 0
-                        and response.status == 400
-                        and "temperature" in payload
-                        and "temperature" in error_text.lower()
-                    ):
+                    if attempt == 0 and response.status == 400 and "temperature" in payload:
+                        # If the error explicitly blames temperature we're certain,
+                        # so learn it now; otherwise learn only if the retry succeeds
+                        # (below), to avoid mislabeling a model over an unrelated 400.
+                        if "temperature" in error_text.lower():
+                            _TEMP_UNSUPPORTED.add(normalized_model)
                         logger.warning(
-                            f"Model {model} rejected temperature; retrying without it"
+                            f"Model {model} returned 400 with temperature set; "
+                            f"retrying without it"
                         )
                         payload.pop("temperature", None)
+                        retried_without_temp = True
                         continue
                     logger.error(f"LLM API error ({response.status}): {error_text[:200]}")
                     yield f"data: {json.dumps({'error': f'LLM API error: {response.status}'})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+
+                # Dropping temperature fixed a prior 400 → this model rejects it;
+                # remember so future calls skip temperature proactively.
+                if retried_without_temp:
+                    _TEMP_UNSUPPORTED.add(normalized_model)
 
                 async for line in response.content:
                     decoded = line.decode("utf-8").strip()
