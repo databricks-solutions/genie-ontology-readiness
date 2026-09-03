@@ -31,6 +31,7 @@ import PillarDetail from './PillarDetail';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
+  | { type: 'pillar_progress'; key: string; done: number; total: number; detail: string }
   | { type: 'complete'; overall: ScorecardOverall; pillars: PillarScore[]; top_gaps: TopGap[]; snapshot_id?: number | null }
   | { type: 'error'; error: string };
 
@@ -130,6 +131,7 @@ export default function Scorecard({
   setScorecard: (s: ScorecardType) => void;
 }) {
   const [phase, setPhase] = useState<'idle' | 'running' | 'done'>(scorecard ? 'done' : 'idle');
+  const [progressByKey, setProgressByKey] = useState<Record<string, string>>({});
   const [pillarsByKey, setPillarsByKey] = useState<Record<string, PillarScore>>(() =>
     scorecard ? Object.fromEntries(scorecard.pillars.map((p) => [p.key, p])) : {}
   );
@@ -184,6 +186,7 @@ export default function Scorecard({
     if (phase === 'running') return;
     setError(null);
     setPillarsByKey({});
+    setProgressByKey({});
     setOverall(null);
     setTopGaps([]);
     setCurrentId(null);
@@ -203,6 +206,8 @@ export default function Scorecard({
         if (ev.type === 'pillar') {
           collected[ev.pillar.key] = ev.pillar;
           setPillarsByKey({ ...collected });
+        } else if (ev.type === 'pillar_progress') {
+          setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
         } else if (ev.type === 'complete') {
           completed = true;
           setOverall(ev.overall);
@@ -492,12 +497,13 @@ export default function Scorecard({
         {config.pillars.map((cp) => {
           const p = pillarsByKey[cp.key];
           if (!p) {
+            const prog = progressByKey[cp.key];
             return (
               <div key={cp.key} className="card flex items-center gap-4 px-4 py-3 opacity-70">
                 <Loader2 size={16} className="animate-spin text-ink-300 shrink-0 w-12" />
                 <div className="flex-1 min-w-0">
                   <span className="font-semibold text-ink-500">{cp.name}</span>
-                  <p className="text-xs text-ink-400 mt-0.5 truncate">Checking…</p>
+                  <p className="text-xs text-ink-400 mt-0.5 truncate" title={prog || undefined}>{prog || 'Checking…'}</p>
                 </div>
               </div>
             );
