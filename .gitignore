@@ -3,6 +3,7 @@
 *conf*.json
 !tsconfig.json
 !tsconfig.*.json
+!release-please-config.json
 .idea/
 
 # Python

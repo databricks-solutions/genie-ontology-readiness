@@ -1,0 +1,26 @@
+name: release-please
+
+# Automates versioning + releases from Conventional Commit messages (feat: / fix:
+# / etc.). On each push to main it maintains a "release PR" that updates CHANGELOG.md
+# and the version; merging that PR cuts the git tag + GitHub Release. Baseline is
+# seeded at 1.1.0 in .release-please-manifest.json.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
