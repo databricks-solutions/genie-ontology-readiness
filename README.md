@@ -45,6 +45,23 @@ guides, and the public Databricks accelerators that raise each pillar's score.
 
 ## Quick start
 
+**Get the code.** For a **stable build**, clone the latest tagged
+[release](https://github.com/databricks-solutions/genie-ontology-readiness/releases)
+— this is the recommended source for customer deployments. For a **staging build**
+with the newest, unreleased changes, clone `main` directly.
+
+```bash
+# Stable — latest release (recommended)
+tag=$(gh release view --repo databricks-solutions/genie-ontology-readiness --json tagName -q .tagName)
+git clone --branch "$tag" https://github.com/databricks-solutions/genie-ontology-readiness.git
+# (no gh? browse the Releases page above and: git clone --branch <tag> <repo-url>)
+
+# Staging — latest main (newest, unreleased)
+git clone https://github.com/databricks-solutions/genie-ontology-readiness.git
+```
+
+Then build and deploy:
+
 ```bash
 cd app/frontend && npm install && npm run build && cd ../..
 databricks bundle deploy -t dev --profile <p> --var="warehouse_id=<id>"
