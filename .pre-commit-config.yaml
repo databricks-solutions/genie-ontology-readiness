@@ -1,11 +1,20 @@
-# Optional local hooks: `pip install pre-commit && pre-commit install`.
-# Mirrors the checks CI enforces so problems are caught before pushing.
+# Local quality gates (GitHub Actions is org-disabled for this repo, so these run
+# client-side). Opt in with:
+#     pip install pre-commit
+#     pre-commit install --install-hooks   # installs pre-commit AND pre-push hooks
+#
+# - pre-commit stage: fast checks (ruff + hygiene) on staged files.
+# - pre-push stage:   the full gate (scripts/check.sh) before anything leaves your
+#                     machine — the CI-equivalent.
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.5
     hooks:
       - id: ruff
         args: [--fix]
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
@@ -15,3 +24,12 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=1024]
+
+  - repo: local
+    hooks:
+      - id: full-check
+        name: full quality gate (scripts/check.sh)
+        entry: bash scripts/check.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

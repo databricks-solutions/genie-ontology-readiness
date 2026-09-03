@@ -16,6 +16,6 @@
 <!-- Anything reviewers should know: follow-ups, known limitations, deploy steps. -->
 
 ---
-- [ ] Frontend builds and typechecks (`npm run build`) — if frontend touched
-- [ ] Tests pass (`npm test`, `pytest`) — if applicable
+<!-- GitHub Actions is org-disabled for this repo, so checks run locally. -->
+- [ ] `bash scripts/check.sh` passes (build, typecheck, vitest, ruff, pytest, compliance)
 - [ ] Reviewed with Isaac Review before merge
