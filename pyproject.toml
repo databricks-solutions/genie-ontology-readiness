@@ -1,0 +1,28 @@
+# Tooling config for the Python backend (app/server) and helper scripts.
+# The app itself is deployed as a Databricks App; this file only configures
+# linting and tests, it is not a package build.
+
+[tool.ruff]
+# Lint the app backend and deploy scripts. The downloadable accelerators under
+# app/accelerators/ are Databricks *notebook* artifacts that run in a notebook
+# runtime (where `dbutils`, `spark`, etc. are injected globals), so they are not
+# valid standalone modules and are intentionally excluded from linting.
+line-length = 120
+extend-exclude = [
+    "app/accelerators",
+    "app/frontend",
+    "**/dist",
+]
+
+[tool.ruff.lint]
+# Deliberately conservative: the real-bug classes (pyflakes + syntax) that should
+# never merge, without opinionated style rules that would fight the code's
+# intentional patterns (e.g. broad best-effort excepts in probes). Broaden in a
+# follow-up (e.g. add "I" import-sorting, "UP" pyupgrade) once the team opts in.
+select = ["E9", "F"]
+
+[tool.pytest.ini_options]
+# pillars.py is import-free, so tests can import it via the server package
+# (app/server/__init__.py is empty) without pulling the app's runtime deps.
+pythonpath = ["app"]
+testpaths = ["tests"]

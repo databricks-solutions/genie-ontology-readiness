@@ -37,7 +37,6 @@ from server.config import (
     get_workspace_host,
     get_auth_headers,
     ASSESS_CATALOGS,
-    GENIE_SPACE_ID,
     get_user_token,
 )
 
