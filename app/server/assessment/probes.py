@@ -98,6 +98,30 @@ def _pct(num, den) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Progress channel
+# ---------------------------------------------------------------------------
+# A probe can report intra-probe progress (e.g. the metadata scan working through
+# catalog batches) by pushing events onto a queue the streaming assessment drains.
+# run_assessment_stream primes this contextvar with a queue before dispatching
+# probes; contextvars are copied into each probe task, so a probe can find the sink
+# and emit without any change to its call signature. When no queue is primed
+# (non-streaming run_assessment, or unit tests) emitting is a no-op.
+_progress_sink: contextvars.ContextVar = contextvars.ContextVar("assessment_progress_sink", default=None)
+
+
+def _emit_progress(key: str, done: int, total: int, detail: str) -> None:
+    """Best-effort: push a pillar-progress event to the streaming sink if primed.
+    Never blocks and never raises into the probe (progress is advisory)."""
+    sink = _progress_sink.get()
+    if sink is None:
+        return
+    try:
+        sink.put_nowait({"type": "pillar_progress", "key": key, "done": done, "total": total, "detail": detail})
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Source resolution
 # ---------------------------------------------------------------------------
 # SP-only cache: used when no user token is present (scheduled/unattended mode).
@@ -338,28 +362,144 @@ async def probe_uc_foundation() -> dict:
 # ---------------------------------------------------------------------------
 # 2. Metadata richness (comments + tags)
 # ---------------------------------------------------------------------------
+# --- Metadata scan chunking -------------------------------------------------
+# Column comment coverage is the heaviest metadata read: information_schema.columns
+# has a row per column of every table. On a wide metastore (thousands of catalogs)
+# one metastore-wide scan runs for many minutes and times out. Instead we scan in
+# per-catalog batches with bounded concurrency, accumulating coverage and emitting
+# progress as batches land. Tuned against a 1068-catalog workspace (a 30-catalog
+# batch returns in ~7s): 25/batch × 6 concurrent finishes ~1068 catalogs in <1 min.
+_METADATA_BATCH_SIZE = 25
+_METADATA_SCAN_CONCURRENCY = 6
+# Stall only if NO batch completes within this window (not a fixed total deadline),
+# so a slow-but-progressing scan of a huge metastore is allowed to finish.
+_METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
+
+_COV_SELECT = ("SELECT COUNT(*) AS total, "
+               "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
+
+
+def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> str:
+    """Comment-coverage query for an information_schema ``view`` (tables/columns)
+    scoped to a batch of catalogs.
+
+    system_ok: filter the metastore-wide view by ``table_catalog IN (...)`` (prunes
+    to just these catalogs). Per-catalog: UNION each catalog's own view. Scoping both
+    tables and columns to the same catalog list keeps the 50/50 comment score
+    measured over one consistent population.
+    """
+    if system_ok:
+        in_list = ", ".join("'" + c.replace("'", "''") + "'" for c in catalogs_batch)
+        return (_COV_SELECT + f"system.information_schema.{view} "
+                f"WHERE table_catalog IN ({in_list}) AND table_schema <> 'information_schema'")
+    union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in catalogs_batch)
+    return _COV_SELECT + f"({union}) AS _c WHERE table_schema <> 'information_schema'"
+
+
+async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tuple[int, int]:
+    """Total (columns, commented-columns) computed in per-catalog batches with
+    bounded concurrency. Emits pillar_progress as each batch lands and raises
+    TimeoutError only if no batch completes within _METADATA_NO_PROGRESS_TIMEOUT."""
+    batches = [catalogs[i:i + _METADATA_BATCH_SIZE] for i in range(0, len(catalogs), _METADATA_BATCH_SIZE)]
+    total_cats = len(catalogs)
+    sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
+    c_total = c_commented = scanned = ok_cats = failed_cats = 0
+
+    async def _one(batch: list[str]) -> tuple[int, int, int, bool]:
+        async with sem:
+            try:
+                rows = await execute_sql(_coverage_query("columns", batch, system_ok))
+                return len(batch), int(rows[0].get("total") or 0), int(rows[0].get("commented") or 0), True
+            except Exception as e:
+                # An isolated bad batch (e.g. one unreadable catalog) shouldn't sink
+                # the whole scan — record it as failed (not as real 0% coverage). If
+                # EVERY batch fails (permissions lost, warehouse down) we raise below
+                # so the pillar degrades to "unavailable" rather than a fake 0%.
+                logger.warning(f"metadata column batch failed ({len(batch)} catalogs): {str(e)[:100]}")
+                return len(batch), 0, 0, False
+
+    tasks = [asyncio.ensure_future(_one(b)) for b in batches]
+    pending = set(tasks)
+    _emit_progress("metadata", 0, total_cats, f"Scanning column metadata across {total_cats} catalogs…")
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, timeout=_METADATA_NO_PROGRESS_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                raise TimeoutError(
+                    f"metadata column scan stalled — no batch completed in "
+                    f"{_METADATA_NO_PROGRESS_TIMEOUT}s ({scanned}/{total_cats} catalogs scanned)"
+                )
+            for d in done:
+                ncat, t, c, ok = d.result()
+                scanned += ncat
+                if ok:
+                    ok_cats += ncat
+                    c_total += t
+                    c_commented += c
+                else:
+                    failed_cats += ncat
+                _emit_progress("metadata", scanned, total_cats,
+                               f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented")
+    finally:
+        # Cancel any still-pending batches (timeout path) and await them so the
+        # cancellations settle — no orphaned tasks or unretrieved-exception warnings.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Every batch failed → this is an access/infra failure, not real 0% coverage.
+    # Raise so probe_metadata marks the pillar unavailable (pre-chunking behavior).
+    if ok_cats == 0:
+        raise RuntimeError(f"column coverage scan failed for all {total_cats} catalogs")
+    if failed_cats:
+        logger.warning(f"metadata scan: {failed_cats}/{total_cats} catalogs unreadable; "
+                       f"coverage computed over the {ok_cats} readable")
+    return c_total, c_commented
+
+
 async def probe_metadata() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
-    col = _src("columns", s)
     if tbl is None:
         return _empty(_no_catalogs_note("metadata assessment"))
     try:
-        rows = await execute_sql(
-            f"""SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
-                FROM {tbl} WHERE table_schema <> 'information_schema'"""
-        )
+        system_ok = bool(s.get("system_ok"))
+        catalogs = s.get("catalogs") or []
+
+        # Table comment coverage — one fast query. In system mode the metastore-wide
+        # tables view also spans internal catalogs (system/samples/…), but column
+        # coverage below is scoped to the enumerated non-internal catalogs; exclude
+        # the same internal catalogs here so both halves of the 50/50 score measure
+        # the same population. (Per-catalog _src is already scoped to that list.)
+        if system_ok:
+            internal_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
+            tables_query = (_COV_SELECT + "system.information_schema.tables "
+                            "WHERE table_schema <> 'information_schema' "
+                            f"AND table_catalog NOT IN ({internal_list})")
+        else:
+            tables_query = _COV_SELECT + f"{tbl} WHERE table_schema <> 'information_schema'"
+        rows = await execute_sql(tables_query)
         t_total = int(rows[0].get("total") or 0)
         t_commented = int(rows[0].get("commented") or 0)
 
-        crows = await execute_sql(
-            f"""SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
-                FROM {col} WHERE table_schema <> 'information_schema'"""
-        )
-        c_total = int(crows[0].get("total") or 0)
-        c_commented = int(crows[0].get("commented") or 0)
+        # Heavy read — scan columns coverage in per-catalog batches so a wide
+        # metastore fills in progressively instead of timing out on one big scan.
+        # Fall back to a single query only when there's no catalog list to chunk by.
+        if catalogs:
+            c_total, c_commented = await _column_coverage_chunked(catalogs, system_ok)
+        else:
+            col = _src("columns", s)  # built lazily — only the no-catalog-list fallback needs it
+            if col is not None:
+                crows = await execute_sql(
+                    _COV_SELECT + f"{col} WHERE table_schema <> 'information_schema'"
+                )
+                c_total = int(crows[0].get("total") or 0)
+                c_commented = int(crows[0].get("commented") or 0)
+            else:
+                c_total = c_commented = 0
 
         tagged_tables = None
         tt = _src("table_tags", s)

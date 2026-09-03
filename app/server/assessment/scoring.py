@@ -15,7 +15,7 @@ from server.pillars import (
     level_from_score,
     readiness_stage,
 )
-from server.assessment.probes import PROBES, prime_request_sources
+from server.assessment.probes import PROBES, prime_request_sources, _progress_sink
 from server.sql_client import start_identity_capture, resolved_identity
 from server.content.library import best_practices_for, capability_summary
 
@@ -134,12 +134,37 @@ async def run_assessment_stream():
     by_key: dict[str, dict] = {}
     # Prime the shared per-request source resolution before dispatching probes.
     await prime_request_sources()
-    tasks = [asyncio.ensure_future(_run_probe(k)) for k in PROBES]
-    for fut in asyncio.as_completed(tasks):
-        key, probe = await fut
-        pillar = _assemble_pillar(PILLARS_BY_KEY[key], probe)
-        by_key[key] = pillar
-        yield {"type": "pillar", "pillar": pillar}
+
+    # A single queue carries both intra-probe progress (pillar_progress) and probe
+    # completions. Priming _progress_sink BEFORE creating the probe tasks means each
+    # task inherits it (contextvars are copied at task creation), so a probe can emit
+    # progress without a changed signature. We drain the queue until every probe has
+    # reported completion — interleaving progress events as they arrive.
+    q: asyncio.Queue = asyncio.Queue()
+    _progress_sink.set(q)
+
+    async def _runner(k: str) -> None:
+        key, probe = await _run_probe(k)
+        await q.put({"kind": "done", "key": key, "probe": probe})
+
+    tasks = [asyncio.ensure_future(_runner(k)) for k in PROBES]
+    remaining = len(tasks)
+    try:
+        while remaining > 0:
+            item = await q.get()
+            if item.get("kind") == "done":
+                key = item["key"]
+                pillar = _assemble_pillar(PILLARS_BY_KEY[key], item["probe"])
+                by_key[key] = pillar
+                remaining -= 1
+                yield {"type": "pillar", "pillar": pillar}
+            else:
+                # Already SSE-shaped progress event ({"type":"pillar_progress",...}).
+                yield item
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
     ordered = [by_key[p["key"]] for p in PILLARS if p["key"] in by_key]
     yield {"type": "complete", "pillars": ordered, **_finalize(ordered)}
