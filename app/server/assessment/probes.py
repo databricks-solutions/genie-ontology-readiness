@@ -38,6 +38,7 @@ from server.config import (
     get_auth_headers,
     ASSESS_CATALOGS,
     GENIE_SPACE_ID,
+    WORKSPACE_ID,
     get_user_token,
 )
 
@@ -689,6 +690,7 @@ async def probe_metrics() -> dict:
 # 5. Genie Agents (REST) — deep curation assessment
 # ---------------------------------------------------------------------------
 _MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
+_GENIE_AUDIT_LOOKBACK_DAYS = 30
 
 
 def _count(serialized: dict, *path: str) -> int:
@@ -762,12 +764,18 @@ async def _genie_audit_counts() -> dict:
     trashed (a `trashSpace` action; there is no deleteSpace — see the docs at
     https://docs.databricks.com/aws/en/ai-bi/admin/audit).
 
-    Single scan: group by space_id and derive per-space "trashed" and
-    "active in last 30 days" flags in one pass (instead of separate COUNT
-    DISTINCT + NOT IN queries that scanned the large audit table repeatedly).
+    Single bounded scan: prune the account-level audit table to this workspace
+    and the last 30 days, then group by space_id and derive per-space "trashed" and
+    "active in last 30 days" flags in one pass. The bounds keep this probe below
+    the app gateway's streaming timeout on large accounts.
     Returns total / active_30d (each None if the audit table isn't readable).
     """
     try:
+        workspace_filter = ""
+        parameters = None
+        if WORKSPACE_ID:
+            workspace_filter = "AND workspace_id = CAST(:workspace_id AS BIGINT) "
+            parameters = {"workspace_id": WORKSPACE_ID}
         rows = await execute_sql(
             "SELECT COUNT(*) AS total, "
             "       SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d "
@@ -777,8 +785,11 @@ async def _genie_audit_counts() -> dict:
             "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
+            f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
+            f"    {workspace_filter}"
             "  GROUP BY request_params.space_id "
-            ") WHERE trashed = 0"
+            ") WHERE trashed = 0",
+            parameters=parameters,
         )
         row = rows[0] if rows else {}
         return {
@@ -793,7 +804,7 @@ def _genie_audit_signals(audit: dict) -> list:
     sig = []
     if audit.get("total") is not None:
         sig.append({"label": "Genie Agents", "value": audit["total"],
-                    "detail": "Distinct existing agents in system.access.audit (aibiGenie)"})
+                    "detail": f"Distinct agents observed in this workspace's audit log ({_GENIE_AUDIT_LOOKBACK_DAYS}d)"})
     if audit.get("active_30d") is not None:
         sig.append({"label": "Active agents (30d)", "value": audit["active_30d"],
                     "detail": "Distinct agents with activity in the last 30 days — audit log"})
@@ -834,7 +845,8 @@ async def probe_genie_agents() -> dict:
         "score": round(score, 1),
         "signals": _genie_audit_signals(audit),
         "gaps": gaps,
-        "note": "Counted from system.access.audit (aibiGenie). Curation quality — instructions, "
+        "note": f"Counted from this workspace's system.access.audit events over the last "
+                f"{_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie). Curation quality — instructions, "
                 "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
                 "Genie Agent Quality Workshop accelerator to assess and lift it.",
         "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit},
