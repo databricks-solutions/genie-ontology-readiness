@@ -36,5 +36,8 @@ env:
     value: ""
   - name: LAKEBASE_DATABASE
     value: "ontology_readiness"
+  # Lakebase Autoscaling endpoint resource name. Leave empty for Provisioned.
+  - name: LAKEBASE_ENDPOINT_NAME
+    value: ""
   - name: LAKEBASE_INSTANCE_NAME
     value: ""

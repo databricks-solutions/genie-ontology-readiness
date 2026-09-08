@@ -17,19 +17,19 @@ _pool_created_at: float = 0.0
 TOKEN_REFRESH_INTERVAL = 45 * 60  # Refresh pool every 45 minutes (tokens expire at 60 min)
 
 
-async def _fetch_db_credential(instance_name: str) -> Optional[str]:
-    """Fetch an instance-scoped database credential from the Databricks API.
+async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "") -> Optional[str]:
+    """Fetch a Lakebase database credential from the Databricks API.
 
-    Calls POST /api/2.0/database/credentials with the given instance name,
-    using the app service principal credentials. Returns the token string
-    suitable as a Postgres password, or None on failure.
+    Autoscaling uses POST /api/2.0/postgres/credentials with an endpoint resource
+    name. Provisioned Lakebase uses POST /api/2.0/database/credentials with an
+    instance name. Both calls use the app service principal credentials.
 
     The returned token is typically valid for ~60 minutes.
     """
     from server.config import get_workspace_host, get_auth_headers
 
-    if not instance_name:
-        logger.warning("_fetch_db_credential: instance_name is empty")
+    if not endpoint_name and not instance_name:
+        logger.warning("_fetch_db_credential: endpoint_name and instance_name are empty")
         return None
 
     try:
@@ -44,19 +44,24 @@ async def _fetch_db_credential(instance_name: str) -> Optional[str]:
             logger.warning("_fetch_db_credential: could not obtain auth headers")
             return None
 
-        url = f"{host}/api/2.0/database/credentials"
-        request_id = str(uuid.uuid4())
-        payload = {
-            "request_id": request_id,
-            "instance_names": [instance_name],
-        }
+        if endpoint_name:
+            url = f"{host}/api/2.0/postgres/credentials"
+            payload = {"endpoint": endpoint_name}
+            resource = f"endpoint '{endpoint_name}'"
+        else:
+            url = f"{host}/api/2.0/database/credentials"
+            payload = {
+                "request_id": str(uuid.uuid4()),
+                "instance_names": [instance_name],
+            }
+            resource = f"instance '{instance_name}'"
 
         headers = {
             **auth_headers,
             "Content-Type": "application/json",
         }
 
-        logger.info(f"Fetching instance-scoped Lakebase credential for instance '{instance_name}'")
+        logger.info(f"Fetching SP-scoped Lakebase credential for {resource}")
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -121,15 +126,21 @@ async def init_pool() -> None:
         config = _get_connection_config()
         password = os.environ.get("LAKEBASE_PASSWORD", "")
 
-        # If no explicit password set and running in Databricks App, fetch instance-scoped credential
+        # If no explicit password is set in a Databricks App, mint a credential
+        # as the app service principal. Prefer Autoscaling endpoint credentials;
+        # retain Provisioned instance credentials for existing deployments.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
+            endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
             instance = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
-            if instance:
-                password = await _fetch_db_credential(instance) or ""
+            if endpoint or instance:
+                password = await _fetch_db_credential(
+                    instance_name=instance,
+                    endpoint_name=endpoint,
+                ) or ""
             else:
                 logger.warning(
-                    "Running in Databricks App but LAKEBASE_INSTANCE_NAME not set; "
-                    "no Lakebase instance credential available"
+                    "Running in Databricks App but neither LAKEBASE_ENDPOINT_NAME "
+                    "nor LAKEBASE_INSTANCE_NAME is set; no Lakebase credential available"
                 )
 
         # If still no password, log and skip pool creation
