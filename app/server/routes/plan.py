@@ -8,6 +8,7 @@ accelerators that help close each gap. The plan can be exported to a branded PDF
 """
 
 import io
+import json
 import logging
 from typing import Optional
 
@@ -66,6 +67,47 @@ def _scorecard_digest(sc: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+def _scorecard_markdown(sc: Optional[dict]) -> str:
+    """A compact, user-facing Markdown summary of the assessment scores, built
+    deterministically from the scorecard (NOT the LLM). Prepended to the plan so
+    the top of the document always reflects the real numbers and can't be
+    truncated or hallucinated. Rendered on screen and flows into the PDF."""
+    if not sc:
+        return ""
+    overall = sc.get("overall", {}) or {}
+    lines = ["## Assessment summary", ""]
+    score = overall.get("score")
+    level = overall.get("level")
+    level_label = overall.get("level_label") or ""
+    stage = overall.get("readiness_stage") or ""
+    header = f"**Overall readiness: {score}/100 — L{level} {level_label}**"
+    if stage:
+        header += f" · {stage}"
+    lines += [header, ""]
+
+    pillars = sc.get("pillars", []) or []
+    if pillars:
+        lines += ["| Pillar | Score | Level |", "| --- | --- | --- |"]
+        for p in pillars:
+            avail = "" if p.get("available", True) else " (n/a)"
+            lines.append(
+                f"| {p.get('name')} | {p.get('score')}{avail} | L{p.get('level')} {p.get('level_label') or ''} |"
+            )
+        lines.append("")
+
+    top_gaps = sc.get("top_gaps") or []
+    if top_gaps:
+        lines.append("**Top gaps**")
+        lines.append("")
+        for g in top_gaps:
+            lines.append(f"- **{g.get('pillar')}** — {g.get('gap')}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _accelerator_catalog() -> str:
     """Compact catalog of the public Databricks accelerators, grouped by the
     capability/pillar they lift, so the plan can name the right one per gap."""
@@ -92,11 +134,10 @@ PUBLIC DATABRICKS ACCELERATORS you may recommend (only these; each is a real, Da
 
 {methodology_prompt()}
 
-Keep it tight and scannable — no filler, no generic multi-phase project plan. Produce exactly these sections:
+Keep it tight and scannable — no filler, no generic multi-phase project plan. The document already opens with a deterministic score summary, so do NOT restate the score table; start directly at "Where you are". Produce exactly these sections:
 1. **Where you are** — 2-3 sentences on their readiness, tied to their overall score/stage and their biggest levers (the lowest-scoring, highest-weight pillars).
 2. **Top recommendations** — the 4-6 highest-impact actions, prioritized worst-gap first. Each bullet must: (a) name the specific pillar/gap it closes, (b) give the concrete technical step AND the business/ownership step, and (c) where one applies, name the relevant accelerator above with its link.
 3. **Suggested sequence** — a NUMBERED list of clear, tactical steps the customer can follow in order (what to do first → next). Each step is a concrete action (e.g. "Declare PK/FK constraints on your 8 gold fact tables"), not a theme. Where the work involves building metric views, Genie Agents, or domain tags, follow the BUILD METHODOLOGY above — reflect its phases and non-negotiable techniques (one source per metric view, validate one measure at a time, base views for multi-fact KPIs, one focused Genie Agent per domain, benchmark + regression-test). Make these specific enough to hand to a data team.
-4. **Example Genie use cases** — 2-3 realistic questions Genie could answer once the foundation is in place, each one line (the question + the metric views / tables it would use). Infer the domain from the catalog/schema names in the assessment signals if available; otherwise keep them broadly applicable and say so in a short lead-in line.
 
 Do not invent scores or accelerators that are not listed above. Be specific to the assessment numbers."""
 
@@ -138,10 +179,17 @@ async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[st
     ]
     logger.info("Plan generate for %s",
                 f"snapshot {req.snapshot_id}" if req.snapshot_id is not None else "in-session assessment")
-    return StreamingResponse(
-        stream_llm_chat(messages, max_tokens=2000, temperature=0.4),
-        media_type="text/event-stream",
-    )
+
+    async def _gen():
+        # Emit the deterministic score summary first (as one SSE content frame) so
+        # the top of the plan is always the real scores; then stream the LLM plan.
+        header = _scorecard_markdown(scorecard)
+        if header:
+            yield f"data: {json.dumps({'content': header})}\n\n"
+        async for chunk in stream_llm_chat(messages, max_tokens=2400, temperature=0.4):
+            yield chunk
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
 @router.post("/plan/save")
