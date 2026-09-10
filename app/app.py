@@ -24,11 +24,25 @@ _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "
 from server.routes import router
 from server.routes._shared import _ai_model, DEFAULT_LLM_MODEL, is_available_model
 from server.config import USE_LAKEBASE
+from server.security import (
+    BodySizeLimitMiddleware,
+    SecurityHeadersMiddleware,
+    install_log_redaction,
+    safe_error,
+)
+
+# Largest request body the app will read. The plan endpoints accept generated
+# Markdown, which is otherwise unbounded — and is rendered to PDF and persisted.
+# 2 MiB is far above any real plan (the model is capped at 2000 output tokens).
+MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", 2 * 1024 * 1024))
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Must run before the first log line: everything downstream (including uvicorn,
+# aiohttp and the Databricks SDK) inherits the redaction filter from the root logger.
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 logger.info(f"DATABRICKS_APP_NAME: {os.environ.get('DATABRICKS_APP_NAME', 'not set')}")
@@ -76,8 +90,15 @@ app = FastAPI(title="Genie Ontology Readiness", version="1.0.0", lifespan=lifesp
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled error on {request.url}: {exc}", exc_info=True)
-    return JSONResponse(status_code=500, content={"error": str(exc)})
+    """Return a correlation reference, never the exception text (CWE-209).
+
+    Failures here wrap upstream errors from the SQL Warehouse, the Genie REST API
+    and the FM API, whose messages routinely quote the failing statement and the
+    object names — and can quote a column value — from a workspace that may hold
+    PHI. The full traceback stays in the (redacted) app log under `reference`.
+    """
+    reference, message = safe_error(exc, f"unhandled error on {request.url.path}", logger)
+    return JSONResponse(status_code=500, content={"error": message, "reference": reference})
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -104,6 +125,12 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(RequestContextMiddleware)
+
+# Outermost first: hardening headers must also cover responses produced by the
+# body-size limiter and by StaticFiles, neither of which goes through the router.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.include_router(router)
 
 # ---------------------------------------------------------------------------

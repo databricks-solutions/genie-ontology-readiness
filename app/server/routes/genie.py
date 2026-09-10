@@ -8,22 +8,30 @@ import aiohttp
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server.config import get_workspace_host, get_auth_headers, GENIE_SPACE_ID
 from server.genie_client import start_conversation, send_message
+from server.security import safe_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# A Genie question is a single natural-language sentence. Bounding it keeps an
+# oversized body from being forwarded to the Genie API and billed (CWE-770).
+_MAX_QUESTION = 4000
+_MAX_CONVERSATION_ID = 128
+
+
 class GenieStartRequest(BaseModel):
-    content: str
+    content: str = Field(min_length=1, max_length=_MAX_QUESTION)
 
 
 class GenieMessageRequest(BaseModel):
-    conversation_id: str
-    content: str
+    conversation_id: str = Field(min_length=1, max_length=_MAX_CONVERSATION_ID,
+                                 pattern=r"^[A-Za-z0-9_-]+$")
+    content: str = Field(min_length=1, max_length=_MAX_QUESTION)
 
 
 @router.get("/genie/spaces")
@@ -34,7 +42,7 @@ async def list_genie_agents():
     if not host or not headers:
         return {"spaces": [], "note": "Workspace credentials unavailable."}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
             async with session.get(f"{host}/api/2.0/genie/spaces", headers=headers, params={"page_size": 100}) as resp:
                 if resp.status != 200:
                     return {"spaces": [], "note": f"Genie API returned {resp.status}"}
@@ -42,8 +50,10 @@ async def list_genie_agents():
                 raw = data.get("spaces", []) or data.get("data", []) or []
                 return {"spaces": [{"id": s.get("space_id") or s.get("id"), "title": s.get("title") or s.get("name")} for s in raw]}
     except Exception as e:
-        logger.warning(f"list_genie_agents failed: {e}")
-        return {"spaces": [], "note": str(e)[:120]}
+        # The exception text can quote the upstream response body; return a
+        # reference to the (redacted) server log instead (CWE-209).
+        reference, message = safe_error(e, "list Genie Agents", logger)
+        return {"spaces": [], "note": message, "reference": reference}
 
 
 @router.post("/genie/start-conversation")

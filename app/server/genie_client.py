@@ -2,10 +2,28 @@
 
 import aiohttp
 import asyncio
+import hashlib
 import logging
 from server.config import get_workspace_host, get_auth_headers, GENIE_SPACE_ID
 
 logger = logging.getLogger(__name__)
+
+# Genie questions are free text typed against the customer's own warehouse. In a
+# regulated deployment (this app ships to insurers) a question can name a member,
+# a claim or a diagnosis, so the text itself is treated as sensitive: log a stable
+# digest for correlation and its length, never the content (CWE-532; HIPAA
+# 164.312(b) requires audit records, not a copy of the data).
+_QUESTION_DIGEST_LEN = 12
+
+
+def _question_ref(content: str) -> str:
+    """A short, stable, non-reversible reference for one question."""
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:_QUESTION_DIGEST_LEN]
+
+
+# Bound every Genie REST call. Without a timeout a stalled upstream holds the
+# connection and the worker slot open indefinitely (CWE-400).
+_GENIE_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=60)
 
 
 async def start_conversation(content: str) -> dict:
@@ -27,14 +45,15 @@ async def start_conversation(content: str) -> dict:
 
     payload = {"content": content}
 
-    logger.info(f"Starting Genie conversation: {content[:80]}...")
+    logger.info("Starting Genie conversation: question=%s len=%d",
+                _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
                 logger.error(f"Genie start-conversation error ({response.status}): {error_text}")
-                raise Exception(f"Genie API error ({response.status}): {error_text}")
+                raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
 
@@ -42,7 +61,7 @@ async def start_conversation(content: str) -> dict:
         message_id = result.get("message_id")
 
         if not conversation_id or not message_id:
-            raise Exception(f"Missing conversation_id or message_id in response: {result}")
+            raise Exception("Genie API response was missing conversation_id or message_id")
 
         logger.info(f"Genie conversation started: conv={conversation_id}, msg={message_id}")
 
@@ -80,21 +99,22 @@ async def send_message(conversation_id: str, content: str) -> dict:
 
     payload = {"content": content}
 
-    logger.info(f"Sending Genie message in conv={conversation_id}: {content[:80]}...")
+    logger.info("Sending Genie message in conv=%s: question=%s len=%d",
+                conversation_id, _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
                 logger.error(f"Genie send-message error ({response.status}): {error_text}")
-                raise Exception(f"Genie API error ({response.status}): {error_text}")
+                raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
 
         message_id = result.get("id") or result.get("message_id")
 
         if not message_id:
-            raise Exception(f"Missing message_id in response: {result}")
+            raise Exception("Genie API response was missing message_id")
 
         logger.info(f"Genie message sent: msg={message_id}")
 
@@ -149,8 +169,8 @@ async def _poll_message(
                 )
                 return result
             elif status in ("FAILED", "CANCELLED"):
-                error_msg = result.get("error", "Unknown error")
-                raise Exception(f"Genie query failed: {error_msg}")
+                logger.error("Genie query failed: %s", result.get("error", "unknown error"))
+                raise Exception("The Genie query failed.")
             # Otherwise keep polling (SUBMITTED, IN_PROGRESS, EXECUTING_QUERY, etc.)
 
     raise Exception(f"Genie message timed out after {timeout_seconds} seconds")

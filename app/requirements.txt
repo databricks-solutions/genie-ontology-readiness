@@ -1,8 +1,35 @@
-fastapi~=0.115.0
-uvicorn[standard]~=0.30.0
-aiohttp~=3.9.0
-databricks-sdk~=0.36.0
-pydantic~=2.0
-asyncpg~=0.29.0
-markdown>=3.7
-xhtml2pdf>=0.2.16
+# Direct dependencies are pinned exactly. The frontend has a committed
+# package-lock.json; this file is the Python half of that guarantee, so a redeploy
+# installs the same versions an SCA scan signed off on rather than whatever is
+# newest that day. Bump deliberately and re-scan — see docs/SECURITY-REMEDIATION.md.
+
+# fastapi <0.133 caps starlette below 1.0, so this floor is what makes the patched
+# starlette selectable at all. fastapi itself carried no advisory.
+fastapi==0.141.1
+
+# Pinned here rather than left to fastapi's transitive resolution, because
+# starlette is what actually carries the fixed code. Every advisory below was open
+# at 0.46.2; 1.3.1 is the lowest version that closes all seven, and 1.6.0 is the
+# version this change was validated against:
+#   CVE-2026-48710  Host-header routing confusion  (CISA KEV)  -> fixed 1.0.1
+#   CVE-2026-48817  HTTPEndpoint getattr method dispatch       -> fixed 1.1.0
+#   CVE-2026-48818  StaticFiles UNC path SSRF                  -> fixed 1.1.0
+#   CVE-2026-54282  request.url authority confusion            -> fixed 1.3.0
+#   CVE-2026-54283  urlencoded form limits silently ignored    -> fixed 1.3.1
+#   CVE-2025-62727  FileResponse Range quadratic-time DoS      -> fixed 0.49.1
+#   CVE-2025-54121  multipart spool blocks the event loop      -> fixed 0.47.2
+starlette==1.6.0
+
+uvicorn[standard]==0.52.4
+
+# The previous `~=3.9.0` pin permitted 3.9.0-3.9.3, which are affected by
+# CVE-2024-23334 (static-route path traversal), CVE-2024-27306 (XSS in the index
+# handler) and CVE-2024-30251 (multipart infinite loop). 3.14.3 is the version the
+# enterprise SCA scan reported clean.
+aiohttp==3.14.3
+
+databricks-sdk==0.36.0
+pydantic==2.13.5
+asyncpg==0.31.0
+markdown==3.10.3
+xhtml2pdf==0.2.18

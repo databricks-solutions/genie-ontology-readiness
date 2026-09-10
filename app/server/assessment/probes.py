@@ -32,6 +32,7 @@ import json
 import logging
 import aiohttp
 
+from server.security import quote_ident, quote_literal
 from server.sql_client import execute_sql, record_rest_identity
 from server.config import (
     get_workspace_host,
@@ -43,6 +44,10 @@ from server.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Bound every probe REST read. A probe that never returns holds its worker slot
+# and its connection open, and the assessment fan-out multiplies that (CWE-400).
+_PROBE_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
 
 # Catalogs that are never part of a customer's own data estate.
 # Excluded from the *Unity Catalog* footprint. `hive_metastore` is the legacy
@@ -228,7 +233,7 @@ async def _do_resolve_sources() -> dict:
         async def _readable(c: str) -> bool:
             async with _sem:
                 try:
-                    await execute_sql(f"SELECT 1 FROM `{c}`.information_schema.tables LIMIT 1")
+                    await execute_sql(f"SELECT 1 FROM {quote_ident(c)}.information_schema.tables LIMIT 1")
                     return True
                 except Exception:
                     return False
@@ -250,7 +255,9 @@ def _src(view: str, sources: dict) -> str | None:
     cats = sources["catalogs"]
     if not cats:
         return None
-    union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in cats)
+    union = " UNION ALL ".join(
+        f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in cats
+    )
     return f"({union}) AS _t"
 
 
@@ -390,10 +397,12 @@ def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> st
     measured over one consistent population.
     """
     if system_ok:
-        in_list = ", ".join("'" + c.replace("'", "''") + "'" for c in catalogs_batch)
+        in_list = ", ".join(quote_literal(c) for c in catalogs_batch)
         return (_COV_SELECT + f"system.information_schema.{view} "
                 f"WHERE table_catalog IN ({in_list}) AND table_schema <> 'information_schema'")
-    union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in catalogs_batch)
+    union = " UNION ALL ".join(
+        f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in catalogs_batch
+    )
     return _COV_SELECT + f"({union}) AS _c WHERE table_schema <> 'information_schema'"
 
 
@@ -476,7 +485,7 @@ async def probe_metadata() -> dict:
         # the same internal catalogs here so both halves of the 50/50 score measure
         # the same population. (Per-catalog _src is already scoped to that list.)
         if system_ok:
-            internal_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
+            internal_list = ", ".join(quote_literal(c) for c in _INTERNAL_CATALOGS)
             tables_query = (_COV_SELECT + "system.information_schema.tables "
                             "WHERE table_schema <> 'information_schema' "
                             f"AND table_catalog NOT IN ({internal_list})")
@@ -713,7 +722,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
       ("error", None)       — transient/other failure
     """
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
             async with session.get(
                 f"{host}/api/2.0/genie/spaces/{sid}",
                 headers=headers, params={"include_serialized_space": "true"},
@@ -874,7 +883,7 @@ async def _native_domains() -> int | None:
         f"{host}/api/2.0/data-domains",
     ):
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -904,9 +913,9 @@ async def probe_domains() -> dict:
     if tt is None:
         return _empty("Domains API unavailable and no readable catalogs for the tag proxy; use the self-assessment.")
     try:
-        domain_keys = ", ".join(f"'{k}'" for k in _DOMAIN_TAG_KEYS)
-        steward_keys = ", ".join(f"'{k}'" for k in _STEWARD_TAG_KEYS)
-        cert_keys = ", ".join(f"'{k}'" for k in _CERT_TAG_KEYS)
+        domain_keys = ", ".join(quote_literal(k) for k in _DOMAIN_TAG_KEYS)
+        steward_keys = ", ".join(quote_literal(k) for k in _STEWARD_TAG_KEYS)
+        cert_keys = ", ".join(quote_literal(k) for k in _CERT_TAG_KEYS)
 
         parts = [f"SELECT tag_value FROM {tt} WHERE lower(tag_name) IN ({domain_keys})"]
         if st is not None:

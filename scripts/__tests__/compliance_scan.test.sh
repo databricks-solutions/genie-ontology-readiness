@@ -186,6 +186,70 @@ DATA_FILES="$(printf '%s\n' "${FILES[@]}" | grep -iE '\.(csv|parquet|avro|orc|js
 record_check "no raw data files (.csv/.parquet/.jsonl/...) shipped" "$DATA_FILES"
 
 # ==============================================================================
+# CHECK GROUP 3: PHI-SAFE HANDLING & SECURE DEFAULTS
+# ==============================================================================
+# This app is deployed by regulated customers (insurers) against workspaces that
+# may hold PHI. These checks are regression guards for the controls added in the
+# SCA remediation — see docs/SECURITY-REMEDIATION.md. Each pattern matches the
+# INSECURE form, so a PASS means the insecure form is absent.
+echo ""
+echo "[3] PHI-SAFE HANDLING & SECURE DEFAULTS"
+
+# Helper: restrict a scan to Python sources.
+scan_py() { scan "$1" | grep -E '\.py:' || true; }
+
+# 3a. Per-user records keyed on the raw forwarded-email header. That header is
+# set by the Databricks Apps proxy, but a route that trusts it directly is one
+# network path away from letting a caller read another user's history (CWE-290).
+# Routes must key on the resolved principal (server/security.py:resolve_principal).
+record_check "ownership keyed on the raw X-Forwarded-Email header" \
+  "$(scan_py 'created_by\s*=\s*x_forwarded_email')"
+
+# 3b. Raw exception text returned to the client. Upstream SQL Warehouse / Genie /
+# FM API errors quote the failing statement and object names, and can quote a
+# column value (CWE-209). Handlers must use security.safe_error and return a
+# reference id. Matches str(e)/str(exc) on a line that also builds a client payload.
+record_check "raw exception text returned to the client" \
+  "$(scan_py 'str\(e(xc)?\)' | grep -E '(\"error\"|'\''error'\''|\"note\"|'\''note'\''|json\.dumps)' )"
+
+# 3c. aiohttp sessions with no timeout. A stalled upstream otherwise pins a
+# worker and its connection open for the life of the process (CWE-400).
+record_check "aiohttp session without a timeout" \
+  "$(scan_py 'aiohttp\.ClientSession\(\s*\)')"
+
+# 3d. Genie question text written to the log. Questions are free text against the
+# customer's own warehouse and can name a member, a claim or a diagnosis; log a
+# digest, never the content (CWE-532; HIPAA 164.312(b)).
+record_check "Genie question content written to the log" \
+  "$(scan_py 'logger\.[a-z]+\(.*content\[' )"
+
+# 3e. Catalog/schema names interpolated into SQL inside bare backticks. Names come
+# from the metastore, so a name containing a backtick closes the quoting early
+# (CWE-89). Use security.quote_ident, which doubles embedded backticks.
+record_check "unescaped backtick identifier interpolation in SQL" \
+  "$(scan_py '`\{' )"
+
+# 3f. Postgres connections that encrypt without verifying the peer. `require`
+# gives no in-path protection, which is what HIPAA 164.312(e)(1) asks for.
+record_check "Lakebase TLS without certificate verification" \
+  "$(scan_py 'ssl\s*=\s*[\"'\'']require[\"'\'']')"
+
+# 3g. The plan PDF renderer must refuse external resources. Without a
+# link_callback, xhtml2pdf resolves src/href in model-generated Markdown and will
+# read local files into the returned PDF (CWE-918/CWE-22).
+# (the call spans several lines, so compare occurrence counts rather than grepping
+# a single line for both)
+PDF_CALLS="$(scan_py 'pisa\.CreatePDF\(' | wc -l | tr -d ' ')"
+PDF_GUARDS="$(scan_py 'link_callback\s*=' | wc -l | tr -d ' ')"
+record_check "pisa.CreatePDF without a link_callback" \
+  "$( [ "$PDF_CALLS" -le "$PDF_GUARDS" ] || echo "  $PDF_CALLS CreatePDF call(s) but only $PDF_GUARDS link_callback guard(s)" )"
+
+# 3h. React escapes by default; dangerouslySetInnerHTML opts out of that and would
+# make model-generated plan Markdown an XSS sink (CWE-79).
+record_check "dangerouslySetInnerHTML in the frontend" \
+  "$(scan 'dangerouslySetInnerHTML')"
+
+# ==============================================================================
 # SUMMARY
 # ==============================================================================
 echo ""

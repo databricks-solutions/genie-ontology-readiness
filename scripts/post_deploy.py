@@ -34,6 +34,11 @@ WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOU
 USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
 LAKEBASE_INSTANCE = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
 LAKEBASE_DATABASE = os.environ.get("LAKEBASE_DATABASE", "ontology_readiness")
+# These provisioning connections carry a live Lakebase credential over the public
+# internet. `require` encrypts but verifies nothing, so it gives no protection
+# against an in-path attacker — see app/server/lakebase_client.py for the runtime
+# counterpart and the escape hatch.
+LAKEBASE_SSL_MODE = os.environ.get("LAKEBASE_SSL_MODE", "verify-full")
 MAX_WAIT = 600
 
 # Populated by setup_lakebase() when USE_LAKEBASE is on.
@@ -146,7 +151,7 @@ def setup_lakebase():
         token = _credential(LAKEBASE_INSTANCE)
         # 1. create the database (idempotent)
         conn = await asyncpg.connect(host=host, port=5432, database="postgres",
-                                     user=user_email, password=token, ssl="require")
+                                     user=user_email, password=token, ssl=LAKEBASE_SSL_MODE)
         try:
             await conn.execute(f'CREATE DATABASE {LAKEBASE_DATABASE}')
             print(f"  created database {LAKEBASE_DATABASE}")
@@ -218,7 +223,7 @@ def attach_lakebase():
             import asyncpg
             token = _credential(LAKEBASE_INSTANCE)
             conn = await asyncpg.connect(host=host, port=5432, database=LAKEBASE_DATABASE,
-                                         user=user_email, password=token, ssl="require")
+                                         user=user_email, password=token, ssl=LAKEBASE_SSL_MODE)
             try:
                 for g in grants:
                     await conn.execute(g)

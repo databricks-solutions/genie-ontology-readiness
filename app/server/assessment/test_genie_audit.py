@@ -9,7 +9,7 @@ class GenieAuditCountsTest(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock(return_value=[{"total": "3", "active_30d": "2"}])
 
         with patch.object(probes, "execute_sql", execute), patch.object(
-            probes, "WORKSPACE_ID", "1444828305810485"
+            probes, "WORKSPACE_ID", "1234567890"
         ):
             result = await probes._genie_audit_counts()
 
@@ -19,7 +19,7 @@ class GenieAuditCountsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("event_date >= current_date() - INTERVAL 30 DAYS", query)
         self.assertEqual(
             execute.await_args.kwargs["parameters"],
-            {"workspace_id": "1444828305810485"},
+            {"workspace_id": "1234567890"},
         )
 
     async def test_omits_workspace_predicate_when_id_is_unset(self):

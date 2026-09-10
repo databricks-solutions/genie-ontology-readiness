@@ -63,13 +63,8 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
 
         logger.info(f"Fetching SP-scoped Lakebase credential for {resource}")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.warning(
@@ -80,7 +75,11 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
                 resp_json = await response.json()
                 token = resp_json.get("token")
                 if not token:
-                    logger.warning(f"No token in Lakebase credential response: {resp_json}")
+                    # Log the response SHAPE only. The body of a credentials
+                    # response is credential material by definition, and logging
+                    # it verbatim wrote a live secret to the app log (CWE-532).
+                    logger.warning("No token in Lakebase credential response (keys: %s)",
+                                   sorted(resp_json.keys()) if isinstance(resp_json, dict) else type(resp_json).__name__)
                     return None
 
                 logger.info("Successfully obtained instance-scoped Lakebase credential")
@@ -115,6 +114,14 @@ def _get_connection_config() -> dict:
         "database": database,
         "user": user,
     }
+
+
+# `require` encrypts the connection but performs NO certificate or hostname check,
+# so it does not protect the assessment history against an in-path attacker —
+# which is what HIPAA 164.312(e)(1) transmission security asks for. `verify-full`
+# is the default here; the escape hatch exists only for a deployment whose
+# Lakebase endpoint presents a certificate outside the container's CA bundle.
+LAKEBASE_SSL_MODE = os.environ.get("LAKEBASE_SSL_MODE", "verify-full")
 
 
 async def init_pool() -> None:
@@ -160,7 +167,7 @@ async def init_pool() -> None:
                 database=config["database"],
                 user=config["user"],
                 password=password,
-                ssl="require",
+                ssl=LAKEBASE_SSL_MODE,
                 min_size=2,
                 max_size=10,
                 command_timeout=30,

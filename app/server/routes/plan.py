@@ -11,13 +11,14 @@ import io
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, StreamingResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server.content.accelerators import list_accelerators
 from server.content.methodology import methodology_prompt
-from server.routes._shared import stream_llm_chat, _ai_model
+from server.routes._shared import stream_llm_chat, _ai_model, current_principal
+from server.security import escape_html, sanitize_html_fragment
 from server import snapshots, plans
 
 logger = logging.getLogger(__name__)
@@ -32,15 +33,22 @@ class PlanGenerateRequest(BaseModel):
     scorecard: Optional[dict] = None
 
 
+# Field limits are the second half of the body-size cap in app.py: that one bounds
+# the whole request, these bound what actually reaches the PDF renderer and the
+# history table. A generated plan is capped at 2000 output tokens (~10 KB).
+_MAX_TITLE = 200
+_MAX_MARKDOWN = 256_000
+
+
 class PlanSaveRequest(BaseModel):
     snapshot_id: Optional[int] = None
-    title: str = "Genie Ontology Readiness — Action Plan"
-    markdown: str
+    title: str = Field(default="Genie Ontology Readiness — Action Plan", max_length=_MAX_TITLE)
+    markdown: str = Field(max_length=_MAX_MARKDOWN)
 
 
 class PlanPdfRequest(BaseModel):
-    title: str = "Genie Ontology Readiness — Action Plan"
-    markdown: str
+    title: str = Field(default="Genie Ontology Readiness — Action Plan", max_length=_MAX_TITLE)
+    markdown: str = Field(max_length=_MAX_MARKDOWN)
 
 
 _GROUND_TRUTH = """PRODUCT GROUND TRUTH (do not violate):
@@ -102,7 +110,7 @@ Do not invent scores or accelerators that are not listed above. Be specific to t
 
 
 @router.post("/plan/generate")
-async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[str] = Header(default=None)):
+async def plan_generate(req: PlanGenerateRequest, principal: str = Depends(current_principal)):
     """Generate the action plan against an assessment (no conversation).
 
     The assessment comes from EITHER a saved snapshot (``snapshot_id``, loaded
@@ -111,7 +119,7 @@ async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[st
     when history isn't persisted (no Lakebase attached).
     """
     if req.snapshot_id is not None:
-        snap = await snapshots.get_snapshot(req.snapshot_id, created_by=x_forwarded_email)
+        snap = await snapshots.get_snapshot(req.snapshot_id, created_by=principal)
         if snap is None:
             return JSONResponse(status_code=404, content={"error": "Assessment not found."})
         scorecard = snap.get("scorecard") or {}
@@ -145,10 +153,10 @@ async def plan_generate(req: PlanGenerateRequest, x_forwarded_email: Optional[st
 
 
 @router.post("/plan/save")
-async def plan_save(req: PlanSaveRequest, x_forwarded_email: Optional[str] = Header(default=None)):
+async def plan_save(req: PlanSaveRequest, principal: str = Depends(current_principal)):
     """Persist a generated plan for the current user, linked to its assessment."""
     plan_id = await plans.save_plan(
-        created_by=x_forwarded_email,
+        created_by=principal,
         snapshot_id=req.snapshot_id,
         title=req.title,
         model=_ai_model.get(),
@@ -158,15 +166,15 @@ async def plan_save(req: PlanSaveRequest, x_forwarded_email: Optional[str] = Hea
 
 
 @router.get("/plan/list")
-async def plan_list(x_forwarded_email: Optional[str] = Header(default=None)):
+async def plan_list(principal: str = Depends(current_principal)):
     """The current user's saved plans (metadata only)."""
-    return {"plans": await plans.list_plans(created_by=x_forwarded_email)}
+    return {"plans": await plans.list_plans(created_by=principal)}
 
 
 @router.get("/plan/{plan_id}")
-async def plan_get(plan_id: int, x_forwarded_email: Optional[str] = Header(default=None)):
+async def plan_get(plan_id: int, principal: str = Depends(current_principal)):
     """Load one saved plan (including markdown), scoped to the current user."""
-    plan = await plans.get_plan(plan_id, created_by=x_forwarded_email)
+    plan = await plans.get_plan(plan_id, created_by=principal)
     if plan is None:
         return JSONResponse(status_code=404, content={"error": "Plan not found."})
     return plan
@@ -189,6 +197,27 @@ th { background: #1B3139; color: #fff; }
 """
 
 
+class ExternalResourceBlocked(Exception):
+    """Raised when the plan document references a resource the renderer may not fetch."""
+
+
+def _block_external_resources(uri: str, rel: str) -> str:
+    """xhtml2pdf resource resolver that refuses every external reference.
+
+    xhtml2pdf resolves `src`/`href` on the document it renders, and will happily
+    open a `file://`, absolute-path or `http(s)://` target. The plan Markdown is
+    model-generated and arrives from the client, so without this the endpoint is a
+    server-side file read and request forge in one (CWE-918, CWE-22): posting
+    `<img src="file:///…">` would embed host file content into the returned PDF.
+
+    The branded template references no external resource, and the body is
+    sanitized before it gets here, so this is the backstop: refuse outright rather
+    than maintain an allowlist. Raising aborts the render, which is the point —
+    a partially-rendered PDF is better than one containing host file contents.
+    """
+    raise ExternalResourceBlocked(uri)
+
+
 @router.post("/plan/pdf")
 async def plan_pdf(req: PlanPdfRequest):
     """Render the plan Markdown to a branded PDF, returned inline for a new-tab viewer.
@@ -204,15 +233,32 @@ async def plan_pdf(req: PlanPdfRequest):
         logger.error(f"PDF engine unavailable: {e}")
         return Response(content="PDF export is unavailable on this deployment.", status_code=503)
 
-    body_html = md.markdown(req.markdown or "", extensions=["tables", "fenced_code", "toc", "sane_lists"])
+    # python-markdown passes raw HTML in the source straight through, so the
+    # rendered body is sanitized to the tag/attribute set this template actually
+    # styles before it reaches the PDF engine. The title is plain text and is
+    # escaped rather than sanitized — it is interpolated into the document below.
+    body_html = sanitize_html_fragment(
+        md.markdown(req.markdown or "", extensions=["tables", "fenced_code", "toc", "sane_lists"])
+    )
     html = (
         f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{_PDF_CSS}</style></head>"
-        f"<body><h1>{req.title}</h1>"
+        f"<body><h1>{escape_html(req.title)}</h1>"
         f"<div class='subtitle'>Generated by the Genie Ontology Readiness app · Databricks</div>"
         f"{body_html}</body></html>"
     )
     buf = io.BytesIO()
-    result = pisa.CreatePDF(src=html, dest=buf, encoding="utf-8")
+    try:
+        result = pisa.CreatePDF(
+            src=html, dest=buf, encoding="utf-8", link_callback=_block_external_resources
+        )
+    except ExternalResourceBlocked as e:
+        # Unreachable for a sanitized body; if it does fire, the document asked for
+        # something it may not have, which is the caller's problem, not a server fault.
+        logger.warning("plan PDF refused an external resource reference: %.120s", str(e))
+        return JSONResponse(
+            status_code=400,
+            content={"error": "The plan references an external resource and cannot be exported."},
+        )
     if result.err:
         logger.error("PDF generation failed")
         return Response(content="PDF generation failed", status_code=500)
