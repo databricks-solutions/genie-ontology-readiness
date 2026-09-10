@@ -22,10 +22,9 @@ export function rowsToCsv(
   return `${header}\n${body}`;
 }
 
-// Trigger a browser download of `csv` as `filename`. Works in a deployed
-// Databricks App (normal browser download; not an Artifact sandbox).
-export function downloadCsv(filename: string, csv: string): void {
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+// Trigger a browser download of an arbitrary blob as `filename`. Works in a
+// deployed Databricks App (normal browser download; not an Artifact sandbox).
+export function downloadBlob(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -34,6 +33,11 @@ export function downloadCsv(filename: string, csv: string): void {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// Trigger a browser download of `csv` as `filename`.
+export function downloadCsv(filename: string, csv: string): void {
+  downloadBlob(filename, new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
 }
 
 // A safe, timestamped filename for a pillar export, e.g. "metadata-20260910-1503.csv".

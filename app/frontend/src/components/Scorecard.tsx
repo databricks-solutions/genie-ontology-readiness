@@ -12,7 +12,7 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -31,6 +31,7 @@ import type {
   CatalogsResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
+import { downloadAllZip } from '../utils/exportAll';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
 
@@ -169,6 +170,7 @@ export default function Scorecard({
   const [catalogsAvailable, setCatalogsAvailable] = useState(true);
   const [catalogsLoading, setCatalogsLoading] = useState(false);
   const [catFilter, setCatFilter] = useState<string[]>([]);
+  const [zipBusy, setZipBusy] = useState(false);
 
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
@@ -176,6 +178,17 @@ export default function Scorecard({
     apiGet<HistoryResponse>('/assess/history')
       .then((h) => setHistory(h.snapshots || []))
       .catch(() => {});
+  }
+
+  // Export every pillar at once: a ZIP with summary.csv + one CSV per pillar that
+  // has drill-down rows (in canonical pillar order).
+  async function handleExportAll() {
+    setZipBusy(true);
+    try {
+      await downloadAllZip(config.pillars.map((cp) => pillarsByKey[cp.key]).filter(Boolean));
+    } finally {
+      setZipBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -586,7 +599,20 @@ export default function Scorecard({
 
       {/* Pillar cards — all pillars in canonical order; skeleton until each arrives */}
       <div className="space-y-3">
-        <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
+          {phase === 'done' && Object.values(pillarsByKey).some((p) => (p.drill_down?.rows?.length ?? 0) > 0) && (
+            <button
+              onClick={handleExportAll}
+              disabled={zipBusy}
+              className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs disabled:opacity-60"
+              title="Download a ZIP with a summary sheet and one CSV per pillar"
+            >
+              {zipBusy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+              Export all to CSV
+            </button>
+          )}
+        </div>
         {config.pillars.map((cp) => {
           const p = pillarsByKey[cp.key];
           if (!p) {
