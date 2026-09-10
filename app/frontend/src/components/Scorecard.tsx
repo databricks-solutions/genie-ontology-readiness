@@ -160,7 +160,6 @@ export default function Scorecard({
   // workspace only, so they're never account-wide. The scope is fixed to the
   // deployed workspace (shown as a read-only label); users scope catalogs instead.
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
-  const [workspacesAvailable, setWorkspacesAvailable] = useState(true);
   const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
     config.workspace_id ? { mode: 'include', workspace_ids: [config.workspace_id] } : { mode: 'include', workspace_ids: [] }
   );
@@ -196,13 +195,12 @@ export default function Scorecard({
     apiGet<WorkspacesResponse>('/workspaces')
       .then((r) => {
         setWorkspaces(r.workspaces || []);
-        setWorkspacesAvailable(r.available);
         // Seed the default selection to the current workspace if the config didn't.
         if (!config.workspace_id && r.current_workspace_id) {
           setWsFilter({ mode: 'include', workspace_ids: [r.current_workspace_id] });
         }
       })
-      .catch(() => setWorkspacesAvailable(false));
+      .catch(() => {});
     return () => abortRef.current?.abort();
   }, []);
 
@@ -233,9 +231,9 @@ export default function Scorecard({
   }, [workspaces, wsFilter]);
 
   const scopedWorkspaceLabel = (
-    <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600">
-      <Server size={13} className="text-ink-400" />
-      Scoped to <span className="font-medium text-ink-800">{scopedWorkspaceName || 'the deployed workspace'}</span>
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600 max-w-[240px]">
+      <Server size={13} className="text-ink-400 shrink-0" />
+      <span className="truncate">Scoped to <span className="font-medium text-ink-800">{scopedWorkspaceName || 'the deployed workspace'}</span></span>
     </span>
   );
 
@@ -497,24 +495,9 @@ export default function Scorecard({
           </div>
         ) : (
           overall && (
-            <div className="flex flex-col md:flex-row gap-6 items-center md:items-start">
-              <Gauge score={overall.score} color={scoreColor(overall.score)} />
-              <div className="flex-1 text-center md:text-left">
-                <div className="flex items-center justify-center md:justify-start gap-3 mb-1">
-                  <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
-                  <LevelBadge level={overall.level} label={overall.level_label} />
-                </div>
-                <p className="text-sm text-ink-600 leading-relaxed max-w-2xl">{overall.readiness_detail}</p>
-                <div className="flex items-center gap-3 flex-wrap mt-2">
-                  {config.assess_catalogs.length > 0 && (
-                    <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
-                  )}
-                  {overall.assessed_at && (
-                    <p className="text-xs text-ink-400">Assessed {fmtWhen(overall.assessed_at)}</p>
-                  )}
-                </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+            <div className="flex flex-col gap-4">
+              {/* Controls bar — wraps onto a second line instead of overflowing the card. */}
+              <div className="flex flex-wrap items-center justify-end gap-2">
                 {scopedWorkspaceLabel}
                 <CatalogFilter
                   catalogs={catalogs}
@@ -531,6 +514,25 @@ export default function Scorecard({
                 >
                   <RefreshCw size={14} /> New assessment
                 </button>
+              </div>
+              {/* Score + readiness text. min-w-0 lets the text column shrink and wrap cleanly. */}
+              <div className="flex flex-col sm:flex-row sm:items-start gap-6">
+                <Gauge score={overall.score} color={scoreColor(overall.score)} />
+                <div className="flex-1 min-w-0 text-center sm:text-left">
+                  <div className="flex items-center justify-center sm:justify-start gap-3 mb-1 flex-wrap">
+                    <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
+                    <LevelBadge level={overall.level} label={overall.level_label} />
+                  </div>
+                  <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
+                  <div className="flex items-center gap-3 flex-wrap mt-2">
+                    {config.assess_catalogs.length > 0 && (
+                      <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
+                    )}
+                    {overall.assessed_at && (
+                      <p className="text-xs text-ink-400">Assessed {fmtWhen(overall.assessed_at)}</p>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           )
