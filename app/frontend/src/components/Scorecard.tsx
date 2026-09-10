@@ -496,32 +496,23 @@ export default function Scorecard({
         ) : (
           overall && (
             <div className="flex flex-col gap-4">
-              {/* Controls bar — wraps onto a second line instead of overflowing the card. */}
-              <div className="flex flex-wrap items-center justify-end gap-2">
-                {scopedWorkspaceLabel}
-                <CatalogFilter
-                  catalogs={catalogs}
-                  available={catalogsAvailable}
-                  loading={catalogsLoading}
-                  value={catFilter}
-                  onChange={setCatFilter}
-                  disabled={running}
-                />
-                <button
-                  onClick={run}
-                  disabled={running}
-                  className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs"
-                >
-                  <RefreshCw size={14} /> New assessment
-                </button>
-              </div>
-              {/* Score + readiness text. min-w-0 lets the text column shrink and wrap cleanly. */}
+              {/* Top: title + subtext + score, with the orange re-run button next to the title.
+                  min-w-0 lets the text column shrink and wrap cleanly. */}
               <div className="flex flex-col sm:flex-row sm:items-start gap-6">
                 <Gauge score={overall.score} color={scoreColor(overall.score)} />
-                <div className="flex-1 min-w-0 text-center sm:text-left">
-                  <div className="flex items-center justify-center sm:justify-start gap-3 mb-1 flex-wrap">
-                    <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
-                    <LevelBadge level={overall.level} label={overall.level_label} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between gap-3 flex-wrap mb-1">
+                    <div className="flex items-center gap-3 flex-wrap min-w-0">
+                      <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
+                      <LevelBadge level={overall.level} label={overall.level_label} />
+                    </div>
+                    <button
+                      onClick={run}
+                      disabled={running}
+                      className="btn-primary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={14} /> New assessment
+                    </button>
                   </div>
                   <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
                   <div className="flex items-center gap-3 flex-wrap mt-2">
@@ -533,6 +524,18 @@ export default function Scorecard({
                     )}
                   </div>
                 </div>
+              </div>
+              {/* Bottom: the scope controls (workspace + catalogs). */}
+              <div className="flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3">
+                {scopedWorkspaceLabel}
+                <CatalogFilter
+                  catalogs={catalogs}
+                  available={catalogsAvailable}
+                  loading={catalogsLoading}
+                  value={catFilter}
+                  onChange={setCatFilter}
+                  disabled={running}
+                />
               </div>
             </div>
           )
