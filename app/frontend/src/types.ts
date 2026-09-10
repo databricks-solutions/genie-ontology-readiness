@@ -48,6 +48,46 @@ export interface ContentQuery {
   sql: string;
 }
 
+// Per-catalog/schema/agent/workspace breakdown of where a pillar's gap is (#10).
+export interface DrillDownColumn {
+  key: string;
+  label: string;
+  unit?: string;
+}
+export interface DrillDown {
+  title: string;
+  columns: DrillDownColumn[];
+  rows: Record<string, string | number | null>[];
+}
+
+// One SQL statement a pillar ran, for the "view the query" disclosure (#22).
+export interface SourceQuery {
+  sql: string;
+  parameters?: Record<string, string>;
+  label?: string;
+}
+
+// Why an unavailable pillar couldn't be read (#20) — distinct from a genuine 0.
+export type UnavailableReason = 'insufficient_permission' | 'scan_failed' | 'not_enabled';
+
+// A workspace on the metastore, for the pre-run workspace filter.
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  url: string | null;
+  status: string | null;
+  is_current: boolean;
+}
+export interface WorkspacesResponse {
+  workspaces: WorkspaceInfo[];
+  current_workspace_id: string | null;
+  available: boolean;
+}
+export interface WorkspaceFilterValue {
+  mode: 'include' | 'exclude';
+  workspace_ids: string[];
+}
+
 export interface PillarScore {
   key: string;
   name: string;
@@ -66,6 +106,9 @@ export interface PillarScore {
   summary: string;
   metrics: Record<string, unknown>;
   identity: SignalIdentity | null;
+  drill_down: DrillDown | null;
+  source_queries: SourceQuery[];
+  unavailable_reason: UnavailableReason | null;
 }
 
 // Which identity actually served a pillar's reads, so the UI can show whether the

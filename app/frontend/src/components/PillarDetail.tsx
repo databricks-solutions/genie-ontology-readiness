@@ -1,7 +1,121 @@
 import { useState } from 'react';
-import { AlertTriangle, CheckCircle2, Info, Database, ChevronDown } from 'lucide-react';
-import type { PillarScore, AppConfig, GenieSpaceCuration, UcSchemaCount, SignalIdentity } from '../types';
+import { AlertTriangle, CheckCircle2, Info, Database, ChevronDown, Lock, Download, Code } from 'lucide-react';
+import type {
+  PillarScore,
+  AppConfig,
+  GenieSpaceCuration,
+  UcSchemaCount,
+  SignalIdentity,
+  DrillDown,
+  SourceQuery,
+  UnavailableReason,
+} from '../types';
+import { rowsToCsv, downloadCsv, csvFilename } from '../utils/csv';
 import GenieTester from './GenieTester';
+
+// Formats a drill-down cell, appending the column unit (e.g. "82%") when present.
+function fmtCell(value: string | number | null, unit?: string): string {
+  if (value === null || value === undefined) return '—';
+  return unit ? `${value}${unit}` : String(value);
+}
+
+// Generic per-asset drill-down table (#10): renders any {title, columns, rows}
+// payload and offers a client-side CSV export of exactly what's shown (which
+// already reflects the active workspace filter). Collapsed by default.
+function DrillDownTable({ drill, pillarKey }: { drill: DrillDown; pillarKey: string }) {
+  const [open, setOpen] = useState(false);
+  if (!drill.rows.length) return null;
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-400 hover:text-ink-600 transition-colors"
+        >
+          <ChevronDown size={13} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+          <Database size={13} className="text-databricks-500" />
+          {drill.title} — {drill.rows.length} row{drill.rows.length === 1 ? '' : 's'}
+        </button>
+        {open && (
+          <button
+            onClick={() => downloadCsv(csvFilename(pillarKey), rowsToCsv(drill.columns, drill.rows))}
+            className="flex items-center gap-1 text-[11px] text-databricks-600 hover:text-databricks-800 hover:underline shrink-0"
+            title="Download this table as CSV (reflects the current workspace filter)"
+          >
+            <Download size={12} /> CSV
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="overflow-x-auto rounded-md border border-gray-200 mt-2">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 text-left">
+                {drill.columns.map((c) => (
+                  <th key={c.key} className="px-3 py-2 text-xs font-semibold text-ink-600 whitespace-nowrap">
+                    {c.label}{c.unit ? <span className="text-ink-400 font-normal"> ({c.unit})</span> : null}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {drill.rows.map((r, i) => (
+                <tr key={i} className="border-t border-gray-100">
+                  {drill.columns.map((c, j) => (
+                    <td
+                      key={c.key}
+                      className={`px-3 py-1.5 ${j === 0 ? 'text-ink-800 font-mono text-xs max-w-[280px] truncate' : 'text-right tabular-nums text-ink-700'}`}
+                      title={j === 0 ? String(r[c.key] ?? '') : undefined}
+                    >
+                      {fmtCell(r[c.key], c.unit)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Collapsed disclosure of the SQL a pillar ran (#22). Uses a native <details> so
+// it's nested and not shown directly. Dark code style matches the app's markdown.
+function SourceQueries({ queries }: { queries: SourceQuery[] }) {
+  if (!queries.length) return null;
+  return (
+    <details className="rounded-md border border-gray-200 group">
+      <summary className="flex items-center gap-1.5 cursor-pointer select-none px-3 py-2 text-xs font-semibold uppercase tracking-wider text-ink-400 hover:text-ink-600">
+        <Code size={13} className="text-ink-400" />
+        How this score was generated — {queries.length} quer{queries.length === 1 ? 'y' : 'ies'}
+      </summary>
+      <div className="px-3 pb-3 space-y-2">
+        {queries.map((q, i) => (
+          <pre key={i} className="bg-ink-900 text-gray-100 rounded-md p-3 overflow-x-auto text-[11px] leading-relaxed whitespace-pre-wrap">
+            {q.sql}
+            {q.parameters && Object.keys(q.parameters).length > 0
+              ? `\n-- parameters: ${JSON.stringify(q.parameters)}`
+              : ''}
+          </pre>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+// Icon + palette for an unavailable pillar's reason (#20), so a scan/access
+// failure is visually distinct from a genuine 0.
+function unavailableStyle(reason: UnavailableReason | null) {
+  switch (reason) {
+    case 'insufficient_permission':
+      return { Icon: Lock, box: 'bg-red-50 border-red-200 text-red-800', label: 'Insufficient permission' };
+    case 'scan_failed':
+      return { Icon: AlertTriangle, box: 'bg-amber-50 border-amber-200 text-amber-800', label: 'Scan failed' };
+    default:
+      return { Icon: Info, box: 'bg-gray-50 border-gray-200 text-ink-500', label: 'Not available' };
+  }
+}
 
 // A visible "read as" line naming the identity that served this pillar's reads
 // (OBO viewer / SP fallback / SP-forced), so viewers know whose grants the signal
@@ -119,13 +233,18 @@ export default function PillarDetail({
   config: AppConfig;
 }) {
   if (!pillar.available) {
+    const { Icon, box, label } = unavailableStyle(pillar.unavailable_reason);
     return (
       <div className="px-4 pb-4 pt-1 space-y-2">
-        <div className="flex items-start gap-2 rounded-md bg-gray-50 border border-gray-200 px-3 py-3 text-sm text-ink-500">
-          <Info size={16} className="mt-0.5 shrink-0" />
-          <span>{pillar.note || 'This signal is not available in the current workspace context.'}</span>
+        <div className={`flex items-start gap-2 rounded-md border px-3 py-3 text-sm ${box}`}>
+          <Icon size={16} className="mt-0.5 shrink-0" />
+          <span>
+            <span className="font-semibold">{label}.</span>{' '}
+            {pillar.note || 'This signal is not available in the current workspace context.'}
+          </span>
         </div>
         {pillar.identity && <IdentityLine identity={pillar.identity} />}
+        <SourceQueries queries={pillar.source_queries} />
       </div>
     );
   }
@@ -190,6 +309,9 @@ export default function PillarDetail({
         </div>
       )}
 
+      {/* Per-asset drill-down: where the gap is, by catalog/schema/agent/workspace (#10). */}
+      {pillar.drill_down && <DrillDownTable drill={pillar.drill_down} pillarKey={pillar.key} />}
+
       {pillar.key === 'uc_foundation' &&
         Array.isArray(pillar.metrics?.legacy_by_schema) &&
         (pillar.metrics.legacy_by_schema as UcSchemaCount[]).length > 0 && (
@@ -201,6 +323,9 @@ export default function PillarDetail({
         (pillar.metrics.spaces as GenieSpaceCuration[]).length > 0 && (
           <GenieSpacesTable spaces={pillar.metrics.spaces as GenieSpaceCuration[]} />
         )}
+
+      {/* The SQL behind this score (#22) — collapsed by default. */}
+      <SourceQueries queries={pillar.source_queries} />
 
       {pillar.key === 'genie_agents' && config.genie_space_configured && (
         <GenieTester />

@@ -24,9 +24,13 @@ import type {
   HistoryResponse,
   HistorySnapshot,
   SnapshotResponse,
+  WorkspaceInfo,
+  WorkspaceFilterValue,
+  WorkspacesResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import PillarDetail from './PillarDetail';
+import WorkspaceFilter from './WorkspaceFilter';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
@@ -149,6 +153,14 @@ export default function Scorecard({
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // Pre-run workspace filter (#25/#10): which workspaces the activity-based
+  // signals count. Defaults to the deployed workspace so counts aren't account-wide.
+  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [workspacesAvailable, setWorkspacesAvailable] = useState(true);
+  const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
+    config.workspace_id ? { mode: 'include', workspace_ids: [config.workspace_id] } : { mode: 'include', workspace_ids: [] }
+  );
+
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
     if (!config.lakebase_enabled) return;
@@ -159,8 +171,21 @@ export default function Scorecard({
 
   useEffect(() => {
     refreshHistory();
+    apiGet<WorkspacesResponse>('/workspaces')
+      .then((r) => {
+        setWorkspaces(r.workspaces || []);
+        setWorkspacesAvailable(r.available);
+        // Seed the default selection to the current workspace if the config didn't.
+        if (!config.workspace_id && r.current_workspace_id) {
+          setWsFilter({ mode: 'include', workspace_ids: [r.current_workspace_id] });
+        }
+      })
+      .catch(() => setWorkspacesAvailable(false));
     return () => abortRef.current?.abort();
   }, []);
+
+  // Whether the activity signals will span more than one workspace (drives the note).
+  const multiWorkspace = wsFilter.mode === 'exclude' || wsFilter.workspace_ids.length !== 1;
 
   const completedCount = Object.keys(pillarsByKey).length;
   const totalPillars = config.pillars.length;
@@ -204,7 +229,7 @@ export default function Scorecard({
     try {
       for await (const ev of streamPostEvents<AssessEvent>(
         '/assess/stream',
-        {},
+        { workspace_filter: wsFilter },
         undefined,
         controller.signal
       )) {
@@ -372,13 +397,28 @@ export default function Scorecard({
         )}
       </div>
 
+      <div className="mt-6 flex flex-col items-center gap-2">
+        <WorkspaceFilter
+          workspaces={workspaces}
+          available={workspacesAvailable}
+          value={wsFilter}
+          onChange={setWsFilter}
+        />
+        {multiWorkspace && (
+          <p className="text-[11px] text-ink-400 max-w-md text-center leading-snug">
+            Activity signals (Genie Agents, Adoption, most-accessed) will count across the selected
+            workspaces. Catalog-metadata pillars are metastore-wide and aren't scoped by this filter.
+          </p>
+        )}
+      </div>
+
       <div className="text-center">
         {error && (
           <p className="mt-4 text-sm text-red-600 flex items-center justify-center gap-1.5">
             <AlertTriangle size={14} /> {error}
           </p>
         )}
-        <button onClick={run} className="btn-primary mt-6 inline-flex items-center gap-2">
+        <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
           <Play size={16} /> Run assessment
         </button>
       </div>
@@ -424,13 +464,22 @@ export default function Scorecard({
                   )}
                 </div>
               </div>
-              <button
-                onClick={run}
-                disabled={running}
-                className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs shrink-0"
-              >
-                <RefreshCw size={14} /> New assessment
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <WorkspaceFilter
+                  workspaces={workspaces}
+                  available={workspacesAvailable}
+                  value={wsFilter}
+                  onChange={setWsFilter}
+                  disabled={running}
+                />
+                <button
+                  onClick={run}
+                  disabled={running}
+                  className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs"
+                >
+                  <RefreshCw size={14} /> New assessment
+                </button>
+              </div>
             </div>
           )
         )}
