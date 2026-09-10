@@ -922,6 +922,11 @@ async def probe_metrics() -> dict:
 # ---------------------------------------------------------------------------
 _MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
 _GENIE_AUDIT_LOOKBACK_DAYS = 30
+# A space's display_name only appears on create/update audit events, not on the
+# query/conversation events that drive the 30-day activity count. Resolve names
+# over a wider window so an actively-queried but not-recently-edited space still
+# shows a readable name (falling back to its space id when none is in the window).
+_GENIE_NAME_LOOKBACK_DAYS = 90
 
 
 def _count(serialized: dict, *path: str) -> int:
@@ -1012,6 +1017,7 @@ async def _genie_audit_counts() -> dict:
             "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
+            "    AND request_params.space_id <> 'new' "
             f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
             f"    {workspace_filter}"
             "  GROUP BY request_params.space_id "
@@ -1032,13 +1038,26 @@ async def _genie_audit_rows() -> list[dict]:
     scope, with event volume, activity, and (when >1 workspace is selected) which
     workspace they live in. Bounded so it can't blow the streaming timeout."""
     try:
-        wsf, wparams = workspace_predicate()  # applied inside the inner audit scan (unqualified column)
+        wsf, wparams = workspace_predicate()  # applied inside the inner audit scans (unqualified column)
         multi = is_multi_workspace()
         ws_select = ", w.workspace_name AS workspace, a.workspace_id AS workspace_id" if multi else ""
         ws_join = (" LEFT JOIN system.access.workspaces_latest w "
                    "ON CAST(a.workspace_id AS STRING) = CAST(w.workspace_id AS STRING)") if multi else ""
         rows = await execute_sql(
-            "SELECT a.space_id AS agent, a.events AS events, a.active_30d AS active_30d" + ws_select + " "
+            # names: latest display_name per space over the wider name window; the
+            # activity subquery (a) drives event volume / recency over the 30d window.
+            "WITH names AS ( "
+            "  SELECT request_params.space_id AS space_id, "
+            "         max_by(request_params.display_name, event_time) AS space_name "
+            "  FROM system.access.audit "
+            "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
+            "    AND request_params.display_name IS NOT NULL "
+            f"    AND event_date >= current_date() - INTERVAL {_GENIE_NAME_LOOKBACK_DAYS} DAYS "
+            f"    {wsf}"
+            "  GROUP BY request_params.space_id "
+            ") "
+            "SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, "
+            "       a.events AS events, a.active_30d AS active_30d" + ws_select + " "
             "FROM ( "
             "  SELECT request_params.space_id AS space_id, "
             + ("any_value(workspace_id) AS workspace_id, " if multi else "") +
@@ -1047,16 +1066,18 @@ async def _genie_audit_rows() -> list[dict]:
             "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
+            "    AND request_params.space_id <> 'new' "
             f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
             f"    {wsf}"
             "  GROUP BY request_params.space_id "
-            ") a" + ws_join + " "
+            ") a LEFT JOIN names nm ON a.space_id = nm.space_id" + ws_join + " "
             "WHERE a.trashed = 0 ORDER BY a.events DESC LIMIT 200",
             parameters=wparams or None,
         )
         out = []
         for r in rows:
-            row = {"agent": r.get("agent"), "events": int(r.get("events") or 0),
+            row = {"agent": r.get("agent"), "space_id": r.get("space_id"),
+                   "events": int(r.get("events") or 0),
                    "active_30d": "Yes" if int(r.get("active_30d") or 0) else "No"}
             if multi:
                 row["workspace"] = r.get("workspace") or r.get("workspace_id")
@@ -1093,11 +1114,12 @@ async def probe_genie_agents() -> dict:
                       reason="insufficient_permission")
     total, active = total or 0, active or 0
     drill_rows = await _genie_audit_rows()
-    drill_cols = [{"key": "agent", "label": "Agent (space id)"},
+    drill_cols = [{"key": "agent", "label": "Genie Space"},
+                  {"key": "space_id", "label": "Space id"},
                   {"key": "events", "label": "Audit events"},
                   {"key": "active_30d", "label": "Active 30d"}]
     if is_multi_workspace():
-        drill_cols.insert(1, {"key": "workspace", "label": "Workspace"})
+        drill_cols.insert(2, {"key": "workspace", "label": "Workspace"})
 
     score = 0.0
     if total > 0:
