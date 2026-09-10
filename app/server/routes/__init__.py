@@ -7,7 +7,8 @@ from .assess import router as assess_router
 from .content import router as content_router
 from .plan import router as plan_router
 from .genie import router as genie_router
+from .workspaces import router as workspaces_router
 
 router = APIRouter(prefix="/api")
-for sub in [config_router, assess_router, content_router, plan_router, genie_router]:
+for sub in [config_router, assess_router, content_router, plan_router, genie_router, workspaces_router]:
     router.include_router(sub)

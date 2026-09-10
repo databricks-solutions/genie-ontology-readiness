@@ -13,6 +13,11 @@ env:
   # Optional: enable the live Genie answer-quality test (pillar 5).
   - name: GENIE_SPACE_ID
     value: ""
+  # The deployed workspace's id — seeds the default workspace-filter selection so
+  # the activity signals (Genie/Adoption/lineage) scope to this workspace by
+  # default on a shared metastore. post_deploy.py resolves it automatically.
+  - name: WORKSPACE_ID
+    value: ""
   # Branding shown in the app header.
   - name: BRAND_NAME
     value: "Databricks"

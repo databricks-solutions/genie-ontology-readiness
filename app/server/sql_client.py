@@ -48,6 +48,35 @@ def record_rest_identity() -> None:
         record_identity("sp_no_token")
 
 
+# --- Per-signal query capture -------------------------------------------------
+# Records the exact SQL each probe runs so the assessment can show "the query
+# behind this score" (explainability). Scoped per probe task like identity
+# capture: the scorer calls start_query_capture() at the head of each probe task,
+# execute_sql appends each statement, and captured_queries() returns them.
+_query_recorder: contextvars.ContextVar = contextvars.ContextVar("query_recorder", default=None)
+
+
+def start_query_capture() -> None:
+    """Begin (or reset) SQL capture for the current context/task."""
+    _query_recorder.set([])
+
+
+def record_query(sql: str, parameters: Optional[dict[str, Any]] = None) -> None:
+    """Record one executed statement. No-op when capture isn't active."""
+    rec = _query_recorder.get()
+    if rec is not None:
+        entry: dict[str, Any] = {"sql": " ".join(sql.split())}
+        if parameters:
+            entry["parameters"] = {k: str(v) for k, v in parameters.items()}
+        rec.append(entry)
+
+
+def captured_queries() -> list[dict]:
+    """The statements recorded since start_query_capture() (may be empty)."""
+    rec = _query_recorder.get()
+    return list(rec) if rec else []
+
+
 def resolved_identity() -> Optional[dict]:
     """Summarize the identities recorded since start_identity_capture().
 
@@ -107,6 +136,10 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     see" OBO promise for completeness — a viewer may see a signal via the SP that
     they couldn't read themselves. That is the intended behaviour here.
     """
+    # Record the statement for the "SQL behind this score" disclosure. Best-effort,
+    # scoped to the probe task; a no-op when capture isn't active (e.g. unit tests).
+    record_query(query, parameters)
+
     # Override: SP only, no OBO attempt, no fallback. Either the per-call override
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
     if force_sp or FORCE_SP:

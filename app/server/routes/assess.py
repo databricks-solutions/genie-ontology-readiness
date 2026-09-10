@@ -4,12 +4,14 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Body
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from server.assessment.scoring import run_assessment, run_assessment_stream
 from server.routes._shared import _cache_get, _cache_set
 from server.config import set_user_token
+from server.workspace_filter import set_workspace_filter
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -20,34 +22,64 @@ router = APIRouter()
 _OBO_HEADER = "x-forwarded-access-token"
 
 
+class WorkspaceFilterModel(BaseModel):
+    mode: str = "include"  # "include" | "exclude"
+    workspace_ids: list[str] = []
+
+
+class AssessRequest(BaseModel):
+    # Which workspaces the activity-based signals (Genie/Adoption/lineage) should
+    # scope to. None / empty ids → all workspaces. Metastore-scoped pillars ignore it.
+    workspace_filter: Optional[WorkspaceFilterModel] = None
+
+
 @router.get("/assess")
-async def assess_get(x_forwarded_access_token: Optional[str] = Header(default=None)):
-    """Quick technical-only assessment. Cached briefly. Not persisted."""
+async def assess_get(
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+    workspace_ids: Optional[str] = None,
+    workspace_mode: str = "include",
+):
+    """Quick technical-only assessment. Cached briefly. Not persisted.
+
+    Optional ``?workspace_ids=<comma,sep>&workspace_mode=include|exclude`` scopes the
+    activity signals (mainly for headless/testing; the UI uses the stream body)."""
     set_user_token(x_forwarded_access_token)
-    # Only cache the SP-run result; a per-user (OBO) run is scoped to that viewer.
-    if not x_forwarded_access_token:
+    ids = [w.strip() for w in (workspace_ids or "").split(",") if w.strip()]
+    set_workspace_filter({"mode": workspace_mode, "workspace_ids": ids} if ids else None)
+    # Only cache the SP-run result with no filter; a per-user (OBO) or filtered run
+    # is scoped and must not be shared from the cache.
+    cacheable = not x_forwarded_access_token and not ids
+    if cacheable:
         cached = _cache_get("assess:technical")
         if cached is not None:
             return cached
     result = await run_assessment()
-    if not x_forwarded_access_token:
+    if cacheable:
         _cache_set("assess:technical", result)
     return result
 
 
 @router.post("/assess/stream")
 async def assess_stream(
+    req: AssessRequest = Body(default=AssessRequest()),
     x_forwarded_email: Optional[str] = Header(default=None),
     x_forwarded_access_token: Optional[str] = Header(default=None),
 ):
     """Stream the assessment: one SSE event per pillar as it completes, then a
     final 'complete' event with the overall score + top gaps. Every completed run
-    is auto-saved to the user's history (when Lakebase is enabled)."""
+    is auto-saved to the user's history (when Lakebase is enabled).
+
+    Body: {"workspace_filter": {"mode": "include"|"exclude", "workspace_ids": [...]}}
+    scopes the activity-based signals; omit / empty for all workspaces."""
+
+    wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
 
     async def gen():
         # Set inside the generator too: the streaming body may run in a fresh
-        # context, so re-establish the on-behalf-of-user token here.
+        # context, so re-establish the on-behalf-of-user token + workspace filter here
+        # (contextvars set here propagate to the probe tasks created downstream).
         set_user_token(x_forwarded_access_token)
+        set_workspace_filter(wsf)
         try:
             async for event in run_assessment_stream():
                 if event.get("type") == "complete":

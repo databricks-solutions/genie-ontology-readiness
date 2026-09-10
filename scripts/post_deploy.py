@@ -56,6 +56,7 @@ def render_app_yml():
 
     set_env("ASSESS_CATALOGS", os.environ.get("ASSESS_CATALOGS", ""))
     set_env("GENIE_SPACE_ID", os.environ.get("GENIE_SPACE_ID", ""))
+    set_env("WORKSPACE_ID", _resolve_workspace_id())
     set_env("BRAND_NAME", os.environ.get("BRAND_NAME", "Databricks"))
     set_env("FORCE_SP", os.environ.get("FORCE_SP", "false"))
     set_env("USE_LAKEBASE", "true" if (USE_LAKEBASE and _LAKEBASE["host"]) else "false")
@@ -66,6 +67,22 @@ def render_app_yml():
 
     out.write_text(text)
     print(f"  Rendered {out}")
+
+
+def _resolve_workspace_id() -> str:
+    """The deployed workspace's id, to seed the app's default workspace filter.
+
+    Honors an explicit WORKSPACE_ID env if set; otherwise resolves it from the CLI
+    (``databricks metastores current`` returns the current workspace_id). Falls back
+    to empty (the app then defaults the filter to all workspaces) if unavailable."""
+    explicit = os.environ.get("WORKSPACE_ID", "")
+    if explicit:
+        return explicit
+    ms = cli_json("metastores", "current")
+    if isinstance(ms, dict) and ms.get("workspace_id"):
+        return str(ms["workspace_id"])
+    print("  (warning) could not resolve WORKSPACE_ID; workspace filter will default to all workspaces")
+    return ""
 
 
 def cli_json(*args):
