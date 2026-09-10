@@ -23,6 +23,25 @@ import contextvars
 # Filter shape: {"mode": "include"|"exclude", "workspace_ids": [str, ...]} or None.
 _workspace_filter: contextvars.ContextVar = contextvars.ContextVar("workspace_filter", default=None)
 
+# Explicit per-request catalog scope for the metadata pillars (from the catalog
+# filter). None → derive from workspace bindings / enumerate (see probes).
+_catalog_scope: contextvars.ContextVar = contextvars.ContextVar("catalog_scope", default=None)
+
+
+def set_catalog_scope(catalogs: list | None) -> None:
+    """Record the per-request catalog scope (a list of catalog names), or None to
+    let the metadata pillars derive scope from workspace bindings / enumeration."""
+    if not catalogs:
+        _catalog_scope.set(None)
+        return
+    names = [str(c).strip() for c in catalogs if str(c).strip()]
+    _catalog_scope.set(names or None)
+
+
+def get_catalog_scope() -> list | None:
+    """The active per-request catalog scope, or None."""
+    return _catalog_scope.get()
+
 
 def set_workspace_filter(f: dict | None) -> None:
     """Record the workspace filter for the current request context.

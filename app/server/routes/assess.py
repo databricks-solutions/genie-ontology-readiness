@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from server.assessment.scoring import run_assessment, run_assessment_stream
 from server.routes._shared import _cache_get, _cache_set
 from server.config import set_user_token
-from server.workspace_filter import set_workspace_filter
+from server.workspace_filter import set_workspace_filter, set_catalog_scope
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,9 @@ class AssessRequest(BaseModel):
     # Which workspaces the activity-based signals (Genie/Adoption/lineage) should
     # scope to. None / empty ids → all workspaces. Metastore-scoped pillars ignore it.
     workspace_filter: Optional[WorkspaceFilterModel] = None
+    # Which catalogs the metadata pillars should assess. Empty → derive from the
+    # selected workspaces' bindings (or enumerate all visible catalogs).
+    catalogs: list[str] = []
 
 
 @router.get("/assess")
@@ -38,17 +41,21 @@ async def assess_get(
     x_forwarded_access_token: Optional[str] = Header(default=None),
     workspace_ids: Optional[str] = None,
     workspace_mode: str = "include",
+    catalogs: Optional[str] = None,
 ):
     """Quick technical-only assessment. Cached briefly. Not persisted.
 
     Optional ``?workspace_ids=<comma,sep>&workspace_mode=include|exclude`` scopes the
-    activity signals (mainly for headless/testing; the UI uses the stream body)."""
+    activity signals and ``?catalogs=<comma,sep>`` scopes the metadata pillars (mainly
+    for headless/testing; the UI uses the stream body)."""
     set_user_token(x_forwarded_access_token)
     ids = [w.strip() for w in (workspace_ids or "").split(",") if w.strip()]
+    cat_scope = [c.strip() for c in (catalogs or "").split(",") if c.strip()]
     set_workspace_filter({"mode": workspace_mode, "workspace_ids": ids} if ids else None)
-    # Only cache the SP-run result with no filter; a per-user (OBO) or filtered run
-    # is scoped and must not be shared from the cache.
-    cacheable = not x_forwarded_access_token and not ids
+    set_catalog_scope(cat_scope or None)
+    # Only cache the SP-run result with no filter; a per-user (OBO) or filtered/scoped
+    # run is scoped and must not be shared from the cache.
+    cacheable = not x_forwarded_access_token and not ids and not cat_scope
     if cacheable:
         cached = _cache_get("assess:technical")
         if cached is not None:
@@ -73,13 +80,15 @@ async def assess_stream(
     scopes the activity-based signals; omit / empty for all workspaces."""
 
     wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
+    cat_scope = list(req.catalogs) if req and req.catalogs else None
 
     async def gen():
         # Set inside the generator too: the streaming body may run in a fresh
-        # context, so re-establish the on-behalf-of-user token + workspace filter here
+        # context, so re-establish the OBO token + workspace/catalog scope here
         # (contextvars set here propagate to the probe tasks created downstream).
         set_user_token(x_forwarded_access_token)
         set_workspace_filter(wsf)
+        set_catalog_scope(cat_scope)
         try:
             async for event in run_assessment_stream():
                 if event.get("type") == "complete":

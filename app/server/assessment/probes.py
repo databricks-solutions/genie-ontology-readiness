@@ -40,7 +40,13 @@ from server.config import (
     GENIE_SPACE_ID,
     get_user_token,
 )
-from server.workspace_filter import workspace_predicate, is_multi_workspace
+from server.workspace_filter import (
+    workspace_predicate,
+    is_multi_workspace,
+    get_workspace_filter,
+    get_catalog_scope,
+)
+from server.bindings import accessible_catalogs
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +74,19 @@ def _reason_for(exc: Exception) -> str:
     return "insufficient_permission" if _is_authz_error(exc) else "scan_failed"
 
 
+# Column keys that the drill-down modal offers as slice-by filters.
+_DIMENSION_KEYS = ("workspace", "catalog", "schema", "agent")
+
+
 def _drill(title: str, columns: list[dict], rows: list[dict]) -> dict | None:
     """Uniform per-asset drill-down payload, or None when there's nothing to show.
-    ``columns`` is [{key,label,unit?}]; ``rows`` are dicts keyed by column key."""
+    ``columns`` is [{key,label,unit?}]; ``rows`` are dicts keyed by column key.
+    ``dimensions`` (auto-derived from the columns) names the columns the UI can
+    filter by (workspace / catalog / schema / agent)."""
     if not rows:
         return None
-    return {"title": title, "columns": columns, "rows": rows}
+    dimensions = [c["key"] for c in columns if c["key"] in _DIMENSION_KEYS]
+    return {"title": title, "columns": columns, "rows": rows, "dimensions": dimensions}
 
 
 def _no_catalogs_note(what: str) -> str:
@@ -176,6 +189,12 @@ async def _resolve_sources() -> dict:
     global _sources_sp
     has_user_token = get_user_token() is not None
 
+    # A workspace/catalog scope makes the resolved catalog set request-specific, so
+    # the process-wide SP cache (which is unscoped) must not be used or populated.
+    scoped = bool(get_catalog_scope()) or _has_workspace_scope()
+    if scoped:
+        return await _do_resolve_sources()
+
     # For SP-only requests, use the global cache.
     if not has_user_token:
         if _sources_sp is not None:
@@ -206,6 +225,32 @@ async def prime_request_sources() -> dict:
     return s
 
 
+def _has_workspace_scope() -> bool:
+    """True when an include-mode workspace filter with specific ids is active —
+    the case where the catalog-metadata pillars scope to the bound catalogs."""
+    f = get_workspace_filter()
+    return bool(f and f.get("mode") == "include" and f.get("workspace_ids"))
+
+
+async def _scoped_catalogs() -> list[str] | None:
+    """The explicit catalog list for this assessment, or None to enumerate.
+
+    Precedence: per-request catalog scope (catalog filter) > catalogs bound to the
+    selected workspaces (UC bindings) > ASSESS_CATALOGS env. None means "no explicit
+    scope — enumerate all visible catalogs" (today's default)."""
+    override = get_catalog_scope()
+    if override:
+        return override
+    f = get_workspace_filter()
+    if f and f.get("mode") == "include" and f.get("workspace_ids"):
+        accessible = await accessible_catalogs(set(f["workspace_ids"]))
+        if accessible is not None:  # None → bindings unreadable; fall through
+            return [c["name"] for c in accessible]
+    if ASSESS_CATALOGS:
+        return list(ASSESS_CATALOGS)
+    return None
+
+
 async def _do_resolve_sources() -> dict:
     """Core source resolution logic (called by _resolve_sources)."""
     system_ok = False
@@ -215,8 +260,9 @@ async def _do_resolve_sources() -> dict:
     except Exception:
         system_ok = False
 
-    catalogs = list(ASSESS_CATALOGS)
-    if not catalogs:
+    explicit = await _scoped_catalogs()
+    catalogs = list(explicit) if explicit is not None else []
+    if explicit is None:
         rows = []
         try:
             if system_ok:
@@ -233,9 +279,10 @@ async def _do_resolve_sources() -> dict:
             if c and c not in _INTERNAL_CATALOGS and not c.startswith("__")
         ]
 
-    # When restricted to specific catalogs, prefer per-catalog reads even if
-    # system is readable, so we never depend on system grants we can't assume.
-    use_system = system_ok and not ASSESS_CATALOGS
+    # When restricted to an explicit catalog list (catalog filter / bindings /
+    # ASSESS_CATALOGS), prefer per-catalog reads even if system is readable, so we
+    # scope precisely and never depend on system grants we can't assume.
+    use_system = system_ok and explicit is None
 
     # In per-catalog mode, SHOW CATALOGS may list catalogs the SP can only
     # BROWSE (not SELECT) — querying their information_schema would fail and
@@ -278,12 +325,14 @@ def _src(view: str, sources: dict) -> str | None:
 
 def _internal_catalog_filter(sources: dict) -> str:
     """Extra WHERE clause to exclude internal catalogs when grouping by
-    ``table_catalog`` over the metastore-wide system view. Per-catalog union mode
-    is already scoped to the enumerated non-internal catalogs, so it needs none."""
+    ``table_catalog`` over the metastore-wide system view — the named internal
+    catalogs plus any ``__``-prefixed system catalog (e.g. Databricks-internal
+    lakeview/materialization catalogs). Per-catalog union mode is already scoped to
+    the enumerated non-internal catalogs, so it needs none."""
     if not sources.get("system_ok"):
         return ""
     in_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-    return f"AND table_catalog NOT IN ({in_list}) "
+    return f"AND table_catalog NOT IN ({in_list}) AND table_catalog NOT RLIKE '^__' "
 
 
 # ---------------------------------------------------------------------------
@@ -374,23 +423,23 @@ async def probe_uc_foundation() -> dict:
             except Exception as e:
                 logger.info(f"legacy_by_schema breakdown failed: {str(e)[:80]}")
 
-        # Per-catalog drill-down (#10): where the UC table footprint sits and how
-        # much of each catalog is managed, so a domain lead sees their own catalog.
+        # Per-schema drill-down (#10): where the UC table footprint sits and how
+        # much of each schema is managed, sliceable by catalog/schema in the UI.
         drill_rows = []
         try:
             crows = await execute_sql(
-                f"SELECT table_catalog AS catalog, COUNT(*) AS tables, "
+                f"SELECT table_catalog AS catalog, table_schema AS schema, COUNT(*) AS tables, "
                 f"       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed "
                 f"FROM {tbl} WHERE table_schema <> 'information_schema' {_internal_catalog_filter(s)}"
-                f"GROUP BY table_catalog ORDER BY tables DESC LIMIT 200"
+                f"GROUP BY table_catalog, table_schema ORDER BY tables DESC LIMIT 500"
             )
             drill_rows = [
-                {"catalog": r.get("catalog"), "tables": int(r.get("tables") or 0),
+                {"catalog": r.get("catalog"), "schema": r.get("schema"), "tables": int(r.get("tables") or 0),
                  "managed_pct": _pct(int(r.get("managed") or 0), int(r.get("tables") or 0))}
                 for r in crows if r.get("catalog")
             ]
         except Exception as e:
-            logger.info(f"uc_foundation per-catalog drill-down failed: {str(e)[:80]}")
+            logger.info(f"uc_foundation per-schema drill-down failed: {str(e)[:80]}")
 
         return {
             "available": True,
@@ -405,8 +454,9 @@ async def probe_uc_foundation() -> dict:
                 "legacy_by_schema": legacy_by_schema,
             },
             "drill_down": _drill(
-                "Tables by catalog",
+                "Tables by schema",
                 [{"key": "catalog", "label": "Catalog"},
+                 {"key": "schema", "label": "Schema"},
                  {"key": "tables", "label": "Tables"},
                  {"key": "managed_pct", "label": "Managed", "unit": "%"}],
                 drill_rows,
@@ -451,24 +501,24 @@ def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> st
            "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented")
     if system_ok:
         in_list = ", ".join("'" + c.replace("'", "''") + "'" for c in catalogs_batch)
-        return (f"SELECT table_catalog AS cat, {cov} FROM system.information_schema.{view} "
+        return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM system.information_schema.{view} "
                 f"WHERE table_catalog IN ({in_list}) AND table_schema <> 'information_schema' "
-                f"GROUP BY table_catalog")
+                f"GROUP BY table_catalog, table_schema")
     union = " UNION ALL ".join(f"SELECT * FROM `{c}`.information_schema.{view}" for c in catalogs_batch)
-    return (f"SELECT table_catalog AS cat, {cov} FROM ({union}) AS _c "
-            f"WHERE table_schema <> 'information_schema' GROUP BY table_catalog")
+    return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM ({union}) AS _c "
+            f"WHERE table_schema <> 'information_schema' GROUP BY table_catalog, table_schema")
 
 
 async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tuple[int, int, dict]:
-    """(columns, commented-columns, per_catalog) computed in per-catalog batches
-    with bounded concurrency, where per_catalog maps catalog -> (columns, commented).
+    """(columns, commented-columns, per_schema) computed in per-catalog batches with
+    bounded concurrency, where per_schema maps (catalog, schema) -> (columns, commented).
     Emits pillar_progress as each batch lands and raises TimeoutError only if no
     batch completes within _METADATA_NO_PROGRESS_TIMEOUT."""
     batches = [catalogs[i:i + _METADATA_BATCH_SIZE] for i in range(0, len(catalogs), _METADATA_BATCH_SIZE)]
     total_cats = len(catalogs)
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = failed_cats = 0
-    per_catalog: dict[str, tuple[int, int]] = {}
+    per_schema: dict[tuple[str, str], tuple[int, int]] = {}
 
     async def _one(batch: list[str]) -> tuple[int, int, int, bool, list[dict]]:
         async with sem:
@@ -506,9 +556,9 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
                     c_total += t
                     c_commented += c
                     for r in rows:
-                        cat = r.get("cat")
-                        if cat:
-                            per_catalog[cat] = (int(r.get("total") or 0), int(r.get("commented") or 0))
+                        cat, sch = r.get("cat"), r.get("sch")
+                        if cat and sch:
+                            per_schema[(cat, sch)] = (int(r.get("total") or 0), int(r.get("commented") or 0))
                 else:
                     failed_cats += ncat
                 _emit_progress("metadata", scanned, total_cats,
@@ -528,7 +578,7 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
     if failed_cats:
         logger.warning(f"metadata scan: {failed_cats}/{total_cats} catalogs unreadable; "
                        f"coverage computed over the {ok_cats} readable")
-    return c_total, c_commented, per_catalog
+    return c_total, c_commented, per_schema
 
 
 async def probe_metadata() -> dict:
@@ -559,9 +609,9 @@ async def probe_metadata() -> dict:
         # Heavy read — scan columns coverage in per-catalog batches so a wide
         # metastore fills in progressively instead of timing out on one big scan.
         # Fall back to a single query only when there's no catalog list to chunk by.
-        col_per_catalog: dict[str, tuple[int, int]] = {}
+        col_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
         if catalogs:
-            c_total, c_commented, col_per_catalog = await _column_coverage_chunked(catalogs, system_ok)
+            c_total, c_commented, col_per_schema = await _column_coverage_chunked(catalogs, system_ok)
         else:
             col = _src("columns", s)  # built lazily — only the no-catalog-list fallback needs it
             if col is not None:
@@ -600,27 +650,28 @@ async def probe_metadata() -> dict:
         if tagged_tables is not None:
             signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
 
-        # Per-catalog drill-down (#10): comment coverage by catalog, worst first,
-        # so a domain lead sees which of their catalogs drag the score down.
-        table_per_catalog: dict[str, tuple[int, int]] = {}
+        # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
+        # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
+        table_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
         try:
             trows = await execute_sql(
-                f"SELECT table_catalog AS cat, COUNT(*) AS total, "
+                f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
                 f"SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
                 f"FROM {tbl} WHERE table_schema <> 'information_schema' {_internal_catalog_filter(s)}"
-                f"GROUP BY table_catalog"
+                f"GROUP BY table_catalog, table_schema"
             )
-            table_per_catalog = {r.get("cat"): (int(r.get("total") or 0), int(r.get("commented") or 0))
-                                 for r in trows if r.get("cat")}
+            table_per_schema = {(r.get("cat"), r.get("sch")): (int(r.get("total") or 0), int(r.get("commented") or 0))
+                                for r in trows if r.get("cat") and r.get("sch")}
         except Exception as e:
-            logger.info(f"metadata per-catalog table coverage failed: {str(e)[:80]}")
+            logger.info(f"metadata per-schema table coverage failed: {str(e)[:80]}")
 
         drill_rows = []
-        for cat in sorted(set(table_per_catalog) | set(col_per_catalog)):
-            t_tot, t_com = table_per_catalog.get(cat, (0, 0))
-            c_tot, c_com = col_per_catalog.get(cat, (0, 0))
+        for (cat, sch) in sorted(set(table_per_schema) | set(col_per_schema)):
+            t_tot, t_com = table_per_schema.get((cat, sch), (0, 0))
+            c_tot, c_com = col_per_schema.get((cat, sch), (0, 0))
             drill_rows.append({
                 "catalog": cat,
+                "schema": sch,
                 "table_comment_pct": _pct(t_com, t_tot),
                 "column_comment_pct": _pct(c_com, c_tot),
                 "tables": t_tot,
@@ -635,8 +686,9 @@ async def probe_metadata() -> dict:
             "note": None,
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
             "drill_down": _drill(
-                "Comment coverage by catalog (worst first)",
+                "Comment coverage by schema (worst first)",
                 [{"key": "catalog", "label": "Catalog"},
+                 {"key": "schema", "label": "Schema"},
                  {"key": "tables", "label": "Tables"},
                  {"key": "table_comment_pct", "label": "Tables commented", "unit": "%"},
                  {"key": "column_comment_pct", "label": "Columns commented", "unit": "%"}],
@@ -699,52 +751,53 @@ async def probe_relationships() -> dict:
 
         note = None if constraints_available else "Constraint metadata not available; relationship score is based on the gold layer only."
 
-        # Per-catalog drill-down (#10): gold-layer tables and declared PK/FK by
-        # catalog, so a domain sees where modeling (constraints/gold layer) is thin.
-        gold_by_cat: dict[str, int] = {}
+        # Per-schema drill-down (#10): gold-layer tables and declared PK/FK by
+        # schema, so a domain sees where modeling (constraints/gold layer) is thin.
+        gold_by: dict[tuple[str, str], int] = {}
         try:
             grows = await execute_sql(
-                f"SELECT table_catalog AS cat, COUNT(*) AS n FROM {tbl} "
+                f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS n FROM {tbl} "
                 f"WHERE (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)' "
                 f"   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)') "
-                f"{_internal_catalog_filter(s)}GROUP BY table_catalog"
+                f"{_internal_catalog_filter(s)}GROUP BY table_catalog, table_schema"
             )
-            gold_by_cat = {r.get("cat"): int(r.get("n") or 0) for r in grows if r.get("cat")}
+            gold_by = {(r.get("cat"), r.get("sch")): int(r.get("n") or 0) for r in grows if r.get("cat") and r.get("sch")}
         except Exception as e:
-            logger.info(f"relationships gold-by-catalog failed: {str(e)[:80]}")
-        pkfk_by_cat: dict[str, dict] = {}
+            logger.info(f"relationships gold-by-schema failed: {str(e)[:80]}")
+        pkfk_by: dict[tuple[str, str], dict] = {}
         if constraints_available:
             try:
                 crows = await execute_sql(
-                    f"SELECT table_catalog AS cat, constraint_type AS ct, COUNT(*) AS n "
-                    f"FROM {tc} GROUP BY table_catalog, constraint_type"
+                    f"SELECT table_catalog AS cat, table_schema AS sch, constraint_type AS ct, COUNT(*) AS n "
+                    f"FROM {tc} GROUP BY table_catalog, table_schema, constraint_type"
                 )
                 for r in crows:
-                    cat = r.get("cat")
-                    if not cat:
+                    cat, sch = r.get("cat"), r.get("sch")
+                    if not cat or not sch:
                         continue
-                    d = pkfk_by_cat.setdefault(cat, {"pk": 0, "fk": 0})
+                    d = pkfk_by.setdefault((cat, sch), {"pk": 0, "fk": 0})
                     if r.get("ct") == "PRIMARY KEY":
                         d["pk"] = int(r.get("n") or 0)
                     elif r.get("ct") == "FOREIGN KEY":
                         d["fk"] = int(r.get("n") or 0)
             except Exception as e:
-                logger.info(f"relationships pkfk-by-catalog failed: {str(e)[:80]}")
-        drill_cols = [{"key": "catalog", "label": "Catalog"}, {"key": "gold_tables", "label": "Gold tables"}]
+                logger.info(f"relationships pkfk-by-schema failed: {str(e)[:80]}")
+        drill_cols = [{"key": "catalog", "label": "Catalog"}, {"key": "schema", "label": "Schema"},
+                      {"key": "gold_tables", "label": "Gold tables"}]
         if constraints_available:
             drill_cols += [{"key": "primary_keys", "label": "PKs"}, {"key": "foreign_keys", "label": "FKs"}]
         drill_rows = []
-        for cat in sorted(set(gold_by_cat) | set(pkfk_by_cat)):
-            row = {"catalog": cat, "gold_tables": gold_by_cat.get(cat, 0)}
+        for (cat, sch) in sorted(set(gold_by) | set(pkfk_by)):
+            row = {"catalog": cat, "schema": sch, "gold_tables": gold_by.get((cat, sch), 0)}
             if constraints_available:
-                row["primary_keys"] = pkfk_by_cat.get(cat, {}).get("pk", 0)
-                row["foreign_keys"] = pkfk_by_cat.get(cat, {}).get("fk", 0)
+                row["primary_keys"] = pkfk_by.get((cat, sch), {}).get("pk", 0)
+                row["foreign_keys"] = pkfk_by.get((cat, sch), {}).get("fk", 0)
             drill_rows.append(row)
         drill_rows.sort(key=lambda r: (r["gold_tables"], r.get("foreign_keys", 0)))
 
         return {"available": True, "score": score, "signals": signals, "gaps": gaps, "note": note,
                 "metrics": {"primary_keys": pk, "foreign_keys": fk, "gold_tables": gold_tables, "constraints_available": constraints_available},
-                "drill_down": _drill("Modeling by catalog (thinnest first)", drill_cols, drill_rows)}
+                "drill_down": _drill("Modeling by schema (thinnest first)", drill_cols, drill_rows)}
     except Exception as e:
         logger.warning(f"probe_relationships failed: {e}")
         return _empty(f"Could not assess relationships ({str(e)[:120]}).", reason=_reason_for(e))
@@ -825,23 +878,23 @@ async def probe_metrics() -> dict:
                     f"{uncommented} metric view(s) lack a description — Genie reads metric-view, dimension, and measure comments to reason; add them."
                 )
 
-        # Per-catalog drill-down (#10): where the metric views live (and how many
-        # are described), so teams see which catalogs still lack a semantic layer.
+        # Per-schema drill-down (#10): where the metric views live (and how many
+        # are described), so teams see which schemas still lack a semantic layer.
         drill_rows = []
         try:
             mrows = await execute_sql(
-                f"SELECT table_catalog AS cat, COUNT(*) AS n, "
+                f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS n, "
                 f"SUM(CASE WHEN comment IS NOT NULL AND trim(comment) <> '' THEN 1 ELSE 0 END) AS commented "
                 f"FROM {tbl} WHERE table_type = '{type_value}' {_internal_catalog_filter(s)}"
-                f"GROUP BY table_catalog ORDER BY n DESC LIMIT 200"
+                f"GROUP BY table_catalog, table_schema ORDER BY n DESC LIMIT 500"
             )
             drill_rows = [
-                {"catalog": r.get("cat"), "metric_views": int(r.get("n") or 0),
+                {"catalog": r.get("cat"), "schema": r.get("sch"), "metric_views": int(r.get("n") or 0),
                  "commented": int(r.get("commented") or 0)}
                 for r in mrows if r.get("cat")
             ]
         except Exception as e:
-            logger.info(f"metrics per-catalog drill-down failed: {str(e)[:80]}")
+            logger.info(f"metrics per-schema drill-down failed: {str(e)[:80]}")
 
         return {
             "available": True,
@@ -851,8 +904,9 @@ async def probe_metrics() -> dict:
             "note": None,
             "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
             "drill_down": _drill(
-                "Metric views by catalog",
+                "Metric views by schema",
                 [{"key": "catalog", "label": "Catalog"},
+                 {"key": "schema", "label": "Schema"},
                  {"key": "metric_views", "label": "Metric views"},
                  {"key": "commented", "label": "Commented"}],
                 drill_rows,
@@ -1258,27 +1312,28 @@ async def probe_domains() -> dict:
             signals.append({"label": "Top accessed certified", "value": top_certified, "unit": f"/ {top_accessed}",
                             "detail": f"{top_certified} out of the top {top_accessed} most accessed resources are certified (last 90d)"})
 
-        # Per-catalog drill-down (#10): domain / steward / certified tag coverage by
-        # catalog, so a domain lead sees which catalogs lack governance tags.
+        # Per-schema drill-down (#10): domain / steward / certified tag coverage by
+        # schema, so a domain lead sees which schemas lack governance tags.
         drill_rows = []
         try:
             drows = await execute_sql(
-                f"SELECT catalog_name AS catalog, "
+                f"SELECT catalog_name AS catalog, schema_name AS schema, "
                 f"  COUNT(DISTINCT CASE WHEN lower(tag_name) IN ({domain_keys}) "
                 f"    THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS domain_tagged, "
                 f"  COUNT(DISTINCT CASE WHEN lower(tag_name) IN ({steward_keys}) "
                 f"    THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS stewarded, "
                 f"  COUNT(DISTINCT CASE WHEN lower(tag_name) IN ({cert_keys}) AND lower(tag_value) = 'certified' "
                 f"    THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS certified "
-                f"FROM {tt} GROUP BY catalog_name ORDER BY domain_tagged DESC LIMIT 200"
+                f"FROM {tt} GROUP BY catalog_name, schema_name ORDER BY domain_tagged DESC LIMIT 500"
             )
             drill_rows = [
-                {"catalog": r.get("catalog"), "domain_tagged": int(r.get("domain_tagged") or 0),
+                {"catalog": r.get("catalog"), "schema": r.get("schema"),
+                 "domain_tagged": int(r.get("domain_tagged") or 0),
                  "stewarded": int(r.get("stewarded") or 0), "certified": int(r.get("certified") or 0)}
                 for r in drows if r.get("catalog")
             ]
         except Exception as e:
-            logger.info(f"domains per-catalog drill-down failed: {str(e)[:80]}")
+            logger.info(f"domains per-schema drill-down failed: {str(e)[:80]}")
 
         return {
             "available": True,
@@ -1296,8 +1351,9 @@ async def probe_domains() -> dict:
                         "top_accessed_list": top_accessed_list,
                         "source": "tag_proxy"},
             "drill_down": _drill(
-                "Governance tags by catalog",
+                "Governance tags by schema",
                 [{"key": "catalog", "label": "Catalog"},
+                 {"key": "schema", "label": "Schema"},
                  {"key": "domain_tagged", "label": "Domain-tagged"},
                  {"key": "stewarded", "label": "Stewarded"},
                  {"key": "certified", "label": "Certified"}],
