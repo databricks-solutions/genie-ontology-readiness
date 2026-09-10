@@ -12,7 +12,7 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -32,7 +32,6 @@ import type {
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import PillarDetail from './PillarDetail';
-import WorkspaceFilter from './WorkspaceFilter';
 import CatalogFilter from './CatalogFilter';
 
 type AssessEvent =
@@ -156,8 +155,9 @@ export default function Scorecard({
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Pre-run workspace filter (#25/#10): which workspaces the activity-based
-  // signals count. Defaults to the deployed workspace so counts aren't account-wide.
+  // Workspace scope (#25/#10): activity-based signals count within the deployed
+  // workspace only, so they're never account-wide. The scope is fixed to the
+  // deployed workspace (shown as a read-only label); users scope catalogs instead.
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [workspacesAvailable, setWorkspacesAvailable] = useState(true);
   const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
@@ -211,8 +211,20 @@ export default function Scorecard({
       .finally(() => setCatalogsLoading(false));
   }, [wsFilter]);
 
-  // Whether the activity signals will span more than one workspace (drives the note).
-  const multiWorkspace = wsFilter.mode === 'exclude' || wsFilter.workspace_ids.length !== 1;
+  // The workspace the assessment is scoped to (the deployed workspace). Shown as a
+  // read-only label in place of a picker.
+  const scopedWorkspaceName = useMemo(() => {
+    const id = wsFilter.workspace_ids[0];
+    const w = workspaces.find((ws) => ws.is_current) || (id ? workspaces.find((ws) => ws.id === id) : undefined);
+    return w?.name || id || null;
+  }, [workspaces, wsFilter]);
+
+  const scopedWorkspaceLabel = (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600">
+      <Server size={13} className="text-ink-400" />
+      Scoped to <span className="font-medium text-ink-800">{scopedWorkspaceName || 'the deployed workspace'}</span>
+    </span>
+  );
 
   const completedCount = Object.keys(pillarsByKey).length;
   const totalPillars = config.pillars.length;
@@ -426,12 +438,7 @@ export default function Scorecard({
 
       <div className="mt-6 flex flex-col items-center gap-2">
         <div className="flex flex-wrap items-center justify-center gap-2">
-          <WorkspaceFilter
-            workspaces={workspaces}
-            available={workspacesAvailable}
-            value={wsFilter}
-            onChange={setWsFilter}
-          />
+          {scopedWorkspaceLabel}
           <CatalogFilter
             catalogs={catalogs}
             available={catalogsAvailable}
@@ -440,12 +447,6 @@ export default function Scorecard({
             onChange={setCatFilter}
           />
         </div>
-        {multiWorkspace && (
-          <p className="text-[11px] text-ink-400 max-w-md text-center leading-snug">
-            Activity signals (Genie Agents, Adoption, most-accessed) will count across the selected
-            workspaces. Catalog-metadata pillars are metastore-wide and aren't scoped by this filter.
-          </p>
-        )}
       </div>
 
       <div className="text-center">
@@ -501,13 +502,7 @@ export default function Scorecard({
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
-                <WorkspaceFilter
-                  workspaces={workspaces}
-                  available={workspacesAvailable}
-                  value={wsFilter}
-                  onChange={setWsFilter}
-                  disabled={running}
-                />
+                {scopedWorkspaceLabel}
                 <CatalogFilter
                   catalogs={catalogs}
                   available={catalogsAvailable}
