@@ -4,6 +4,8 @@ export interface AIModel {
   id: string;
   label: string;
   provider: string;
+  family: string;
+  open_source: boolean;
 }
 
 export interface ConfigPillar {
