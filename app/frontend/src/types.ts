@@ -58,6 +58,19 @@ export interface DrillDown {
   title: string;
   columns: DrillDownColumn[];
   rows: Record<string, string | number | null>[];
+  // Column keys the drill-down modal offers as slice-by filters (workspace/catalog/schema/agent).
+  dimensions?: string[];
+}
+
+// A catalog accessible to the selected workspaces, for the pre-run catalog filter.
+export interface CatalogInfo {
+  name: string;
+  access: string; // 'OPEN' | 'READ' | 'READ_WRITE' | 'ALL'
+  isolation: string;
+}
+export interface CatalogsResponse {
+  catalogs: CatalogInfo[];
+  available: boolean;
 }
 
 // One SQL statement a pillar ran, for the "view the query" disclosure (#22).

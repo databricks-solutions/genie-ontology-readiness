@@ -27,10 +27,13 @@ import type {
   WorkspaceInfo,
   WorkspaceFilterValue,
   WorkspacesResponse,
+  CatalogInfo,
+  CatalogsResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import PillarDetail from './PillarDetail';
 import WorkspaceFilter from './WorkspaceFilter';
+import CatalogFilter from './CatalogFilter';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
@@ -160,6 +163,12 @@ export default function Scorecard({
   const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
     config.workspace_id ? { mode: 'include', workspace_ids: [config.workspace_id] } : { mode: 'include', workspace_ids: [] }
   );
+  // Catalog filter: options depend on the selected workspaces (bindings), refetched
+  // when the workspace selection changes. Value = selected catalog names ([] = all).
+  const [catalogs, setCatalogs] = useState<CatalogInfo[]>([]);
+  const [catalogsAvailable, setCatalogsAvailable] = useState(true);
+  const [catalogsLoading, setCatalogsLoading] = useState(false);
+  const [catFilter, setCatFilter] = useState<string[]>([]);
 
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
@@ -183,6 +192,24 @@ export default function Scorecard({
       .catch(() => setWorkspacesAvailable(false));
     return () => abortRef.current?.abort();
   }, []);
+
+  // Refetch the catalog options whenever the workspace selection changes, so the
+  // catalog filter always reflects the catalogs bound to the chosen workspaces.
+  useEffect(() => {
+    const include = wsFilter.mode === 'include' && wsFilter.workspace_ids.length > 0;
+    const qs = include
+      ? `?workspace_ids=${encodeURIComponent(wsFilter.workspace_ids.join(','))}&mode=include`
+      : `?mode=${wsFilter.mode}`;
+    setCatalogsLoading(true);
+    apiGet<CatalogsResponse>(`/catalogs${qs}`)
+      .then((r) => {
+        setCatalogs(r.catalogs || []);
+        setCatalogsAvailable(r.available);
+        setCatFilter([]); // reset to "all accessible" for the new workspace scope
+      })
+      .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
+      .finally(() => setCatalogsLoading(false));
+  }, [wsFilter]);
 
   // Whether the activity signals will span more than one workspace (drives the note).
   const multiWorkspace = wsFilter.mode === 'exclude' || wsFilter.workspace_ids.length !== 1;
@@ -229,7 +256,7 @@ export default function Scorecard({
     try {
       for await (const ev of streamPostEvents<AssessEvent>(
         '/assess/stream',
-        { workspace_filter: wsFilter },
+        { workspace_filter: wsFilter, catalogs: catFilter },
         undefined,
         controller.signal
       )) {
@@ -398,12 +425,21 @@ export default function Scorecard({
       </div>
 
       <div className="mt-6 flex flex-col items-center gap-2">
-        <WorkspaceFilter
-          workspaces={workspaces}
-          available={workspacesAvailable}
-          value={wsFilter}
-          onChange={setWsFilter}
-        />
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <WorkspaceFilter
+            workspaces={workspaces}
+            available={workspacesAvailable}
+            value={wsFilter}
+            onChange={setWsFilter}
+          />
+          <CatalogFilter
+            catalogs={catalogs}
+            available={catalogsAvailable}
+            loading={catalogsLoading}
+            value={catFilter}
+            onChange={setCatFilter}
+          />
+        </div>
         {multiWorkspace && (
           <p className="text-[11px] text-ink-400 max-w-md text-center leading-snug">
             Activity signals (Genie Agents, Adoption, most-accessed) will count across the selected
@@ -464,12 +500,20 @@ export default function Scorecard({
                   )}
                 </div>
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
                 <WorkspaceFilter
                   workspaces={workspaces}
                   available={workspacesAvailable}
                   value={wsFilter}
                   onChange={setWsFilter}
+                  disabled={running}
+                />
+                <CatalogFilter
+                  catalogs={catalogs}
+                  available={catalogsAvailable}
+                  loading={catalogsLoading}
+                  value={catFilter}
+                  onChange={setCatFilter}
                   disabled={running}
                 />
                 <button
