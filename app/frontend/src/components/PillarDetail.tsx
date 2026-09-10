@@ -10,6 +10,7 @@ import type {
 } from '../types';
 import GenieTester from './GenieTester';
 import DrillDownModal from './DrillDownModal';
+import SqlModal from './SqlModal';
 
 // A visible "read as" line naming the identity that served this pillar's reads.
 function IdentityLine({ identity }: { identity: SignalIdentity }) {
@@ -121,16 +122,26 @@ function unavailableStyle(reason: UnavailableReason | null) {
 
 export default function PillarDetail({ pillar, config }: { pillar: PillarScore; config: AppConfig }) {
   const [drillOpen, setDrillOpen] = useState(false);
+  const [sqlOpen, setSqlOpen] = useState(false);
   const hasDrill = !!pillar.drill_down && (pillar.drill_down.rows?.length ?? 0) > 0;
   const hasQueries = (pillar.source_queries?.length ?? 0) > 0;
 
-  const modal = drillOpen ? (
+  const drillModal = drillOpen ? (
     <DrillDownModal
       pillarName={pillar.name}
       pillarKey={pillar.key}
       drill={pillar.drill_down}
       queries={pillar.source_queries || []}
       onClose={() => setDrillOpen(false)}
+    />
+  ) : null;
+  // SQL-only overlay for pillars that have no drill-down table (unavailable pillars,
+  // or available pillars whose score came from queries without per-asset rows).
+  const sqlModal = sqlOpen ? (
+    <SqlModal
+      pillarName={pillar.name}
+      queries={pillar.source_queries || []}
+      onClose={() => setSqlOpen(false)}
     />
   ) : null;
 
@@ -147,11 +158,11 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
         </div>
         {pillar.identity && <IdentityLine identity={pillar.identity} />}
         {hasQueries && (
-          <button onClick={() => setDrillOpen(true)} className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs">
+          <button onClick={() => setSqlOpen(true)} className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs">
             <Code size={13} /> View SQL
           </button>
         )}
-        {modal}
+        {sqlModal}
       </div>
     );
   }
@@ -208,16 +219,24 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
         </div>
       )}
 
-      {/* Drill down: opens an overlay with the per-asset table, CSV export, slice-by
-          filters (workspace/catalog/schema) and the SQL behind the score (#10/#22). */}
-      {(hasDrill || hasQueries) && (
+      {/* Drill down: opens an overlay with the per-asset table (sortable, ~10 rows then
+          scroll), slice-by filters (workspace/catalog/schema), CSV export, and a View SQL
+          button (#10/#22). Pillars with no per-asset rows go straight to the SQL overlay. */}
+      {hasDrill ? (
         <button
           onClick={() => setDrillOpen(true)}
           className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs"
         >
-          <Table2 size={14} /> Drill down{hasDrill ? ` (${pillar.drill_down!.rows.length})` : ''}
+          <Table2 size={14} /> Drill down ({pillar.drill_down!.rows.length})
         </button>
-      )}
+      ) : hasQueries ? (
+        <button
+          onClick={() => setSqlOpen(true)}
+          className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs"
+        >
+          <Code size={13} /> View SQL
+        </button>
+      ) : null}
 
       {pillar.key === 'uc_foundation' &&
         Array.isArray(pillar.metrics?.legacy_by_schema) &&
@@ -233,7 +252,8 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
 
       {pillar.key === 'genie_agents' && config.genie_space_configured && <GenieTester />}
 
-      {modal}
+      {drillModal}
+      {sqlModal}
     </div>
   );
 }

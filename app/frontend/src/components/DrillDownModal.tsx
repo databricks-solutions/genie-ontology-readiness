@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, Download, Copy, Check, Code, Database } from 'lucide-react';
+import { X, Download, Code, Database, ChevronUp, ChevronDown } from 'lucide-react';
 import type { DrillDown, SourceQuery } from '../types';
 import { rowsToCsv, downloadCsv, csvFilename } from '../utils/csv';
+import SqlModal from './SqlModal';
 
 type Row = Record<string, string | number | null>;
 
@@ -12,9 +13,10 @@ const DIM_LABEL: Record<string, string> = {
   agent: 'Agent',
 };
 
-// Focused overlay for a pillar's drill-down (#10/#22): a filterable table (slice by
-// workspace/catalog/schema where present), CSV export of the filtered view, and the
-// source SQL with copy-to-clipboard. Opened from the "Drill down" button.
+// Focused overlay for a pillar's drill-down (#10/#22): a filterable, sortable table
+// (slice by workspace/catalog/schema where present), CSV export of the current view,
+// and a "View SQL" button that opens the source SQL in its own overlay. Opened from
+// the "Drill down" button.
 export default function DrillDownModal({
   pillarName,
   pillarKey,
@@ -29,15 +31,17 @@ export default function DrillDownModal({
   onClose: () => void;
 }) {
   const [filters, setFilters] = useState<Record<string, string>>({});
-  const [copied, setCopied] = useState<number | null>(null);
+  const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(null);
+  const [sqlOpen, setSqlOpen] = useState(false);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose();
+      // Let the SQL overlay handle Escape while it's open, so it closes first.
+      if (e.key === 'Escape' && !sqlOpen) onClose();
     }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  }, [onClose, sqlOpen]);
 
   const dims = drill?.dimensions ?? [];
   const rows: Row[] = drill?.rows ?? [];
@@ -54,123 +58,140 @@ export default function DrillDownModal({
     [rows, dims, filters]
   );
 
-  async function copy(sql: string, i: number) {
-    await navigator.clipboard.writeText(sql);
-    setCopied(i);
-    setTimeout(() => setCopied((c) => (c === i ? null : c)), 1500);
+  // Sort the filtered rows on raw cell values: numeric compare when the column holds
+  // numbers, else locale string compare; nulls always sort last.
+  const sorted = useMemo(() => {
+    if (!sort) return filtered;
+    const { key, dir } = sort;
+    const mul = dir === 'asc' ? 1 : -1;
+    const sample = filtered.find((r) => r[key] !== null && r[key] !== undefined)?.[key];
+    const numeric = typeof sample === 'number';
+    return [...filtered].sort((a, b) => {
+      const av = a[key];
+      const bv = b[key];
+      if (av === null || av === undefined) return 1;
+      if (bv === null || bv === undefined) return -1;
+      if (numeric) return (Number(av) - Number(bv)) * mul;
+      return String(av).localeCompare(String(bv)) * mul;
+    });
+  }, [filtered, sort]);
+
+  function toggleSort(key: string) {
+    setSort((s) => (s && s.key === key ? { key, dir: s.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' }));
   }
 
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+  const viewSqlButton = queries.length > 0 && (
+    <button
+      onClick={() => setSqlOpen(true)}
+      className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs"
     >
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
-        <div className="flex items-center justify-between gap-2 px-5 py-3 border-b border-gray-100">
-          <h3 className="flex items-center gap-2 text-sm font-semibold text-ink-900">
-            <Database size={16} className="text-databricks-500" />
-            {pillarName} — {drill?.title || 'details'}
-          </h3>
-          <button onClick={onClose} className="text-ink-400 hover:text-ink-700"><X size={18} /></button>
-        </div>
+      <Code size={13} /> View SQL
+    </button>
+  );
 
-        <div className="px-5 py-4 overflow-y-auto space-y-4">
-          {drill && drill.rows.length > 0 ? (
-            <>
-              {/* Slice-by filters + CSV export */}
-              <div className="flex flex-wrap items-end gap-3">
-                {dims.map((d) => {
-                  const opts = Array.from(new Set(rowsExcept(d).map((r) => String(r[d] ?? '')))).filter(Boolean).sort();
-                  return (
-                    <label key={d} className="flex flex-col gap-1 text-[11px] text-ink-500">
-                      {DIM_LABEL[d] || d}
-                      <select
-                        value={filters[d] || ''}
-                        onChange={(e) => setFilters((f) => ({ ...f, [d]: e.target.value }))}
-                        className="rounded-md border border-gray-200 px-2 py-1 text-xs text-ink-800 bg-white min-w-[140px]"
-                      >
-                        <option value="">All</option>
-                        {opts.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    </label>
-                  );
-                })}
-                <div className="flex-1" />
-                <button
-                  onClick={() => downloadCsv(csvFilename(pillarKey), rowsToCsv(drill.columns, filtered))}
-                  className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs"
-                >
-                  <Download size={13} /> Export CSV
-                </button>
-              </div>
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+        onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      >
+        <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
+          <div className="flex items-center justify-between gap-2 px-5 py-3 border-b border-gray-100">
+            <h3 className="flex items-center gap-2 text-sm font-semibold text-ink-900">
+              <Database size={16} className="text-databricks-500" />
+              {pillarName} — {drill?.title || 'details'}
+            </h3>
+            <button onClick={onClose} className="text-ink-400 hover:text-ink-700"><X size={18} /></button>
+          </div>
 
-              <div className="text-[11px] text-ink-400">{filtered.length} of {rows.length} rows</div>
+          <div className="px-5 py-4 overflow-y-auto space-y-4">
+            {drill && drill.rows.length > 0 ? (
+              <>
+                {/* Slice-by filters + CSV export + View SQL */}
+                <div className="flex flex-wrap items-end gap-3">
+                  {dims.map((d) => {
+                    const opts = Array.from(new Set(rowsExcept(d).map((r) => String(r[d] ?? '')))).filter(Boolean).sort();
+                    return (
+                      <label key={d} className="flex flex-col gap-1 text-[11px] text-ink-500">
+                        {DIM_LABEL[d] || d}
+                        <select
+                          value={filters[d] || ''}
+                          onChange={(e) => setFilters((f) => ({ ...f, [d]: e.target.value }))}
+                          className="rounded-md border border-gray-200 px-2 py-1 text-xs text-ink-800 bg-white min-w-[140px]"
+                        >
+                          <option value="">All</option>
+                          {opts.map((o) => <option key={o} value={o}>{o}</option>)}
+                        </select>
+                      </label>
+                    );
+                  })}
+                  <div className="flex-1" />
+                  <button
+                    onClick={() => downloadCsv(csvFilename(pillarKey), rowsToCsv(drill.columns, sorted))}
+                    className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs"
+                  >
+                    <Download size={13} /> Export CSV
+                  </button>
+                  {viewSqlButton}
+                </div>
 
-              <div className="overflow-x-auto rounded-md border border-gray-200">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="bg-gray-50 text-left">
-                      {drill.columns.map((c) => (
-                        <th key={c.key} className="px-3 py-2 text-xs font-semibold text-ink-600 whitespace-nowrap">
-                          {c.label}{c.unit ? <span className="text-ink-400 font-normal"> ({c.unit})</span> : null}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filtered.map((r, i) => (
-                      <tr key={i} className="border-t border-gray-100">
-                        {drill.columns.map((c, j) => (
-                          <td
-                            key={c.key}
-                            className={`px-3 py-1.5 ${j === 0 ? 'text-ink-800 font-mono text-xs' : 'text-right tabular-nums text-ink-700'}`}
-                          >
-                            {r[c.key] === null || r[c.key] === undefined ? '—' : `${r[c.key]}${c.unit ? c.unit : ''}`}
-                          </td>
-                        ))}
+                <div className="text-[11px] text-ink-400">
+                  {filtered.length} of {rows.length} rows{filtered.length > 10 ? ' — scroll for more' : ''}
+                </div>
+
+                <div className="overflow-auto max-h-[360px] rounded-md border border-gray-200">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 z-10">
+                      <tr className="text-left">
+                        {drill.columns.map((c) => {
+                          const active = sort?.key === c.key;
+                          return (
+                            <th
+                              key={c.key}
+                              onClick={() => toggleSort(c.key)}
+                              aria-sort={active ? (sort!.dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+                              className="px-3 py-2 text-xs font-semibold text-ink-600 whitespace-nowrap cursor-pointer select-none bg-gray-50 hover:bg-gray-100"
+                              title="Sort by this column"
+                            >
+                              <span className="inline-flex items-center gap-1">
+                                {c.label}{c.unit ? <span className="text-ink-400 font-normal"> ({c.unit})</span> : null}
+                                {active ? (sort!.dir === 'asc' ? <ChevronUp size={12} /> : <ChevronDown size={12} />) : null}
+                              </span>
+                            </th>
+                          );
+                        })}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {sorted.map((r, i) => (
+                        <tr key={i} className="border-t border-gray-100">
+                          {drill.columns.map((c, j) => (
+                            <td
+                              key={c.key}
+                              className={`px-3 py-1.5 ${j === 0 ? 'text-ink-800 font-mono text-xs' : 'text-right tabular-nums text-ink-700'}`}
+                            >
+                              {r[c.key] === null || r[c.key] === undefined ? '—' : `${r[c.key]}${c.unit ? c.unit : ''}`}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-ink-400">No drill-down data for this pillar.</p>
+                {viewSqlButton}
               </div>
-            </>
-          ) : (
-            <p className="text-sm text-ink-400">No drill-down data for this pillar.</p>
-          )}
-
-          {/* Source SQL with copy-to-clipboard */}
-          {queries.length > 0 && (
-            <div className="pt-2 border-t border-gray-100">
-              <h4 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-400 mb-2">
-                <Code size={13} /> SQL behind this score
-              </h4>
-              <div className="space-y-2">
-                {queries.map((q, i) => (
-                  <div key={i} className="rounded-md border border-gray-200 overflow-hidden">
-                    <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-gray-50 border-b border-gray-100">
-                      <span className="text-[11px] font-medium text-ink-600">Query {i + 1}</span>
-                      <button
-                        onClick={() => copy(q.sql, i)}
-                        className="inline-flex items-center gap-1 rounded bg-white border border-gray-200 hover:bg-databricks-50 hover:text-databricks-700 px-1.5 py-0.5 text-[11px] text-ink-600 transition-colors"
-                        title="Copy query"
-                      >
-                        {copied === i ? <Check size={12} /> : <Copy size={12} />}
-                        {copied === i ? 'Copied' : 'Copy'}
-                      </button>
-                    </div>
-                    <pre className="bg-ink-900 text-gray-100 text-[11px] leading-relaxed p-3 overflow-x-auto whitespace-pre-wrap">
-                      {q.sql}
-                      {q.parameters && Object.keys(q.parameters).length > 0
-                        ? `\n-- parameters: ${JSON.stringify(q.parameters)}`
-                        : ''}
-                    </pre>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
-    </div>
+
+      {sqlOpen && (
+        <SqlModal pillarName={pillarName} queries={queries} onClose={() => setSqlOpen(false)} />
+      )}
+    </>
   );
 }
