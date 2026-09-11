@@ -32,7 +32,7 @@ import json
 import logging
 import aiohttp
 
-from server.sql_client import execute_sql, record_rest_identity, _is_authz_error
+from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
 from server.config import (
     get_workspace_host,
     get_auth_headers,
@@ -65,13 +65,30 @@ def _empty(note: str, reason: str | None = None) -> dict:
             "metrics": {}, "unavailable_reason": reason}
 
 
+def _is_not_enabled(exc: Exception) -> bool:
+    """Heuristic: the read failed because the table/schema doesn't exist — e.g. a
+    system schema (system.access / system.query) that isn't enabled on the
+    metastore — rather than an access denial. Used to render the neutral
+    'not available' state instead of a red 'insufficient permission' lock (#20)."""
+    m = str(exc).lower()
+    return any(k in m for k in (
+        "table_or_view_not_found", "schema_not_found", "does not exist",
+        "not found", "no such table", "no such schema", "cannot be found",
+    ))
+
+
 def _reason_for(exc: Exception) -> str:
     """Classify a probe read failure for the availability state (issue #20).
 
     Reuses execute_sql's authorization detection: an authz/permission failure ->
-    'insufficient_permission' (the SP or viewer lacks a grant); anything else
+    'insufficient_permission' (the SP or viewer lacks a grant); a missing
+    table/schema (system tables not enabled) -> 'not_enabled'; anything else
     (timeout, warehouse down, bad response) -> 'scan_failed'."""
-    return "insufficient_permission" if _is_authz_error(exc) else "scan_failed"
+    if _is_authz_error(exc):
+        return "insufficient_permission"
+    if _is_not_enabled(exc):
+        return "not_enabled"
+    return "scan_failed"
 
 
 # Column keys that the drill-down modal offers as slice-by filters.
@@ -516,6 +533,17 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
     batch completes within _METADATA_NO_PROGRESS_TIMEOUT."""
     batches = [catalogs[i:i + _METADATA_BATCH_SIZE] for i in range(0, len(catalogs), _METADATA_BATCH_SIZE)]
     total_cats = len(catalogs)
+    # Record ONE representative column-coverage query for the "View SQL" disclosure;
+    # the real scan below runs this per catalog batch (record=False) so the disclosure
+    # shows the query shape once rather than one near-identical row per batch.
+    _cov_view = "system.information_schema.columns" if system_ok else "<catalog>.information_schema.columns"
+    record_query(
+        "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
+        "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
+        f"FROM {_cov_view} WHERE table_catalog IN (:catalogs) "
+        "AND table_schema <> 'information_schema' GROUP BY table_catalog, table_schema",
+        {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches"},
+    )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = failed_cats = 0
     per_schema: dict[tuple[str, str], tuple[int, int]] = {}
@@ -523,7 +551,10 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
     async def _one(batch: list[str]) -> tuple[int, int, int, bool, list[dict]]:
         async with sem:
             try:
-                rows = await execute_sql(_coverage_query("columns", batch, system_ok))
+                # record=False: the per-batch queries differ only in their catalog
+                # list, so we record ONE representative below instead of one row per
+                # batch in the "View SQL" disclosure.
+                rows = await execute_sql(_coverage_query("columns", batch, system_ok), record=False)
                 bt = sum(int(r.get("total") or 0) for r in rows)
                 bc = sum(int(r.get("commented") or 0) for r in rows)
                 return len(batch), bt, bc, True, rows
@@ -590,21 +621,35 @@ async def probe_metadata() -> dict:
         system_ok = bool(s.get("system_ok"))
         catalogs = s.get("catalogs") or []
 
-        # Table comment coverage — one fast query. In system mode the metastore-wide
-        # tables view also spans internal catalogs (system/samples/…), but column
-        # coverage below is scoped to the enumerated non-internal catalogs; exclude
-        # the same internal catalogs here so both halves of the 50/50 score measure
-        # the same population. (Per-catalog _src is already scoped to that list.)
+        # Table comment coverage — ONE grouped scan that yields BOTH the headline
+        # totals and the per-schema breakdown for the drill-down (#10), so table
+        # metadata isn't scanned twice (the drill-down previously re-ran this exact
+        # scan). In system mode the metastore-wide tables view also spans internal
+        # catalogs (system/samples/…), but column coverage below is scoped to the
+        # enumerated non-internal catalogs; exclude the same internal catalogs here
+        # so both halves of the 50/50 score measure the same population. (Per-catalog
+        # _src is already scoped to that list.)
         if system_ok:
             internal_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-            tables_query = (_COV_SELECT + "system.information_schema.tables "
-                            "WHERE table_schema <> 'information_schema' "
-                            f"AND table_catalog NOT IN ({internal_list})")
+            tables_src, tables_where = ("system.information_schema.tables",
+                                        "WHERE table_schema <> 'information_schema' "
+                                        f"AND table_catalog NOT IN ({internal_list})")
         else:
-            tables_query = _COV_SELECT + f"{tbl} WHERE table_schema <> 'information_schema'"
-        rows = await execute_sql(tables_query)
-        t_total = int(rows[0].get("total") or 0)
-        t_commented = int(rows[0].get("commented") or 0)
+            tables_src, tables_where = tbl, "WHERE table_schema <> 'information_schema'"
+        trows = await execute_sql(
+            "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
+            "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
+            f"FROM {tables_src} {tables_where} GROUP BY table_catalog, table_schema"
+        )
+        table_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
+        t_total = t_commented = 0
+        for r in trows:
+            tot, com = int(r.get("total") or 0), int(r.get("commented") or 0)
+            t_total += tot
+            t_commented += com
+            cat, sch = r.get("cat"), r.get("sch")
+            if cat and sch:
+                table_per_schema[(cat, sch)] = (tot, com)
 
         # Heavy read — scan columns coverage in per-catalog batches so a wide
         # metastore fills in progressively instead of timing out on one big scan.
@@ -652,19 +697,8 @@ async def probe_metadata() -> dict:
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
-        table_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
-        try:
-            trows = await execute_sql(
-                f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
-                f"SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
-                f"FROM {tbl} WHERE table_schema <> 'information_schema' {_internal_catalog_filter(s)}"
-                f"GROUP BY table_catalog, table_schema"
-            )
-            table_per_schema = {(r.get("cat"), r.get("sch")): (int(r.get("total") or 0), int(r.get("commented") or 0))
-                                for r in trows if r.get("cat") and r.get("sch")}
-        except Exception as e:
-            logger.info(f"metadata per-schema table coverage failed: {str(e)[:80]}")
-
+        # table_per_schema was populated by the grouped headline scan above (no re-scan);
+        # col_per_schema comes from the column-coverage scan.
         drill_rows = []
         for (cat, sch) in sorted(set(table_per_schema) | set(col_per_schema)):
             t_tot, t_com = table_per_schema.get((cat, sch), (0, 0))
@@ -1394,6 +1428,10 @@ async def probe_domains() -> dict:
 async def probe_adoption() -> dict:
     wsf, wparams = workspace_predicate()
     try:
+        # Keep the last read failure so we can classify WHY both signals came back
+        # empty (issue #20): system tables not enabled vs. a grant the SP/viewer
+        # lacks — the two render differently in the UI.
+        last_err: Exception | None = None
         active_users = None
         try:
             # System tables default to OBO like every other signal; if the viewer
@@ -1404,8 +1442,9 @@ async def probe_adoption() -> dict:
                 f"WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}",
                 parameters=wparams,
             )
-        except Exception:
+        except Exception as e:
             active_users = None
+            last_err = e
 
         queries_30d = None
         try:
@@ -1414,8 +1453,9 @@ async def probe_adoption() -> dict:
                 f"WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}",
                 parameters=wparams,
             )
-        except Exception:
+        except Exception as e:
             queries_30d = None
+            last_err = e
 
         if active_users is None and queries_30d is None:
             # Neither read returned. Under OBO the read ran as the viewer and, on an
@@ -1427,8 +1467,12 @@ async def probe_adoption() -> dict:
                    "signal) or your user account"
                    if get_user_token()
                    else "the app service principal")
+            # Classify WHY (issue #20): a missing system schema (not enabled) renders
+            # as neutral "not available", an authz denial as "insufficient permission",
+            # rather than always claiming a grant is missing.
+            reason = _reason_for(last_err) if last_err is not None else "not_enabled"
             return _empty("System tables (system.access / system.query) are not enabled "
-                          f"or not granted to {who}.", reason="insufficient_permission")
+                          f"or not granted to {who}.", reason=reason)
 
         # Band the (time-windowed) activity counts into fixed tiers so day-to-day
         # drift rarely moves the score — keeps runs comparable while still

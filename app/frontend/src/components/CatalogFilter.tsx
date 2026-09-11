@@ -5,7 +5,9 @@ import type { CatalogInfo } from '../types';
 // Pre-run catalog filter: which catalogs the metadata pillars assess. Its options
 // are the catalogs accessible to the selected workspaces (UC bindings + OPEN),
 // so the parent refetches this list whenever the workspace selection changes.
-// Value is a list of catalog names; empty means "all accessible".
+// Value is the explicit list of selected catalog names; empty means NO filter —
+// the assessment scans all accessible catalogs. The "All catalogs" control is a
+// select-all / clear-all lever; checking specific catalogs narrows the scan.
 const ACCESS_BADGE: Record<string, string> = {
   READ_WRITE: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   READ: 'bg-sky-50 text-sky-700 border-sky-200',
@@ -47,24 +49,19 @@ export default function CatalogFilter({
     return q ? catalogs.filter((c) => c.name.toLowerCase().includes(q)) : catalogs;
   }, [query, catalogs]);
 
-  const allSelected = value.length === 0 || value.length === catalogs.length;
+  const allSelected = catalogs.length > 0 && value.length === catalogs.length;
   const summary =
     catalogs.length === 0
       ? 'No catalogs'
-      : allSelected
-      ? `All ${catalogs.length} catalogs`
+      : value.length === 0 || allSelected
+      ? `All ${catalogs.length} catalogs` // empty = no filter = assess all
       : `${value.length} of ${catalogs.length} catalogs`;
 
   function toggle(name: string) {
-    // Represent selection as an explicit list; toggling from "all" (empty) starts
-    // from the full set so the user can deselect from everything.
-    const base = value.length === 0 ? allNames : value;
-    const next = selectedSet.has(name) && value.length !== 0
-      ? base.filter((n) => n !== name)
-      : value.length === 0
-      ? base.filter((n) => n !== name)
-      : [...base, name];
-    onChange(next.length === catalogs.length ? [] : next);
+    // Explicit selection: empty means none. Plain add/remove — no "empty == all"
+    // magic, so a single catalog can be checked or unchecked without the list
+    // snapping back to everything.
+    onChange(selectedSet.has(name) ? value.filter((n) => n !== name) : [...value, name]);
   }
 
   return (
@@ -90,15 +87,19 @@ export default function CatalogFilter({
               catalogs the app can see.
             </p>
           )}
-          <div className="flex items-center gap-2 text-[11px]">
-            <button className="text-databricks-600 hover:underline" onClick={() => onChange([])}>All catalogs</button>
-            {value.length > 0 && (
-              <>
-                <span className="text-ink-300">·</span>
-                <button className="text-ink-500 hover:underline" onClick={() => onChange(allNames.slice(0, 1))}>Only first</button>
-              </>
-            )}
+          <div className="flex items-center justify-between gap-2 text-[11px]">
+            {/* Lever: select every catalog, or clear back to no filter (= all). */}
+            <button
+              className="text-databricks-600 hover:underline font-medium"
+              onClick={() => onChange(allSelected ? [] : allNames)}
+            >
+              {allSelected ? 'Clear all' : `Select all ${catalogs.length}`}
+            </button>
+            <span className="text-ink-400">{value.length === 0 ? 'assessing all' : `${value.length} selected`}</span>
           </div>
+          {value.length === 0 && (
+            <p className="text-[11px] text-ink-400">No catalogs selected — the assessment scans all {catalogs.length}.</p>
+          )}
           <div className="flex items-center gap-1.5 rounded-md border border-gray-200 px-2 py-1">
             <Search size={13} className="text-ink-400 shrink-0" />
             <input
@@ -113,7 +114,7 @@ export default function CatalogFilter({
               <p className="text-[11px] text-ink-400 px-2 py-2">No catalogs.</p>
             ) : (
               shown.map((c) => {
-                const on = value.length === 0 || selectedSet.has(c.name);
+                const on = selectedSet.has(c.name);
                 return (
                   <button
                     key={c.name}

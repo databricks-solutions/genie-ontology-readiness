@@ -265,9 +265,12 @@ def _derive_label_and_provider(model_id: str) -> tuple[str, str]:
 # Model-family classification for the grouped picker: (family, open_source),
 # matched by keyword on the (lowercased) endpoint id. Proprietary vs open-source
 # is a property of the family, not the provider (Google ships both Gemini
-# [proprietary] and Gemma [open]). Order matters — check gemma before gemini.
+# [proprietary] and Gemma [open], and OpenAI ships both GPT [proprietary] and
+# gpt-oss [open]). Order matters — the more specific open-weight tokens must
+# come before their proprietary parent: gpt-oss before gpt, gemma before gemini.
 _FAMILY_RULES = (
     ("claude", ("Claude", False)),
+    ("gpt-oss", ("GPT", True)),   # OpenAI open-weight — must precede the "gpt" rule
     ("gpt", ("GPT", False)),
     ("gemma", ("Gemma", True)),
     ("gemini", ("Gemini", False)),
@@ -275,6 +278,8 @@ _FAMILY_RULES = (
     ("qwen", ("Qwen", True)),
     ("mixtral", ("Mistral", True)),
     ("mistral", ("Mistral", True)),
+    ("deepseek", ("DeepSeek", True)),
+    ("phi", ("Phi", True)),
     ("dbrx", ("DBRX", True)),
 )
 

@@ -16,6 +16,24 @@ class QueryCaptureTest(unittest.TestCase):
         self.assertEqual(caps[0]["parameters"], {"a": "5"})
         self.assertNotIn("parameters", caps[1])
 
+    def test_capture_dedups_identical_statements(self):
+        # The drill-down "View SQL" disclosure should show each distinct query once,
+        # not one row per identical repeated statement (per-batch scans, etc.).
+        # Run in a copied context so start_query_capture() doesn't leak into other tests.
+        import contextvars
+
+        def _run():
+            sql_client.start_query_capture()
+            sql_client.record_query("SELECT 1 FROM t", {"a": 1})
+            sql_client.record_query("SELECT 1 FROM t", {"a": 1})  # exact dup
+            sql_client.record_query("SELECT 1 FROM t", {"a": 2})  # same sql, different param
+            sql_client.record_query("SELECT 2 FROM u")
+            return sql_client.captured_queries()
+
+        caps = contextvars.copy_context().run(_run)
+        self.assertEqual(len(caps), 3)  # the exact dup collapsed; the rest kept
+        self.assertEqual(caps[0]["sql"], "SELECT 1 FROM t")
+
     def test_capture_noop_without_start(self):
         # Fresh context with no start_query_capture → recording is a no-op, not an error.
         import contextvars

@@ -72,9 +72,23 @@ def record_query(sql: str, parameters: Optional[dict[str, Any]] = None) -> None:
 
 
 def captured_queries() -> list[dict]:
-    """The statements recorded since start_query_capture() (may be empty)."""
+    """The distinct statements recorded since start_query_capture() (may be empty).
+
+    Deduplicated by SQL text + parameters, preserving first-seen order, so the
+    "SQL behind this score" disclosure shows each representative query once
+    instead of one row per identical repeated statement."""
     rec = _query_recorder.get()
-    return list(rec) if rec else []
+    if not rec:
+        return []
+    seen: set = set()
+    out: list[dict] = []
+    for e in rec:
+        key = (e.get("sql"), tuple(sorted((e.get("parameters") or {}).items())))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
 
 
 def resolved_identity() -> Optional[dict]:
@@ -116,7 +130,7 @@ def resolved_identity() -> Optional[dict]:
             "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
-async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False) -> list[dict]:
+async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False, record: bool = True) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
     Identity model — every signal defaults to on-behalf-of-user (OBO):
@@ -138,7 +152,10 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     """
     # Record the statement for the "SQL behind this score" disclosure. Best-effort,
     # scoped to the probe task; a no-op when capture isn't active (e.g. unit tests).
-    record_query(query, parameters)
+    # record=False lets a chunked scan (e.g. per-catalog batches) opt out and record
+    # a single representative query instead of one row per near-identical batch.
+    if record:
+        record_query(query, parameters)
 
     # Override: SP only, no OBO attempt, no fallback. Either the per-call override
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).

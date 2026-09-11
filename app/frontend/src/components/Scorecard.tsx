@@ -216,7 +216,7 @@ export default function Scorecard({
       .then((r) => {
         setCatalogs(r.catalogs || []);
         setCatalogsAvailable(r.available);
-        setCatFilter([]); // reset to "all accessible" for the new workspace scope
+        setCatFilter([]); // reset to no filter (empty = assess all) for the new workspace scope
       })
       .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
       .finally(() => setCatalogsLoading(false));
