@@ -12,6 +12,7 @@ import type { Scorecard as ScorecardType } from './types';
 import Scorecard from './components/Scorecard';
 import CapabilityExplainer from './components/CapabilityExplainer';
 import PlanWizard from './components/PlanWizard';
+import ModelPickerModal from './components/ModelPickerModal';
 import HelpButton from './components/HelpButton';
 import Spinner from './components/Spinner';
 
@@ -27,6 +28,7 @@ export default function App() {
   const { config, error, loading } = useConfig();
   const [tab, setTab] = useState<Tab>('assess');
   const [model, setModel] = useState<string>('');
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [scorecard, setScorecard] = useState<ScorecardType | null>(null);
   // Mount PlanWizard on first Plan visit and keep it mounted (hidden when
   // inactive) so its conversation + generated plan persist across tab switches.
@@ -57,6 +59,7 @@ export default function App() {
   }
 
   const activeModel = model || config.default_model;
+  const activeModelLabel = config.ai_models.find((m) => m.id === activeModel)?.label || activeModel;
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -74,21 +77,18 @@ export default function App() {
               </div>
             </div>
 
-            {/* Model selector */}
-            <div className="relative">
-              <select
-                value={activeModel}
-                onChange={(e) => setModel(e.target.value)}
-                className="appearance-none bg-ink-800 border border-ink-700 text-white text-sm rounded-md pl-3 pr-8 py-1.5 focus:outline-none focus:ring-2 focus:ring-databricks-400 cursor-pointer"
+            {/* Model selector — opens a grouped picker overlay */}
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-ink-300 hidden sm:inline">Model</span>
+              <button
+                type="button"
+                onClick={() => setModelPickerOpen(true)}
+                className="flex items-center gap-2 bg-ink-800 border border-ink-700 text-white text-sm rounded-md pl-3 pr-2 py-1.5 hover:bg-ink-700 focus:outline-none focus:ring-2 focus:ring-databricks-400"
                 title="AI model used to generate the plan"
               >
-                {config.ai_models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label} · {m.provider}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown size={15} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-ink-300" />
+                <span className="max-w-[180px] truncate">{activeModelLabel}</span>
+                <ChevronDown size={15} className="text-ink-300 shrink-0" />
+              </button>
             </div>
           </div>
 
@@ -128,6 +128,15 @@ export default function App() {
       </main>
 
       <HelpButton config={config} />
+
+      {modelPickerOpen && (
+        <ModelPickerModal
+          models={config.ai_models}
+          value={activeModel}
+          onSelect={setModel}
+          onClose={() => setModelPickerOpen(false)}
+        />
+      )}
     </div>
   );
 }

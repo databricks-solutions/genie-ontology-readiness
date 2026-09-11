@@ -12,7 +12,7 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -24,9 +24,16 @@ import type {
   HistoryResponse,
   HistorySnapshot,
   SnapshotResponse,
+  WorkspaceInfo,
+  WorkspaceFilterValue,
+  WorkspacesResponse,
+  CatalogInfo,
+  CatalogsResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
+import { downloadAllZip } from '../utils/exportAll';
 import PillarDetail from './PillarDetail';
+import CatalogFilter from './CatalogFilter';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
@@ -149,6 +156,21 @@ export default function Scorecard({
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // Workspace scope (#25/#10): activity-based signals count within the deployed
+  // workspace only, so they're never account-wide. The scope is fixed to the
+  // deployed workspace (shown as a read-only label); users scope catalogs instead.
+  const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
+  const [wsFilter, setWsFilter] = useState<WorkspaceFilterValue>(
+    config.workspace_id ? { mode: 'include', workspace_ids: [config.workspace_id] } : { mode: 'include', workspace_ids: [] }
+  );
+  // Catalog filter: options depend on the selected workspaces (bindings), refetched
+  // when the workspace selection changes. Value = selected catalog names ([] = all).
+  const [catalogs, setCatalogs] = useState<CatalogInfo[]>([]);
+  const [catalogsAvailable, setCatalogsAvailable] = useState(true);
+  const [catalogsLoading, setCatalogsLoading] = useState(false);
+  const [catFilter, setCatFilter] = useState<string[]>([]);
+  const [zipBusy, setZipBusy] = useState(false);
+
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
     if (!config.lakebase_enabled) return;
@@ -157,10 +179,63 @@ export default function Scorecard({
       .catch(() => {});
   }
 
+  // Export every pillar at once: a ZIP with summary.csv + one CSV per pillar that
+  // has drill-down rows (in canonical pillar order).
+  async function handleExportAll() {
+    setZipBusy(true);
+    try {
+      await downloadAllZip(config.pillars.map((cp) => pillarsByKey[cp.key]).filter(Boolean));
+    } finally {
+      setZipBusy(false);
+    }
+  }
+
   useEffect(() => {
     refreshHistory();
+    apiGet<WorkspacesResponse>('/workspaces')
+      .then((r) => {
+        setWorkspaces(r.workspaces || []);
+        // Seed the default selection to the current workspace if the config didn't.
+        if (!config.workspace_id && r.current_workspace_id) {
+          setWsFilter({ mode: 'include', workspace_ids: [r.current_workspace_id] });
+        }
+      })
+      .catch(() => {});
     return () => abortRef.current?.abort();
   }, []);
+
+  // Refetch the catalog options whenever the workspace selection changes, so the
+  // catalog filter always reflects the catalogs bound to the chosen workspaces.
+  useEffect(() => {
+    const include = wsFilter.mode === 'include' && wsFilter.workspace_ids.length > 0;
+    const qs = include
+      ? `?workspace_ids=${encodeURIComponent(wsFilter.workspace_ids.join(','))}&mode=include`
+      : `?mode=${wsFilter.mode}`;
+    setCatalogsLoading(true);
+    apiGet<CatalogsResponse>(`/catalogs${qs}`)
+      .then((r) => {
+        setCatalogs(r.catalogs || []);
+        setCatalogsAvailable(r.available);
+        setCatFilter([]); // reset to no filter (empty = assess all) for the new workspace scope
+      })
+      .catch(() => { setCatalogs([]); setCatalogsAvailable(false); })
+      .finally(() => setCatalogsLoading(false));
+  }, [wsFilter]);
+
+  // The workspace the assessment is scoped to (the deployed workspace). Shown as a
+  // read-only label in place of a picker.
+  const scopedWorkspaceName = useMemo(() => {
+    const id = wsFilter.workspace_ids[0];
+    const w = workspaces.find((ws) => ws.is_current) || (id ? workspaces.find((ws) => ws.id === id) : undefined);
+    return w?.name || id || null;
+  }, [workspaces, wsFilter]);
+
+  const scopedWorkspaceLabel = (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-ink-600 max-w-[240px]">
+      <Server size={13} className="text-ink-400 shrink-0" />
+      <span className="truncate">Scoped to <span className="font-medium text-ink-800">{scopedWorkspaceName || 'the deployed workspace'}</span></span>
+    </span>
+  );
 
   const completedCount = Object.keys(pillarsByKey).length;
   const totalPillars = config.pillars.length;
@@ -204,7 +279,7 @@ export default function Scorecard({
     try {
       for await (const ev of streamPostEvents<AssessEvent>(
         '/assess/stream',
-        {},
+        { workspace_filter: wsFilter, catalogs: catFilter },
         undefined,
         controller.signal
       )) {
@@ -372,13 +447,26 @@ export default function Scorecard({
         )}
       </div>
 
+      <div className="mt-6 flex flex-col items-center gap-2">
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          {scopedWorkspaceLabel}
+          <CatalogFilter
+            catalogs={catalogs}
+            available={catalogsAvailable}
+            loading={catalogsLoading}
+            value={catFilter}
+            onChange={setCatFilter}
+          />
+        </div>
+      </div>
+
       <div className="text-center">
         {error && (
           <p className="mt-4 text-sm text-red-600 flex items-center justify-center gap-1.5">
             <AlertTriangle size={14} /> {error}
           </p>
         )}
-        <button onClick={run} className="btn-primary mt-6 inline-flex items-center gap-2">
+        <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
           <Play size={16} /> Run assessment
         </button>
       </div>
@@ -407,30 +495,48 @@ export default function Scorecard({
           </div>
         ) : (
           overall && (
-            <div className="flex flex-col md:flex-row gap-6 items-center md:items-start">
-              <Gauge score={overall.score} color={scoreColor(overall.score)} />
-              <div className="flex-1 text-center md:text-left">
-                <div className="flex items-center justify-center md:justify-start gap-3 mb-1">
-                  <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
-                  <LevelBadge level={overall.level} label={overall.level_label} />
-                </div>
-                <p className="text-sm text-ink-600 leading-relaxed max-w-2xl">{overall.readiness_detail}</p>
-                <div className="flex items-center gap-3 flex-wrap mt-2">
-                  {config.assess_catalogs.length > 0 && (
-                    <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
-                  )}
-                  {overall.assessed_at && (
-                    <p className="text-xs text-ink-400">Assessed {fmtWhen(overall.assessed_at)}</p>
-                  )}
+            <div className="flex flex-col gap-4">
+              {/* Top: title + subtext + score, with the orange re-run button next to the title.
+                  min-w-0 lets the text column shrink and wrap cleanly. */}
+              <div className="flex flex-col sm:flex-row sm:items-start gap-6">
+                <Gauge score={overall.score} color={scoreColor(overall.score)} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between gap-3 flex-wrap mb-1">
+                    <div className="flex items-center gap-3 flex-wrap min-w-0">
+                      <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
+                      <LevelBadge level={overall.level} label={overall.level_label} />
+                    </div>
+                    <button
+                      onClick={run}
+                      disabled={running}
+                      className="btn-primary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs shrink-0"
+                    >
+                      <RefreshCw size={14} /> New assessment
+                    </button>
+                  </div>
+                  <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
+                  <div className="flex items-center gap-3 flex-wrap mt-2">
+                    {config.assess_catalogs.length > 0 && (
+                      <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
+                    )}
+                    {overall.assessed_at && (
+                      <p className="text-xs text-ink-400">Assessed {fmtWhen(overall.assessed_at)}</p>
+                    )}
+                  </div>
                 </div>
               </div>
-              <button
-                onClick={run}
-                disabled={running}
-                className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs shrink-0"
-              >
-                <RefreshCw size={14} /> New assessment
-              </button>
+              {/* Bottom: the scope controls (workspace + catalogs). */}
+              <div className="flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3">
+                {scopedWorkspaceLabel}
+                <CatalogFilter
+                  catalogs={catalogs}
+                  available={catalogsAvailable}
+                  loading={catalogsLoading}
+                  value={catFilter}
+                  onChange={setCatFilter}
+                  disabled={running}
+                />
+              </div>
             </div>
           )
         )}
@@ -498,7 +604,20 @@ export default function Scorecard({
 
       {/* Pillar cards — all pillars in canonical order; skeleton until each arrives */}
       <div className="space-y-3">
-        <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
+          {phase === 'done' && Object.values(pillarsByKey).some((p) => (p.drill_down?.rows?.length ?? 0) > 0) && (
+            <button
+              onClick={handleExportAll}
+              disabled={zipBusy}
+              className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs disabled:opacity-60"
+              title="Download a ZIP with a summary sheet and one CSV per pillar"
+            >
+              {zipBusy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+              Export all to CSV
+            </button>
+          )}
+        </div>
         {config.pillars.map((cp) => {
           const p = pillarsByKey[cp.key];
           if (!p) {

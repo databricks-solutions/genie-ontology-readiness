@@ -16,7 +16,12 @@ from server.pillars import (
     readiness_stage,
 )
 from server.assessment.probes import PROBES, prime_request_sources, _progress_sink
-from server.sql_client import start_identity_capture, resolved_identity
+from server.sql_client import (
+    start_identity_capture,
+    resolved_identity,
+    start_query_capture,
+    captured_queries,
+)
 from server.content.library import best_practices_for, capability_summary
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,14 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         # fallback / SP-forced), so the UI can show whether it reflects the
         # viewer's grants or the app SP's. None when the probe did no instrumented read.
         "identity": probe.get("identity"),
+        # Per-catalog/schema/agent/workspace breakdown of where the gap is (#10):
+        # {title, columns:[{key,label,unit?}], rows:[{...}]} or None.
+        "drill_down": probe.get("drill_down"),
+        # The exact SQL this pillar ran, for the "view the query" disclosure (#22).
+        "source_queries": probe.get("source_queries", []),
+        # When available=False, WHY (insufficient_permission / scan_failed /
+        # not_enabled) so the UI can distinguish an access failure from a real 0 (#20).
+        "unavailable_reason": probe.get("unavailable_reason"),
     }
 
 
@@ -99,6 +112,7 @@ async def _run_probe(key: str) -> tuple[str, dict]:
     then attach the resolved identity to the probe result.
     """
     start_identity_capture()
+    start_query_capture()
     try:
         probe = await PROBES[key]()
     except Exception as e:
@@ -107,6 +121,10 @@ async def _run_probe(key: str) -> tuple[str, dict]:
     ident = resolved_identity()
     if ident is not None:
         probe = {**probe, "identity": ident}
+    # Attach the SQL this probe ran (explainability), unless the probe already
+    # supplied its own curated list (e.g. a REST-only signal with no SQL).
+    if "source_queries" not in probe:
+        probe = {**probe, "source_queries": captured_queries()}
     return key, probe
 
 

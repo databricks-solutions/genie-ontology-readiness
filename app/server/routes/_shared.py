@@ -262,11 +262,52 @@ def _derive_label_and_provider(model_id: str) -> tuple[str, str]:
     return label, provider
 
 
+# Model-family classification for the grouped picker: (family, open_source),
+# matched by keyword on the (lowercased) endpoint id. Proprietary vs open-source
+# is a property of the family, not the provider (Google ships both Gemini
+# [proprietary] and Gemma [open], and OpenAI ships both GPT [proprietary] and
+# gpt-oss [open]). Order matters — the more specific open-weight tokens must
+# come before their proprietary parent: gpt-oss before gpt, gemma before gemini.
+_FAMILY_RULES = (
+    ("claude", ("Claude", False)),
+    ("gpt-oss", ("GPT", True)),   # OpenAI open-weight — must precede the "gpt" rule
+    ("gpt", ("GPT", False)),
+    ("gemma", ("Gemma", True)),
+    ("gemini", ("Gemini", False)),
+    ("llama", ("Llama", True)),
+    ("qwen", ("Qwen", True)),
+    ("mixtral", ("Mistral", True)),
+    ("mistral", ("Mistral", True)),
+    ("deepseek", ("DeepSeek", True)),
+    ("phi", ("Phi", True)),
+    ("dbrx", ("DBRX", True)),
+)
+
+
+def _classify_family(model_id: str, provider: str) -> tuple[str, bool]:
+    """Return (family, open_source) for a model endpoint id. Unknown families
+    fall back to the provider name and are treated as proprietary (conservative)."""
+    m = (model_id or "").lower()
+    for token, (family, open_source) in _FAMILY_RULES:
+        if token in m:
+            return family, open_source
+    return (provider or "Other"), False
+
+
+def _model_record(model_id: str) -> dict:
+    """One model's full record for the picker: {id, label, provider, family, open_source}."""
+    label, provider = _derive_label_and_provider(model_id)
+    family, open_source = _classify_family(model_id, provider)
+    return {"id": model_id, "label": label, "provider": provider,
+            "family": family, "open_source": open_source}
+
+
 async def list_available_models() -> list[dict]:
     """Fetch the list of available LLM chat models from the workspace serving endpoints.
 
     Queries the serving-endpoints API, filters to task == "llm/v1/chat", and
-    returns a list of {id, label, provider} dicts with friendly labels.
+    returns a list of {id, label, provider, family, open_source} dicts (see
+    _model_record) so the picker can group by licensing and family.
 
     Results are cached for CACHE_TTL (10 min). On ANY error, falls back to
     static AI_MODELS entries so the dropdown is never empty.
@@ -284,7 +325,7 @@ async def list_available_models() -> list[dict]:
 
         if not host or not auth_headers:
             logger.warning("Missing host or auth headers; falling back to static AI_MODELS")
-            result = [{"id": k, **v} for k, v in AI_MODELS.items()]
+            result = [_model_record(k) for k in AI_MODELS]
             _cache_set("serving_models", result)
             return result
 
@@ -295,7 +336,7 @@ async def list_available_models() -> list[dict]:
             if response.status != 200:
                 error_text = await response.text()
                 logger.warning(f"serving-endpoints API error ({response.status}): {error_text[:200]}")
-                result = [{"id": k, **v} for k, v in AI_MODELS.items()]
+                result = [_model_record(k) for k in AI_MODELS]
                 _cache_set("serving_models", result)
                 return result
 
@@ -308,12 +349,11 @@ async def list_available_models() -> list[dict]:
                 if ep.get("task") == "llm/v1/chat":
                     model_id = ep.get("name")
                     if model_id:
-                        label, provider = _derive_label_and_provider(model_id)
-                        models.append({"id": model_id, "label": label, "provider": provider})
+                        models.append(_model_record(model_id))
 
             if not models:
                 logger.warning("No chat endpoints found in serving-endpoints API")
-                result = [{"id": k, **v} for k, v in AI_MODELS.items()]
+                result = [_model_record(k) for k in AI_MODELS]
                 _cache_set("serving_models", result)
                 return result
 
@@ -326,7 +366,7 @@ async def list_available_models() -> list[dict]:
 
     except Exception as e:
         logger.error(f"Error fetching serving endpoints: {e}")
-        result = [{"id": k, **v} for k, v in AI_MODELS.items()]
+        result = [_model_record(k) for k in AI_MODELS]
         _cache_set("serving_models", result)
         return result
 

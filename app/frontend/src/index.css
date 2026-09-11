@@ -70,6 +70,9 @@
 .markdown-body a {
   @apply text-databricks-600 underline;
 }
+.markdown-body hr {
+  @apply border-0 border-t border-gray-200 my-4;
+}
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
