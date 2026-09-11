@@ -210,7 +210,9 @@ record_check "ownership keyed on the raw X-Forwarded-Email header" \
 # column value (CWE-209). Handlers must use security.safe_error and return a
 # reference id. Matches str(e)/str(exc) on a line that also builds a client payload.
 record_check "raw exception text returned to the client" \
-  "$(scan_py 'str\(e(xc)?\)' | grep -E '(\"error\"|'\''error'\''|\"note\"|'\''note'\''|json\.dumps)' )"
+  "$(scan_py 'str\(e(xc)?\)' \
+     | grep -vE ':[0-9]+:[[:space:]]*(#|logger\.|log\.|print\()' \
+     | grep -E '(return|yield|\"error\"|'\''error'\''|\"note\"|'\''note'\''|json\.dumps|_empty\(|content=)' )"
 
 # 3c. aiohttp sessions with no timeout. A stalled upstream otherwise pins a
 # worker and its connection open for the life of the process (CWE-400).
@@ -243,6 +245,22 @@ PDF_CALLS="$(scan_py 'pisa\.CreatePDF\(' | wc -l | tr -d ' ')"
 PDF_GUARDS="$(scan_py 'link_callback\s*=' | wc -l | tr -d ' ')"
 record_check "pisa.CreatePDF without a link_callback" \
   "$( [ "$PDF_CALLS" -le "$PDF_GUARDS" ] || echo "  $PDF_CALLS CreatePDF call(s) but only $PDF_GUARDS link_callback guard(s)" )"
+
+# 3g-bis. The Genie Conversation API returns ROWS from the customer's warehouse.
+# Hard-wiring it to the app service principal — which holds SELECT on every
+# assessed catalog — lets any app viewer read tables they have no grant on
+# (CWE-269). It must run on-behalf-of the viewer; see server/genie_client.py.
+GENIE_SP_CALLS="$(scan_py 'get_auth_headers\(force_sp=True\)' | grep -c 'genie_client\.py' || true)"
+GENIE_SP_GATED="$(scan_py 'GENIE_ALLOW_SP_FALLBACK' | grep -c 'genie_client\.py' || true)"
+record_check "Genie API hard-wired to the service principal" \
+  "$( [ "$GENIE_SP_CALLS" -eq 0 ] || [ "$GENIE_SP_GATED" -ge 1 ] || echo "  service-principal Genie call is not gated on GENIE_ALLOW_SP_FALLBACK" )"
+
+# 3g-ter. Every endpoint that returns customer data or per-user records must
+# resolve an identity first. Flags a Genie route that takes no principal.
+GENIE_ROUTES="$(scan_py '^async def genie_' | wc -l | tr -d ' ')"
+GENIE_GUARDED="$(scan_py 'Depends\(current_principal\)' | grep -c 'routes/genie\.py' || true)"
+record_check "Genie route without an authenticated principal" \
+  "$( [ "$GENIE_ROUTES" -le "$GENIE_GUARDED" ] || echo "  $GENIE_ROUTES genie route(s) but only $GENIE_GUARDED principal guard(s)" )"
 
 # 3h. React escapes by default; dangerouslySetInnerHTML opts out of that and would
 # make model-generated plan Markdown an XSS sink (CWE-79).

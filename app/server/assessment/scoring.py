@@ -18,6 +18,7 @@ from server.pillars import (
 from server.assessment.probes import PROBES, prime_request_sources, _progress_sink
 from server.sql_client import start_identity_capture, resolved_identity
 from server.content.library import best_practices_for, capability_summary
+from server.security import safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +103,10 @@ async def _run_probe(key: str) -> tuple[str, dict]:
     try:
         probe = await PROBES[key]()
     except Exception as e:
-        logger.warning(f"probe {key} raised: {e}")
-        probe = _error_probe(f"Probe error: {str(e)[:120]}")
+        # This note is returned to the browser and stored in the saved snapshot,
+        # so it carries a log reference rather than the exception text (CWE-209).
+        reference, _ = safe_error(e, f"probe {key} raised", logger)
+        probe = _error_probe(f"This signal could not be assessed. (reference {reference})")
     ident = resolved_identity()
     if ident is not None:
         probe = {**probe, "identity": ident}

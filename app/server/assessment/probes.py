@@ -32,7 +32,7 @@ import json
 import logging
 import aiohttp
 
-from server.security import quote_ident, quote_literal
+from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_rest_identity
 from server.config import (
     get_workspace_host,
@@ -57,6 +57,21 @@ _INTERNAL_CATALOGS = ("system", "__databricks_internal", "samples", "hive_metast
 
 def _empty(note: str) -> dict:
     return {"available": False, "score": 0.0, "signals": [], "gaps": [], "note": note, "metrics": {}}
+
+
+def _failed(exc: Exception, what: str, remedy: str = "") -> dict:
+    """An unavailable-pillar result for a probe that raised.
+
+    The probe's note is returned to the browser AND persisted inside the saved
+    snapshot, so it must never carry the upstream message: SQL Warehouse errors
+    quote the failing statement, the object names involved and sometimes a literal
+    value from a column (CWE-209). The detail goes to the log under `reference`.
+    """
+    reference, _ = safe_error(exc, f"probe: {what}", logger)
+    note = f"{what} could not be read."
+    if remedy:
+        note += f" {remedy}"
+    return _empty(f"{note} (reference {reference})")
 
 
 def _no_catalogs_note(what: str) -> str:
@@ -363,8 +378,8 @@ async def probe_uc_foundation() -> dict:
             },
         }
     except Exception as e:
-        logger.warning(f"probe_uc_foundation failed: {e}")
-        return _empty(f"Could not read information_schema ({str(e)[:120]}). The app SP may lack catalog access.")
+        return _failed(e, "The Unity Catalog footprint",
+                       "The assessing identity may lack USE CATALOG + SELECT on the catalogs to assess.")
 
 
 # ---------------------------------------------------------------------------
@@ -547,8 +562,7 @@ async def probe_metadata() -> dict:
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
         }
     except Exception as e:
-        logger.warning(f"probe_metadata failed: {e}")
-        return _empty(f"Could not read comment coverage ({str(e)[:120]}).")
+        return _failed(e, "Comment coverage")
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +618,7 @@ async def probe_relationships() -> dict:
         return {"available": True, "score": score, "signals": signals, "gaps": gaps, "note": note,
                 "metrics": {"primary_keys": pk, "foreign_keys": fk, "gold_tables": gold_tables, "constraints_available": constraints_available}}
     except Exception as e:
-        logger.warning(f"probe_relationships failed: {e}")
-        return _empty(f"Could not assess relationships ({str(e)[:120]}).")
+        return _failed(e, "Relationships and modeling")
 
 
 # ---------------------------------------------------------------------------
@@ -691,8 +704,7 @@ async def probe_metrics() -> dict:
             "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
         }
     except Exception as e:
-        logger.warning(f"probe_metrics failed: {e}")
-        return _empty(f"Could not count metric views ({str(e)[:120]}).")
+        return _failed(e, "The metric-view footprint")
 
 
 # ---------------------------------------------------------------------------
@@ -1059,8 +1071,9 @@ async def probe_domains() -> dict:
                         "source": "tag_proxy"},
         }
     except Exception as e:
-        logger.warning(f"probe_domains failed: {e}")
-        return _empty(f"Domains API unavailable and tag proxy failed ({str(e)[:120]}); use the self-assessment.")
+        return _failed(e, "Domains and stewardship",
+                       "The native Domains API was unavailable and the governed-tag proxy also failed; "
+                       "use the self-assessment.")
 
 
 # ---------------------------------------------------------------------------
@@ -1130,8 +1143,7 @@ async def probe_adoption() -> dict:
         return {"available": True, "score": score, "signals": signals, "gaps": [], "note": None,
                 "metrics": {"active_users_30d": active_users, "queries_30d": queries_30d}}
     except Exception as e:
-        logger.warning(f"probe_adoption failed: {e}")
-        return _empty(f"Could not read adoption signals ({str(e)[:120]}).")
+        return _failed(e, "Adoption signals")
 
 
 # Map pillar key -> probe coroutine

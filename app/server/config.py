@@ -85,6 +85,19 @@ WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
 # Optional Genie agent to test answer quality against (pillar 5)
 GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")
 
+# The Genie Conversation API is not covered by the ``sql`` user_api_scope, so a
+# forwarded viewer token cannot call it unless the workspace also grants a Genie
+# scope. The app therefore used to run EVERY Genie test as the app service
+# principal — which holds SELECT on every assessed catalog. That let any viewer
+# ask a question and receive rows from tables they have no grant on: a privilege
+# escalation straight into whatever the warehouse holds.
+#
+# Now the test runs on-behalf-of the viewer, and this knob decides what happens
+# when the viewer's token cannot call the API. Default false = refuse and say so.
+# Set true ONLY where every app viewer is already cleared for everything the app
+# service principal can read; on a workspace holding PHI that is rarely true.
+GENIE_ALLOW_SP_FALLBACK = os.environ.get("GENIE_ALLOW_SP_FALLBACK", "false").lower() == "true"
+
 # Cache workspace client to avoid repeated creation
 _workspace_client = None
 

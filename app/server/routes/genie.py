@@ -6,12 +6,20 @@ Set GENIE_SPACE_ID to enable. Used in pillar 5 to demonstrate live value.
 import logging
 import aiohttp
 
-from fastapi import APIRouter
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from server.config import get_workspace_host, get_auth_headers, GENIE_SPACE_ID
-from server.genie_client import start_conversation, send_message
+from server.config import get_workspace_host, get_auth_headers, set_user_token, GENIE_SPACE_ID
+from server.genie_client import (
+    GENIE_IDENTITY_REQUIRED,
+    GenieIdentityUnavailable,
+    send_message,
+    start_conversation,
+)
+from server.routes._shared import current_principal
 from server.security import safe_error
 
 logger = logging.getLogger(__name__)
@@ -35,8 +43,12 @@ class GenieMessageRequest(BaseModel):
 
 
 @router.get("/genie/spaces")
-async def list_genie_agents():
+async def list_genie_agents(
+    principal: str = Depends(current_principal),
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+):
     """List Genie Agents visible to the app (for the pillar 5 detail view)."""
+    set_user_token(x_forwarded_access_token)
     host = get_workspace_host()
     headers = get_auth_headers()
     if not host or not headers:
@@ -56,15 +68,34 @@ async def list_genie_agents():
         return {"spaces": [], "note": message, "reference": reference}
 
 
+# A Genie answer returns ROWS from the customer's warehouse. Both endpoints below
+# therefore require an established identity (they were previously open to any
+# caller) and run the query on-behalf-of that viewer — see genie_client.
 @router.post("/genie/start-conversation")
-async def genie_start(req: GenieStartRequest):
+async def genie_start(
+    req: GenieStartRequest,
+    principal: str = Depends(current_principal),
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+):
     if not GENIE_SPACE_ID:
         return JSONResponse(status_code=400, content={"error": "No GENIE_SPACE_ID configured."})
-    return await start_conversation(req.content)
+    set_user_token(x_forwarded_access_token)
+    try:
+        return await start_conversation(req.content)
+    except GenieIdentityUnavailable:
+        return JSONResponse(status_code=403, content={"error": GENIE_IDENTITY_REQUIRED})
 
 
 @router.post("/genie/message")
-async def genie_message(req: GenieMessageRequest):
+async def genie_message(
+    req: GenieMessageRequest,
+    principal: str = Depends(current_principal),
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+):
     if not GENIE_SPACE_ID:
         return JSONResponse(status_code=400, content={"error": "No GENIE_SPACE_ID configured."})
-    return await send_message(req.conversation_id, req.content)
+    set_user_token(x_forwarded_access_token)
+    try:
+        return await send_message(req.conversation_id, req.content)
+    except GenieIdentityUnavailable:
+        return JSONResponse(status_code=403, content={"error": GENIE_IDENTITY_REQUIRED})

@@ -1,5 +1,10 @@
 # Security remediation — Checkmarx SCA report `06a63d86`
 
+**Audit coverage.** Every record in the scan report, and every line of the
+application source — `app/server/**` (including all 1,137 lines of `probes.py`),
+`app/app.py`, all seven frontend components, both deploy scripts, the bundled
+accelerator notebook, and the deployment manifests.
+
 **Scope.** Enterprise SCA scan of `databricks-solutions/genie-ontology-readiness`,
 run 2026-09-09, report `SCA_ScanReport_06a63d86-3319-47cd-99db-1644afde8fb4`.
 Remediated 2026-09-10. The app is deployed by regulated customers — including
@@ -7,9 +12,13 @@ insurers — against Unity Catalog workspaces that may hold PHI, so this pass co
 both the scanner's dependency findings and a manual review of the application code
 for data leakage and HIPAA-relevant control gaps.
 
-**Constraint.** No functional change. Every endpoint, response shape and UI flow
-behaves as it did before; the verification section below records how that was
-established.
+**Constraint.** No functional change, with **one deliberate exception**: the Genie
+answer-quality test now runs as the viewer instead of as the app service principal
+(F-11), because the old behaviour handed any viewer the service principal's read
+access to the whole metastore. One environment variable restores the previous
+behaviour if a deployment needs it. Everything else — every endpoint, response
+shape and UI flow — behaves as it did before; the verification section records how
+that was established.
 
 ---
 
@@ -22,9 +31,32 @@ established.
 | Vulnerable packages | 5 | 0 |
 | Vulnerable **runtime** packages | 1 (`starlette`) | 0 |
 | Risk score | 8.2 | — |
+| Code findings (manual review) | 13 | 0 |
+| — of which Critical | 1 (F-11) | 0 |
 
-Thirteen additional issues were found by manual review and are fixed here; they
-were not in the scanner's output because an SCA tool only inspects dependencies.
+### What the 35,264-line report actually contains
+
+The file is large because it ships the full SBOM, not because it holds many
+findings. Counted three independent ways, they agree:
+
+| | |
+|---|---|
+| `Vulnerabilities[]` array length | 14 |
+| Distinct CVE ids | 14 |
+| Sum of every package's `VulnerabilityCount` | 14 |
+| `RiskReportSummary` C+H+M+L+N | 0+8+5+0+1 = 14 |
+| `Packages[]` (the SBOM — the bulk of the file) | 354 |
+| `LicensesByPackage[]` / `Licenses[]` / `LegalRisks[]` | 341 / 11 / 13 |
+
+Every other flag in the report was checked across all 354 packages and is clean:
+no `IsMalicious`, no `IsViolatingPolicy`, no `IsPrivatePackage`, no proof-of-concept
+exploit, no `ExploitablePath`, nothing suppressed via `IsIgnored`. One CVE is on the
+CISA KEV list.
+
+**Thirteen further issues were found by manual code review and are fixed here.**
+An SCA tool reads dependency manifests; it never opens the application source. The
+most serious finding in this whole effort (F-11 below) is one no SCA scan could
+have produced.
 
 ---
 
@@ -284,6 +316,73 @@ customer-identifying.
 
 **Fix.** Replaced with an obviously synthetic value. The gate now passes.
 
+### F-11 · Genie test answers with the service principal's data access — CWE-269 / CWE-863 · **Critical**
+
+The highest-impact finding, and the one that matters most for a TB-scale insurance
+workspace. Three facts combined:
+
+1. `POST /api/genie/start-conversation` and `/api/genie/message` had **no
+   authorization check at all** — only a test that `GENIE_SPACE_ID` was configured.
+2. `genie_client` called `get_auth_headers(force_sp=True)`, hard-wiring every Genie
+   call to the **app service principal** and ignoring the viewer entirely. The
+   comment explained why (`sql` is the only user API scope, and it does not cover
+   the Genie Conversation API) but the consequence was not addressed.
+3. `scripts/setup_app_permissions.py` grants that service principal
+   `GRANT SELECT ON CATALOG` for **every catalog being assessed**.
+
+A Genie answer returns up to 100 rows of real query results, which the UI renders.
+So any user who could open the app could ask a natural-language question and
+receive rows from any table the service principal could read — in a typical
+deployment, the entire metastore. On an insurance workspace that is PHI, delivered
+to someone with no grant on it, with no audit trail tying the read to them.
+
+**Fix.** The Genie test now runs **on-behalf-of the viewer**, so the answer reflects
+that person's own Unity Catalog grants. All three endpoints require an established
+identity. When the viewer's token cannot call the Genie API, the app **refuses and
+explains** rather than silently answering with elevated privileges. Responses carry
+a `ran_as` field so the UI can never imply borrowed rows are the viewer's own.
+
+> **This is the one deliberate behaviour change in this work.** Restoring the old
+> behaviour is a single environment variable, `GENIE_ALLOW_SP_FALLBACK=true`, which
+> logs a warning on every call. Do not set it on a workspace holding PHI: it
+> re-opens exactly this escalation. The better fix is to enable user authorization
+> on the app and grant it a Genie API scope, which makes the fallback unnecessary.
+
+### F-12 · SQL error text persisted into saved assessments — CWE-209 · High
+
+Eight probe failure paths built their user-facing note from the exception:
+
+```python
+return _empty(f"Could not read comment coverage ({str(e)[:120]}).")
+```
+
+That note is returned in the scorecard **and written into the `scorecard` JSONB
+column** when the run is saved. So a SQL Warehouse error quoting
+`phi_prod.claims.member_ssn`, or a rejected literal value, did not just reach one
+browser — it was persisted to the history table and re-served on every later view
+of that snapshot.
+
+This is the same weakness as F-01, in a path F-01 did not reach, and the first
+version of the compliance check missed it because the pattern only matched lines
+that also mentioned `error` or `note`.
+
+**Fix.** A single `_failed()` helper gives every probe a fixed, actionable note plus
+a log reference; the same treatment is applied in `scoring.py`, which wrapped any
+probe exception the same way. The gate check was widened to match exception text
+interpolated into anything returned, not just into a line containing `error`.
+
+### F-13 · The compliance gate was scanning an incomplete file set
+
+`compliance_scan.test.sh` builds its scan set from `git ls-files`, which lists only
+**tracked** files. New files sat outside the gate until their first commit — so a
+pre-commit run reported PASS on a tree it had not fully read. Re-running after the
+first commit immediately flagged three real issues in the newly-tracked files
+(a token-shaped literal and non-reserved email domains in the new tests). Fixed at
+source: tests now use RFC-2606 reserved domains and assemble the token.
+
+No change to the gate is needed — the lesson is operational, and is recorded here:
+**run the gate after staging, not before.**
+
 ---
 
 ## 4. HIPAA control mapping
@@ -295,7 +394,11 @@ that do, so the safeguards below apply to it as a system component.
 | Safeguard | § | Gap found | Control now in place |
 |---|---|---|---|
 | Access control — unique user identification | 164.312(a)(2)(i) | Ownership rested on a spoofable header; unidentified callers shared one bucket | F-03: token-derived principal, 401 when unattributable, no `NULL` bucket |
+| Access control — authorization | 164.308(a)(4)(ii)(B) | The Genie test ran as a service principal holding SELECT on every catalog, for any viewer | F-11: runs on-behalf-of the viewer; escalation is opt-in and logged |
+| Minimum necessary / incidental disclosure | 164.502(b) | Warehouse rows returned to viewers with no grant on the source table | F-11 |
 | Audit controls | 164.312(b) | Question text and credential bodies written to logs | F-04: digests, key-name-only credential logging, root-logger redaction |
+| Audit controls — attribution | 164.312(b) | Genie reads were attributed to the service principal, not the person who asked | F-11: the read now runs as the viewer, so workspace audit names them |
+| Storage — improper retention of disclosed data | 164.310(d)(2)(i) | Upstream error text persisted into the snapshot history table | F-12: fixed notes plus a log reference |
 | Integrity — improper modification | 164.312(c)(1) | Identifier injection into SQL | F-05: `quote_ident` / `quote_literal` everywhere |
 | Transmission security | 164.312(e)(1) | Postgres TLS unverified | F-09: `verify-full` |
 | Transmission security — encryption | 164.312(e)(2)(ii) | No HSTS or upgrade directive | F-08: HSTS + `upgrade-insecure-requests` |
@@ -337,10 +440,13 @@ Everything below was run against the changed tree, not asserted.
 | App imports and serves under starlette 1.6.0 | all endpoints return their prior status and payload shape |
 | `npm ci && npm run build` | vite 8.3.0, 2312 modules, builds clean |
 | Vulnerable packages in the npm tree | `esbuild` absent; nanoid 3.3.19, browserslist 4.28.9, postcss 8.5.28 |
-| `python -m unittest discover -s server` | 40 tests pass (3 pre-existing + 37 new) |
+| `python -m unittest discover -s server` | 47 tests pass (3 pre-existing + 44 new) |
 | `npx vitest run` | 16 tests pass |
 | `scripts/__tests__/compliance_scan.test.sh` | PASS, including 8 new checks |
-| New gate checks fail on a deliberate regression | all 8 confirmed to fire |
+| New gate checks fail on a deliberate regression | all 10 confirmed to fire |
+| Genie endpoints unauthenticated | 401 on all three (were fully open) |
+| Genie test with an identified viewer but no OBO token | 403 with guidance, not a service-principal answer |
+| Probe failure note | carries a reference; table name and column value withheld |
 | Built UI loaded in a browser under the new CSP | renders; zero console violations |
 | Exploit reproduction for F-02 before the fix | local file reference reached the renderer; blocked after |
 
@@ -354,7 +460,7 @@ Markdown). The Assess and Learn tabs were exercised in a browser.
 
 ```bash
 bash scripts/__tests__/compliance_scan.test.sh
-cd app && python -m unittest discover -s server -p "test_*.py"
+cd app && python -m unittest discover -s server --pattern "test_*.py"
 cd app && npx vitest run --config vitest.config.ts
 cd app/frontend && npm ci && npm run build
 ```

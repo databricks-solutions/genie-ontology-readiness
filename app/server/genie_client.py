@@ -4,7 +4,13 @@ import aiohttp
 import asyncio
 import hashlib
 import logging
-from server.config import get_workspace_host, get_auth_headers, GENIE_SPACE_ID
+from server.config import (
+    GENIE_ALLOW_SP_FALLBACK,
+    GENIE_SPACE_ID,
+    get_auth_headers,
+    get_user_token,
+    get_workspace_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +32,44 @@ def _question_ref(content: str) -> str:
 _GENIE_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=60)
 
 
+#: Shown to the caller when the Genie test cannot run as them. Fixed text — it
+#: carries no upstream detail, so it is safe to return verbatim.
+GENIE_IDENTITY_REQUIRED = (
+    "The Genie test runs on-behalf-of you, and no user token was forwarded. Ask a workspace "
+    "admin to enable user authorization for this app (and grant it a Genie API scope). "
+    "Running the test as the app service principal would answer with the service "
+    "principal's data access rather than yours."
+)
+
+
+class GenieIdentityUnavailable(Exception):
+    """The viewer's own token cannot call the Genie API and SP fallback is off."""
+
+
+def _genie_auth_headers() -> tuple[dict, str]:
+    """Auth headers for a Genie Conversation API call, plus the identity used.
+
+    A Genie answer carries ROWS from the customer's warehouse back to the caller,
+    so the identity this runs as decides what that caller is allowed to see. It
+    used to be hard-wired to the app service principal, which holds SELECT on every
+    assessed catalog — so any viewer could read any table through it (CWE-269).
+
+    On-behalf-of the viewer is the only identity that makes the answer reflect the
+    caller's own grants, so it is preferred. Falling back to the service principal
+    re-opens the escalation, so it happens only when a deployment has explicitly
+    accepted that (``GENIE_ALLOW_SP_FALLBACK``).
+    """
+    if get_user_token():
+        return get_auth_headers(), "obo"
+    if GENIE_ALLOW_SP_FALLBACK:
+        logger.warning(
+            "Genie call running as the app service principal — the answer reflects the SP's "
+            "grants, not the viewer's (GENIE_ALLOW_SP_FALLBACK is on)"
+        )
+        return get_auth_headers(force_sp=True), "service_principal"
+    raise GenieIdentityUnavailable(GENIE_IDENTITY_REQUIRED)
+
+
 async def start_conversation(content: str) -> dict:
     """Start a new Genie conversation.
 
@@ -33,7 +77,7 @@ async def start_conversation(content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers = get_auth_headers(force_sp=True)  # Genie REST API via SP (OBO token lacks genie scope)
+    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
@@ -73,6 +117,7 @@ async def start_conversation(content: str) -> dict:
         return {
             "conversation_id": conversation_id,
             "message_id": message_id,
+            "ran_as": identity,
             "result": _extract_result(message_result),
         }
 
@@ -84,7 +129,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
     Then poll for result.
     """
     host = get_workspace_host()
-    auth_headers = get_auth_headers(force_sp=True)  # Genie REST API via SP (OBO token lacks genie scope)
+    auth_headers, identity = _genie_auth_headers()
 
     if not host:
         raise Exception("DATABRICKS_HOST not configured")
@@ -125,6 +170,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
 
         return {
             "message_id": message_id,
+            "ran_as": identity,
             "result": _extract_result(message_result),
         }
 

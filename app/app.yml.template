@@ -10,9 +10,26 @@ env:
   # Optional: restrict the assessment to specific catalogs (comma-separated).
   - name: ASSESS_CATALOGS
     value: ""
+  # Largest request body the app will accept, in bytes (default 2 MiB).
+  - name: MAX_REQUEST_BYTES
+    value: "2097152"
+  # Postgres TLS mode for the history database. "verify-full" (default) checks the
+  # certificate and hostname; lower it only if your endpoint presents a certificate
+  # outside the container's CA bundle.
+  - name: LAKEBASE_SSL_MODE
+    value: "verify-full"
   # Optional: enable the live Genie answer-quality test (pillar 5).
+  # A Genie answer returns ROWS from your warehouse, so the test runs
+  # on-behalf-of the viewer and needs user authorization enabled on the app.
   - name: GENIE_SPACE_ID
     value: ""
+  # What happens when the viewer's token cannot call the Genie API.
+  # "false" (default) = refuse and explain. "true" = answer as the app service
+  # principal instead — which holds SELECT on every assessed catalog, so any
+  # viewer could then read tables they have no grant on. Do not set "true" on a
+  # workspace holding PHI or other regulated data.
+  - name: GENIE_ALLOW_SP_FALLBACK
+    value: "false"
   # Branding shown in the app header.
   - name: BRAND_NAME
     value: "Databricks"
