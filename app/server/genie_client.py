@@ -96,7 +96,7 @@ async def start_conversation(content: str) -> dict:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"Genie start-conversation error ({response.status}): {error_text}")
+                logger.error(f"Genie start-conversation error ({response.status}): {error_text[:2000]}")
                 raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
@@ -151,7 +151,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"Genie send-message error ({response.status}): {error_text}")
+                logger.error(f"Genie send-message error ({response.status}): {error_text[:2000]}")
                 raise Exception(f"Genie API error ({response.status})")
 
             result = await response.json()
@@ -199,7 +199,7 @@ async def _poll_message(
         async with session.get(url, headers=auth_headers) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
-                logger.warning(f"Genie poll error ({resp.status}): {error_text}")
+                logger.warning(f"Genie poll error ({resp.status}): {error_text[:2000]}")
                 # Keep polling on transient errors
                 continue
 
@@ -274,7 +274,7 @@ async def _fetch_query_results_if_needed(
                     else:
                         error_text = await resp.text()
                         logger.warning(
-                            f"Failed to fetch query result by attachment ({resp.status}): {error_text}"
+                            f"Failed to fetch query result by attachment ({resp.status}): {error_text[:2000]}"
                         )
             except Exception as e:
                 logger.warning(f"Error fetching query result by attachment: {e}")

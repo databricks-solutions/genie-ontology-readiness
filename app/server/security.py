@@ -277,7 +277,13 @@ def sanitize_html_fragment(fragment: str) -> str:
 # The header is the fallback, and the lookup is best-effort with a short timeout
 # so an API blip degrades to the previous behaviour instead of failing the app.
 _IDENTITY_TTL = 600  # seconds; a token outlives this many times over
-_identity_cache: dict[str, tuple[float, str]] = {}
+# A failed lookup is cached too, for a shorter window. Without this, a workspace
+# whose SCIM endpoint is slow or unreachable would make EVERY per-user request pay
+# the full timeout before falling back to the header — turning a degraded
+# dependency into an app-wide latency regression.
+_IDENTITY_NEGATIVE_TTL = 60
+_IDENTITY_LOOKUP_TIMEOUT = 5
+_identity_cache: dict[str, tuple[float, Optional[str]]] = {}
 _IDENTITY_CACHE_MAX = 500
 
 # Ownership key used when the app runs outside Databricks Apps (local development
@@ -290,20 +296,33 @@ def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _remember_identity(fingerprint: str, identity: Optional[str]) -> None:
+    """Cache a lookup outcome, evicting the oldest entry when the cache is full."""
+    if len(_identity_cache) >= _IDENTITY_CACHE_MAX:
+        oldest = min(_identity_cache, key=lambda k: _identity_cache[k][0])
+        del _identity_cache[oldest]
+    _identity_cache[fingerprint] = (time.time(), identity)
+
+
 async def _identity_from_token(token: str) -> Optional[str]:
     """The workspace's own answer to 'who does this token belong to', cached."""
     fingerprint = _token_fingerprint(token)
     hit = _identity_cache.get(fingerprint)
-    if hit and time.time() - hit[0] < _IDENTITY_TTL:
-        return hit[1]
+    if hit is not None:
+        age = time.time() - hit[0]
+        # Negative entries expire sooner, so a transient failure self-heals quickly
+        # while a persistent one stays cheap.
+        if age < (_IDENTITY_TTL if hit[1] else _IDENTITY_NEGATIVE_TTL):
+            return hit[1]
 
     from server.config import get_workspace_host
 
     host = get_workspace_host()
     if not host:
+        _remember_identity(fingerprint, None)
         return None
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_IDENTITY_LOOKUP_TIMEOUT)) as session:
             async with session.get(
                 f"{host}/api/2.0/preview/scim/v2/Me",
                 headers={"Authorization": f"Bearer {token}"},
@@ -311,10 +330,12 @@ async def _identity_from_token(token: str) -> Optional[str]:
                 if response.status != 200:
                     logger.warning("identity lookup returned %s; falling back to the forwarded header",
                                    response.status)
+                    _remember_identity(fingerprint, None)
                     return None
                 data = await response.json()
     except Exception as e:
         logger.warning(f"identity lookup failed ({type(e).__name__}); falling back to the forwarded header")
+        _remember_identity(fingerprint, None)
         return None
 
     identity = (data.get("userName") or "").strip().lower()
@@ -322,12 +343,10 @@ async def _identity_from_token(token: str) -> Optional[str]:
         emails = data.get("emails") or []
         identity = next((e.get("value", "") for e in emails if e.get("primary")), "").strip().lower()
     if not identity:
+        _remember_identity(fingerprint, None)
         return None
 
-    if len(_identity_cache) >= _IDENTITY_CACHE_MAX:
-        oldest = min(_identity_cache, key=lambda k: _identity_cache[k][0])
-        del _identity_cache[oldest]
-    _identity_cache[fingerprint] = (time.time(), identity)
+    _remember_identity(fingerprint, identity)
     return identity
 
 
@@ -406,6 +425,15 @@ _SECURITY_HEADERS = {
 }
 
 
+# Pre-encoded once at import. Encoding these per response showed up as measurable
+# per-request overhead, and the values never change at runtime.
+_SECURITY_HEADERS_ENCODED: tuple[tuple[bytes, bytes], ...] = tuple(
+    (name.lower().encode("latin-1"), value.encode("latin-1"))
+    for name, value in _SECURITY_HEADERS.items()
+)
+_SECURITY_HEADER_NAMES: frozenset[bytes] = frozenset(n for n, _ in _SECURITY_HEADERS_ENCODED)
+
+
 class SecurityHeadersMiddleware:
     """Attach the hardening headers to every response (pure ASGI, so it also
     covers streaming SSE responses and static files)."""
@@ -421,10 +449,15 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
                 headers = message.setdefault("headers", [])
-                existing = {k.lower() for k, _ in headers}
-                for name, value in _SECURITY_HEADERS.items():
-                    if name.lower().encode() not in existing:
-                        headers.append((name.lower().encode(), value.encode()))
+                # Only scan for collisions if the response actually set one of
+                # ours; the common case appends without any comparison at all.
+                if any(k in _SECURITY_HEADER_NAMES for k, _ in headers):
+                    existing = {k for k, _ in headers}
+                    headers.extend(
+                        (n, v) for n, v in _SECURITY_HEADERS_ENCODED if n not in existing
+                    )
+                else:
+                    headers.extend(_SECURITY_HEADERS_ENCODED)
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -466,14 +499,17 @@ class BodySizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        declared = dict(scope.get("headers") or {}).get(b"content-length")
-        if declared is not None:
-            try:
-                if int(declared) > self.max_bytes:
-                    await self._reject(send)
-                    return
-            except ValueError:
-                pass
+        # Scan for content-length directly rather than materialising every header
+        # into a dict on each request.
+        for key, value in scope.get("headers") or ():
+            if key == b"content-length":
+                try:
+                    if int(value) > self.max_bytes:
+                        await self._reject(send)
+                        return
+                except ValueError:
+                    pass
+                break
 
         received = 0
 

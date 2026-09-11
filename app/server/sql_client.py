@@ -217,7 +217,9 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"SQL Warehouse error ({response.status}): {error_text}")
+                # Truncated for the log only; the exception keeps the full text so
+                # execute_sql's authorization-marker matching still sees it.
+                logger.error(f"SQL Warehouse error ({response.status}): {error_text[:2000]}")
                 raise Exception(f"SQL Warehouse error ({response.status}): {error_text}")
 
             result = await response.json()

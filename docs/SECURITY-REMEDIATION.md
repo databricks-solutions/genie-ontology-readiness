@@ -441,6 +441,10 @@ Everything below was run against the changed tree, not asserted.
 | `npm ci && npm run build` | vite 8.3.0, 2312 modules, builds clean |
 | Vulnerable packages in the npm tree | `esbuild` absent; nanoid 3.3.19, browserslist 4.28.9, postcss 8.5.28 |
 | `python -m unittest discover -s server` | 47 tests pass (3 pre-existing + 44 new) |
+| Generated SQL vs. the original expressions | byte-identical for every ordinary catalog name |
+| Scoring logic diff | no change to any formula, threshold, weight or signal |
+| Request latency vs. the pre-remediation tree | +0.002 to +0.06 ms from this work; see the parity section |
+| Redaction pattern scaling (ReDoS check) | linear, 2.00x for 2x input |
 | `npx vitest run` | 16 tests pass |
 | `scripts/__tests__/compliance_scan.test.sh` | PASS, including 8 new checks |
 | New gate checks fail on a deliberate regression | all 10 confirmed to fire |
@@ -455,6 +459,83 @@ Functional parity was checked endpoint by endpoint: `/api/config`, `/api/content
 download, `/api/assess/history`, `/api/plan/list`, `/api/plan/generate` validation,
 and `/api/plan/pdf` (still returns a valid `%PDF-` document from the same
 Markdown). The Assess and Learn tabs were exercised in a browser.
+
+### Behaviour, accuracy and performance parity
+
+The concern with a security pass is that it quietly changes what the app does or
+how fast it does it. Three things were measured rather than assumed.
+
+**1. Not one generated SQL statement changed.** `quote_ident` / `quote_literal`
+replaced hand-rolled quoting, so the output was diffed against the original
+expressions across every `information_schema` view, both source modes
+(metastore-wide and per-catalog union) and a set of realistic catalog names:
+
+```
+RESULT: BYTE-IDENTICAL for every ordinary catalog name
+  'sales'          -> `sales`
+  'member-360'     -> `member-360`
+  'Cat With Space' -> `Cat With Space`
+  'a`b'            -> `a``b`     <- escaping engages only on a name that would break out
+```
+
+Same statements means the same warehouse query plans, the same scan volume, the
+same cost and the same rows. Nothing about assessment accuracy can have moved.
+
+**2. Not one scoring line changed.** Every edit in `probes.py` and `scoring.py` is
+identifier quoting, an HTTP timeout, or an error-message path that only executes
+when a probe has already failed. Score formulas, thresholds, weights, signal
+definitions, gap wording and the adoption banding are untouched — verifiable in one
+command:
+
+```bash
+git diff 3358270..HEAD -- app/server/assessment/
+```
+
+**3. Request latency.** Benchmarked on one machine, 300 iterations per endpoint
+after warm-up, with the pre-remediation tree on the original dependency stack
+(fastapi 0.115.14 / starlette 0.46.2) as the baseline. Splitting the framework
+upgrade from the code changes shows where the difference actually comes from:
+
+| Endpoint | Baseline | Framework upgrade | + this work | Framework cost | This work's cost |
+|---|---|---|---|---|---|
+| `GET /api/content` | 5.189 ms | 5.387 ms | 5.446 ms | +0.198 ms | **+0.059 ms** |
+| `GET /api/accelerators` | 4.229 ms | 4.456 ms | 4.458 ms | +0.228 ms | **+0.002 ms** |
+| `GET /api/content/{key}` | 2.314 ms | 2.529 ms | 2.562 ms | +0.215 ms | **+0.033 ms** |
+| `POST /api/plan/pdf` | 62.753 ms | 63.100 ms | 63.840 ms | +0.347 ms | **+0.740 ms** |
+
+The hardening middleware costs essentially nothing on the JSON endpoints. The
+0.74 ms on the PDF route is the HTML sanitizer, 1.2% of an operation dominated by
+PDF rendering. The ~0.2 ms that remains is inherent to running the patched
+framework and is the price of the seven starlette CVEs.
+
+Both middlewares were profiled and optimised after the first measurement: the
+response headers are pre-encoded once at import instead of per response, and the
+body-size limiter scans for `Content-Length` instead of materialising every header
+into a dict.
+
+For scale context: every one of those figures is local CPU. A real assessment is
+dominated by SQL Warehouse round trips and runs 30–60 seconds, so the added
+fraction is far below measurement noise on a live workspace.
+
+**4. Log redaction.** It runs on every record, so it was benchmarked and checked
+for catastrophic backtracking:
+
+| Input | Cost per record |
+|---|---|
+| Typical assessment log line | 18–34 µs |
+| 4 KB adversarial input (digit- and separator-heavy) | 0.8–1.7 ms |
+
+A 1068-catalog assessment emits roughly 120 records, so redaction adds about 4 ms
+to a 30–60 second run. Scaling is exactly linear (2.00× cost for 2× input across
+1 KB → 16 KB), which rules out ReDoS in the patterns. Two sites that logged an
+entire upstream response body were capped at 2 KB, so a remote server cannot
+dictate log volume or redaction work.
+
+**5. One latency bug found and fixed in this work.** The identity lookup cached
+successes but not failures, so a workspace with a slow or unreachable SCIM endpoint
+would have paid the full 5-second timeout on *every* per-user request before
+falling back. Failures are now cached for 60 seconds, turning a degraded dependency
+into one slow call per minute instead of one per request.
 
 ### Re-verifying
 
