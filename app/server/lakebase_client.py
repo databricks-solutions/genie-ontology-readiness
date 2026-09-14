@@ -3,6 +3,7 @@
 import os
 import time
 import logging
+import ssl
 import uuid
 import asyncio
 import aiohttp
@@ -62,13 +63,8 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
 
         logger.info(f"Fetching SP-scoped Lakebase credential for {resource}")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     logger.warning(
@@ -79,7 +75,11 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
                 resp_json = await response.json()
                 token = resp_json.get("token")
                 if not token:
-                    logger.warning(f"No token in Lakebase credential response: {resp_json}")
+                    # Log the response SHAPE only. The body of a credentials
+                    # response is credential material by definition, and logging
+                    # it verbatim wrote a live secret to the app log (CWE-532).
+                    logger.warning("No token in Lakebase credential response (keys: %s)",
+                                   sorted(resp_json.keys()) if isinstance(resp_json, dict) else type(resp_json).__name__)
                     return None
 
                 logger.info("Successfully obtained instance-scoped Lakebase credential")
@@ -114,6 +114,39 @@ def _get_connection_config() -> dict:
         "database": database,
         "user": user,
     }
+
+
+# `require` encrypts the connection but performs NO certificate or hostname check,
+# so it does not protect the assessment history against an in-path attacker.
+# `verify-full` is the default here; the escape hatch exists only for a deployment
+# whose Lakebase endpoint presents a certificate outside the container's CA bundle.
+LAKEBASE_SSL_MODE = os.environ.get("LAKEBASE_SSL_MODE", "verify-full")
+
+
+def _ssl_arg():
+    """The asyncpg ``ssl`` argument for LAKEBASE_SSL_MODE.
+
+    asyncpg's string modes ``verify-ca``/``verify-full`` look for a CA cert at
+    ``~/.postgresql/root.crt``, which the Databricks Apps runtime does not ship — so
+    passing the bare string makes pool creation fail and silently disables history.
+    The Lakebase endpoint presents a publicly-signed certificate, so for the verify
+    modes we build an SSLContext from a trusted CA bundle (certifi if present, else
+    the system store) and let asyncpg verify against it: real certificate (and, for
+    verify-full, hostname) verification without needing a bundled root.crt. The
+    non-verifying modes (``require``/``prefer``/``allow``/``disable``) pass through
+    to asyncpg as-is."""
+    mode = (LAKEBASE_SSL_MODE or "").lower()
+    if mode not in ("verify-ca", "verify-full"):
+        return LAKEBASE_SSL_MODE
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    if mode == "verify-ca":
+        # verify the chain but not the hostname (verify-full does both).
+        ctx.check_hostname = False
+    return ctx
 
 
 async def init_pool() -> None:
@@ -159,7 +192,7 @@ async def init_pool() -> None:
                 database=config["database"],
                 user=config["user"],
                 password=password,
-                ssl="require",
+                ssl=_ssl_arg(),
                 min_size=2,
                 max_size=10,
                 command_timeout=30,

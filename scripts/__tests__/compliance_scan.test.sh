@@ -186,6 +186,88 @@ DATA_FILES="$(printf '%s\n' "${FILES[@]}" | grep -iE '\.(csv|parquet|avro|orc|js
 record_check "no raw data files (.csv/.parquet/.jsonl/...) shipped" "$DATA_FILES"
 
 # ==============================================================================
+# CHECK GROUP 3: DATA HANDLING & SECURE DEFAULTS
+# ==============================================================================
+# The app reads a customer's own workspace, so its metadata and query results may
+# be sensitive. These checks are regression guards for the app's security
+# controls. Each pattern matches the INSECURE form, so a PASS means the insecure
+# form is absent.
+echo ""
+echo "[3] DATA HANDLING & SECURE DEFAULTS"
+
+# Helper: restrict a scan to Python sources.
+scan_py() { scan "$1" | grep -E '\.py:' || true; }
+
+# 3a. Per-user records keyed on the raw forwarded-email header. That header is
+# set by the Databricks Apps proxy, but a route that trusts it directly is one
+# network path away from letting a caller read another user's history (CWE-290).
+# Routes must key on the resolved principal (server/security.py:resolve_principal).
+record_check "ownership keyed on the raw X-Forwarded-Email header" \
+  "$(scan_py 'created_by\s*=\s*x_forwarded_email')"
+
+# 3b. Raw exception text returned to the client. Upstream SQL Warehouse / Genie /
+# FM API errors quote the failing statement and object names, and can quote a
+# column value (CWE-209). Handlers must use security.safe_error and return a
+# reference id. Matches str(e)/str(exc) on a line that also builds a client payload.
+record_check "raw exception text returned to the client" \
+  "$(scan_py 'str\(e(xc)?\)' \
+     | grep -vE ':[0-9]+:[[:space:]]*(#|logger\.|log\.|print\()' \
+     | grep -E '(return|yield|\"error\"|'\''error'\''|\"note\"|'\''note'\''|json\.dumps|_empty\(|content=)' )"
+
+# 3c. aiohttp sessions with no timeout. A stalled upstream otherwise pins a
+# worker and its connection open for the life of the process (CWE-400).
+record_check "aiohttp session without a timeout" \
+  "$(scan_py 'aiohttp\.ClientSession\(\s*\)')"
+
+# 3d. Genie question text written to the log. Questions are free text against the
+# customer's own warehouse and can quote values from the data itself; log a
+# digest, never the content (CWE-532).
+record_check "Genie question content written to the log" \
+  "$(scan_py 'logger\.[a-z]+\(.*content\[' )"
+
+# 3e. Catalog/schema names interpolated into SQL inside bare backticks. Names come
+# from the metastore, so a name containing a backtick closes the quoting early
+# (CWE-89). Use security.quote_ident, which doubles embedded backticks.
+record_check "unescaped backtick identifier interpolation in SQL" \
+  "$(scan_py '`\{' )"
+
+# 3f. Postgres connections that encrypt without verifying the peer. `require`
+# encrypts but authenticates nothing, so it gives no in-path protection.
+record_check "Lakebase TLS without certificate verification" \
+  "$(scan_py 'ssl\s*=\s*[\"'\'']require[\"'\'']')"
+
+# 3g. The plan PDF renderer must refuse external resources. Without a
+# link_callback, xhtml2pdf resolves src/href in model-generated Markdown and will
+# read local files into the returned PDF (CWE-918/CWE-22).
+# (the call spans several lines, so compare occurrence counts rather than grepping
+# a single line for both)
+PDF_CALLS="$(scan_py 'pisa\.CreatePDF\(' | wc -l | tr -d ' ')"
+PDF_GUARDS="$(scan_py 'link_callback\s*=' | wc -l | tr -d ' ')"
+record_check "pisa.CreatePDF without a link_callback" \
+  "$( [ "$PDF_CALLS" -le "$PDF_GUARDS" ] || echo "  $PDF_CALLS CreatePDF call(s) but only $PDF_GUARDS link_callback guard(s)" )"
+
+# 3g-bis. The Genie Conversation API returns ROWS from the customer's warehouse.
+# Hard-wiring it to the app service principal — which holds SELECT on every
+# assessed catalog — lets any app viewer read tables they have no grant on
+# (CWE-269). It must run on-behalf-of the viewer; see server/genie_client.py.
+GENIE_SP_CALLS="$(scan_py 'get_auth_headers\(force_sp=True\)' | grep -c 'genie_client\.py' || true)"
+GENIE_SP_GATED="$(scan_py 'GENIE_ALLOW_SP_FALLBACK' | grep -c 'genie_client\.py' || true)"
+record_check "Genie API hard-wired to the service principal" \
+  "$( [ "$GENIE_SP_CALLS" -eq 0 ] || [ "$GENIE_SP_GATED" -ge 1 ] || echo "  service-principal Genie call is not gated on GENIE_ALLOW_SP_FALLBACK" )"
+
+# 3g-ter. Every endpoint that returns customer data or per-user records must
+# resolve an identity first. Flags a Genie route that takes no principal.
+GENIE_ROUTES="$(scan_py '^async def genie_' | wc -l | tr -d ' ')"
+GENIE_GUARDED="$(scan_py 'Depends\(current_principal\)' | grep -c 'routes/genie\.py' || true)"
+record_check "Genie route without an authenticated principal" \
+  "$( [ "$GENIE_ROUTES" -le "$GENIE_GUARDED" ] || echo "  $GENIE_ROUTES genie route(s) but only $GENIE_GUARDED principal guard(s)" )"
+
+# 3h. React escapes by default; dangerouslySetInnerHTML opts out of that and would
+# make model-generated plan Markdown an XSS sink (CWE-79).
+record_check "dangerouslySetInnerHTML in the frontend" \
+  "$(scan 'dangerouslySetInnerHTML')"
+
+# ==============================================================================
 # SUMMARY
 # ==============================================================================
 echo ""

@@ -8,7 +8,7 @@ top-level H1 from the body; these tests lock that in so the duplicate can't retu
 
 import unittest
 
-from server.routes.plan import _strip_document_h1, _build_plan_pdf_html
+from server.routes.plan import _strip_document_h1, _build_plan_pdf_html, _block_external_resources
 
 
 class StripDocumentH1Test(unittest.TestCase):
@@ -142,7 +142,8 @@ class BuildPlanPdfHtmlTest(unittest.TestCase):
         )
         html_doc = _build_plan_pdf_html(body, "Genie Ontology Readiness — Action Plan")
         buf = io.BytesIO()
-        result = pisa.CreatePDF(src=html_doc, dest=buf, encoding="utf-8")
+        result = pisa.CreatePDF(src=html_doc, dest=buf, encoding="utf-8",
+                                link_callback=_block_external_resources)
         self.assertFalse(result.err, "PDF generation should succeed with the real CSS + footer")
         text = "\n".join(p.extract_text() for p in PdfReader(io.BytesIO(buf.getvalue())).pages)
         self.assertEqual(text.count("Action Plan"), 1, "title must appear exactly once")

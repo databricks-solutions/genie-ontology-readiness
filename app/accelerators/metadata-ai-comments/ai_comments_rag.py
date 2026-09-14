@@ -239,10 +239,22 @@ else:
 if mode == "apply":
     approved = spark.table(review_table).where("validated = 'yes'").collect()
     applied = 0
+    # Every identifier below comes from the metastore, and the comment text is
+    # model-generated — neither is a literal this notebook controls. Escape both
+    # before they reach spark.sql: a backtick inside a name (or a quote inside a
+    # comment) would otherwise close the quoting early and let the rest of the
+    # value be parsed as SQL (CWE-89).
+    def _ident(name):
+        return "`" + str(name).replace("`", "``") + "`"
+
     for r in approved:
-        fq = f"`{r['table_catalog']}`.`{r['table_schema']}`.`{r['table_name']}`"
-        comment = (r["draft_comment"] or "").replace("'", "''")
-        spark.sql(f"ALTER TABLE {fq} ALTER COLUMN `{r['column_name']}` COMMENT '{comment}'")
+        fq = ".".join(_ident(r[c]) for c in ("table_catalog", "table_schema", "table_name"))
+        column = _ident(r["column_name"])
+        # Escape backslashes before quotes: Spark SQL treats '\' as an escape inside
+        # string literals, so a model-generated comment ending in '\' would otherwise
+        # escape the closing quote and break/inject the statement (CWE-89).
+        comment = (r["draft_comment"] or "").replace("\\", "\\\\").replace("'", "''")
+        spark.sql(f"ALTER TABLE {fq} ALTER COLUMN {column} COMMENT '{comment}'")
         applied += 1
     if approved:
         spark.sql(f"UPDATE {review_table} SET validated = 'applied' WHERE validated = 'yes'")

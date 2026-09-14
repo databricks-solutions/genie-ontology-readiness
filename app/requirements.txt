@@ -1,4 +1,20 @@
 fastapi~=0.141.1
+
+# starlette is pinned EXACTLY (not left to fastapi's transitive resolution)
+# because it carries the fixed code for seven advisories open at 0.46.2; 1.3.1 is
+# the lowest version that closes all seven, 1.6.0 is what this was validated
+# against. fastapi~=0.141.1 already allows starlette>=1.0 (the <0.133 cap is gone),
+# so this pin only tightens the floor to the patched line — everything else stays
+# on its normal range and can move with Dependabot.
+#   CVE-2026-48710  Host-header routing confusion  (CISA KEV)  -> fixed 1.0.1
+#   CVE-2026-48817  HTTPEndpoint getattr method dispatch       -> fixed 1.1.0
+#   CVE-2026-48818  StaticFiles UNC path SSRF                  -> fixed 1.1.0
+#   CVE-2026-54282  request.url authority confusion            -> fixed 1.3.0
+#   CVE-2026-54283  urlencoded form limits silently ignored    -> fixed 1.3.1
+#   CVE-2025-62727  FileResponse Range quadratic-time DoS      -> fixed 0.49.1
+#   CVE-2025-54121  multipart spool blocks the event loop      -> fixed 0.47.2
+starlette==1.6.0
+
 uvicorn[standard]~=0.52.4
 aiohttp~=3.14.3
 databricks-sdk~=0.36.0

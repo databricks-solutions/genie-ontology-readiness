@@ -4,14 +4,15 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, Body
+from fastapi import APIRouter, Body, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from server.assessment.scoring import run_assessment, run_assessment_stream
-from server.routes._shared import _cache_get, _cache_set
+from server.routes._shared import _cache_get, _cache_set, current_principal
 from server.config import set_user_token
 from server.workspace_filter import set_workspace_filter, set_catalog_scope
+from server.security import safe_error
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ async def assess_get(
 @router.post("/assess/stream")
 async def assess_stream(
     req: AssessRequest = Body(default=AssessRequest()),
-    x_forwarded_email: Optional[str] = Header(default=None),
+    principal: str = Depends(current_principal),
     x_forwarded_access_token: Optional[str] = Header(default=None),
 ):
     """Stream the assessment: one SSE event per pillar as it completes, then a
@@ -98,7 +99,7 @@ async def assess_stream(
                         "top_gaps": event["top_gaps"],
                     }
                     try:
-                        sid = await snapshots.save_snapshot(scorecard, created_by=x_forwarded_email)
+                        sid = await snapshots.save_snapshot(scorecard, created_by=principal)
                         event["snapshot_id"] = sid
                         event["snapshot_saved"] = sid is not None
                     except Exception as e:
@@ -106,23 +107,25 @@ async def assess_stream(
                         event["snapshot_saved"] = False
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
-            logger.error(f"assess_stream error: {e}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)[:200]})}\n\n"
+            # Assessment failures wrap SQL Warehouse errors, which quote the failing
+            # statement and the object names involved — never return that verbatim.
+            reference, message = safe_error(e, "assessment stream", logger)
+            yield f"data: {json.dumps({'type': 'error', 'error': message, 'reference': reference})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @router.get("/assess/history")
-async def assess_history(x_forwarded_email: Optional[str] = Header(default=None)):
+async def assess_history(principal: str = Depends(current_principal)):
     """The current user's past assessment runs (requires Lakebase; empty otherwise)."""
-    return {"snapshots": await snapshots.list_snapshots(created_by=x_forwarded_email)}
+    return {"snapshots": await snapshots.list_snapshots(created_by=principal)}
 
 
 @router.get("/assess/snapshot/{snapshot_id}")
-async def assess_snapshot(snapshot_id: int, x_forwarded_email: Optional[str] = Header(default=None)):
+async def assess_snapshot(snapshot_id: int, principal: str = Depends(current_principal)):
     """Load one past assessment's full scorecard (scoped to the current user)."""
-    snap = await snapshots.get_snapshot(snapshot_id, created_by=x_forwarded_email)
+    snap = await snapshots.get_snapshot(snapshot_id, created_by=principal)
     if snap is None:
         return JSONResponse(status_code=404, content={"error": "Assessment not found."})
     return snap

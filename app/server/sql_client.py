@@ -258,11 +258,18 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
             params_list.append({"name": name, "value": str(value), "type": param_type})
         payload["parameters"] = params_list
 
-    async with aiohttp.ClientSession() as session:
+    # `wait_timeout` bounds the warehouse side; this bounds the HTTP side, so a
+    # stalled connection cannot hold a worker slot indefinitely (CWE-400). Reads
+    # are bounded per-socket rather than in total because _poll_statement reuses
+    # this session for up to two minutes of polling.
+    timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
-                logger.error(f"SQL Warehouse error ({response.status}): {error_text}")
+                # Truncated for the log only; the exception keeps the full text so
+                # execute_sql's authorization-marker matching still sees it.
+                logger.error(f"SQL Warehouse error ({response.status}): {error_text[:2000]}")
                 raise Exception(f"SQL Warehouse error ({response.status}): {error_text}")
 
             result = await response.json()

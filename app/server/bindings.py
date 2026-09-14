@@ -85,7 +85,9 @@ async def accessible_catalogs(workspace_ids: set[str]) -> Optional[list[dict]]:
     if not host or not headers:
         return None
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
+    ) as session:
         cat_data = await _get_json(session, f"{host}/api/2.1/unity-catalog/catalogs", headers)
         if not isinstance(cat_data, dict):
             return None
@@ -120,7 +122,9 @@ async def all_catalogs() -> Optional[list[dict]]:
     headers = get_auth_headers()
     if not host or not headers:
         return None
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
+    ) as session:
         cat_data = await _get_json(session, f"{host}/api/2.1/unity-catalog/catalogs", headers)
     if not isinstance(cat_data, dict):
         return None
