@@ -84,7 +84,7 @@ async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, created_at, created_by, overall_score, overall_level "
-                f"FROM {_TABLE} WHERE created_by IS NOT DISTINCT FROM $1 "
+                f"FROM {_TABLE} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
                 f"ORDER BY created_at DESC LIMIT $2",
                 created_by,
                 limit,
@@ -116,7 +116,7 @@ async def get_snapshot(snapshot_id: int, created_by: str | None = None) -> dict 
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT id, created_at, created_by, scorecard FROM {_TABLE} "
-                f"WHERE id = $1 AND created_by IS NOT DISTINCT FROM $2",
+                f"WHERE id = $1 AND lower(created_by) IS NOT DISTINCT FROM lower($2)",
                 snapshot_id,
                 created_by,
             )

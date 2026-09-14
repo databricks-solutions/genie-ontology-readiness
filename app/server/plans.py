@@ -88,7 +88,7 @@ async def list_plans(created_by: str | None = None, limit: int = 50) -> list[dic
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, created_at, created_by, snapshot_id, title, model "
-                f"FROM {_TABLE} WHERE created_by IS NOT DISTINCT FROM $1 "
+                f"FROM {_TABLE} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
                 f"ORDER BY created_at DESC LIMIT $2",
                 created_by,
                 limit,
@@ -121,7 +121,7 @@ async def get_plan(plan_id: int, created_by: str | None = None) -> dict | None:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT id, created_at, created_by, snapshot_id, title, model, plan_markdown "
-                f"FROM {_TABLE} WHERE id = $1 AND created_by IS NOT DISTINCT FROM $2",
+                f"FROM {_TABLE} WHERE id = $1 AND lower(created_by) IS NOT DISTINCT FROM lower($2)",
                 plan_id,
                 created_by,
             )

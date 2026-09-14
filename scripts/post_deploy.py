@@ -34,7 +34,34 @@ WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOU
 USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
 LAKEBASE_INSTANCE = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
 LAKEBASE_DATABASE = os.environ.get("LAKEBASE_DATABASE", "ontology_readiness")
+# These provisioning connections carry a live Lakebase credential over the public
+# internet. `require` encrypts but verifies nothing, so it gives no protection
+# against an in-path attacker — see app/server/lakebase_client.py for the runtime
+# counterpart and the escape hatch.
+LAKEBASE_SSL_MODE = os.environ.get("LAKEBASE_SSL_MODE", "verify-full")
 MAX_WAIT = 600
+
+
+def _lakebase_ssl():
+    """asyncpg ``ssl`` arg for LAKEBASE_SSL_MODE (mirrors lakebase_client._ssl_arg).
+
+    Passing the bare ``verify-full``/``verify-ca`` string makes asyncpg look for a
+    CA cert at ``~/.postgresql/root.crt`` (absent here), so the provisioning
+    connections fail. The Lakebase endpoint is publicly-signed, so build an
+    SSLContext from a trusted CA bundle and verify against it; non-verifying modes
+    pass through as the plain string."""
+    import ssl
+    mode = (LAKEBASE_SSL_MODE or "").lower()
+    if mode not in ("verify-ca", "verify-full"):
+        return LAKEBASE_SSL_MODE
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    if mode == "verify-ca":
+        ctx.check_hostname = False
+    return ctx
 
 # Populated by setup_lakebase() when USE_LAKEBASE is on.
 _LAKEBASE = {"host": "", "sp_client_id": ""}
@@ -63,6 +90,7 @@ def render_app_yml():
     set_env("LAKEBASE_HOST", _LAKEBASE["host"])
     set_env("LAKEBASE_USER", _LAKEBASE["sp_client_id"])
     set_env("LAKEBASE_DATABASE", LAKEBASE_DATABASE)
+    set_env("LAKEBASE_SSL_MODE", LAKEBASE_SSL_MODE)
     set_env("LAKEBASE_INSTANCE_NAME", LAKEBASE_INSTANCE)
 
     out.write_text(text)
@@ -163,7 +191,7 @@ def setup_lakebase():
         token = _credential(LAKEBASE_INSTANCE)
         # 1. create the database (idempotent)
         conn = await asyncpg.connect(host=host, port=5432, database="postgres",
-                                     user=user_email, password=token, ssl="require")
+                                     user=user_email, password=token, ssl=_lakebase_ssl())
         try:
             await conn.execute(f'CREATE DATABASE {LAKEBASE_DATABASE}')
             print(f"  created database {LAKEBASE_DATABASE}")
@@ -235,7 +263,7 @@ def attach_lakebase():
             import asyncpg
             token = _credential(LAKEBASE_INSTANCE)
             conn = await asyncpg.connect(host=host, port=5432, database=LAKEBASE_DATABASE,
-                                         user=user_email, password=token, ssl="require")
+                                         user=user_email, password=token, ssl=_lakebase_ssl())
             try:
                 for g in grants:
                     await conn.execute(g)

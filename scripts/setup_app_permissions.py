@@ -30,6 +30,17 @@ ASSESS_CATALOGS = [c.strip() for c in os.environ.get("ASSESS_CATALOGS", "").spli
 _INTERNAL = {"system", "__databricks_internal", "samples", "information_schema"}
 
 
+def _ident(name: str) -> str:
+    """Back-quote a SQL identifier, doubling any embedded backtick.
+
+    Catalog names and the service principal id come from the workspace API, not
+    from this script, so a name containing a backtick would otherwise close the
+    quoting early and let the remainder be parsed as SQL (CWE-89). Doubling is
+    how Databricks escapes a backtick inside a quoted identifier.
+    """
+    return "`" + str(name).replace("`", "``") + "`"
+
+
 def run_cli(*args):
     cmd = ["databricks"] + list(args)
     if PROFILE:
@@ -86,10 +97,11 @@ def main():
 
     # 1) System schemas (information_schema is the core; access/query are optional)
     print("\n[1/2] Granting read on system schemas...")
-    grant(f"GRANT USE CATALOG ON CATALOG system TO `{sp}`")
+    sp_id = _ident(sp)
+    grant(f"GRANT USE CATALOG ON CATALOG system TO {sp_id}")
     for schema in ("information_schema", "access", "query"):
-        grant(f"GRANT USE SCHEMA ON SCHEMA system.{schema} TO `{sp}`")
-        grant(f"GRANT SELECT ON SCHEMA system.{schema} TO `{sp}`")
+        grant(f"GRANT USE SCHEMA ON SCHEMA system.{schema} TO {sp_id}")
+        grant(f"GRANT SELECT ON SCHEMA system.{schema} TO {sp_id}")
 
     # 2) Target catalogs
     print("\n[2/2] Granting read on assessed catalogs...")
@@ -105,10 +117,10 @@ def main():
     for cat in catalogs:
         # Back-quote the catalog identifier so names with hyphens or other
         # special characters (e.g. "cardiac-intelligence-lakebase") are valid.
-        cat_id = "`" + cat.replace("`", "``") + "`"
-        grant(f"GRANT USE CATALOG ON CATALOG {cat_id} TO `{sp}`")
-        grant(f"GRANT USE SCHEMA ON CATALOG {cat_id} TO `{sp}`")
-        grant(f"GRANT SELECT ON CATALOG {cat_id} TO `{sp}`")
+        cat_id = _ident(cat)
+        grant(f"GRANT USE CATALOG ON CATALOG {cat_id} TO {sp_id}")
+        grant(f"GRANT USE SCHEMA ON CATALOG {cat_id} TO {sp_id}")
+        grant(f"GRANT SELECT ON CATALOG {cat_id} TO {sp_id}")
 
     print("\nPermissions setup complete.")
     print("Note: SELECT on catalogs lets the SP see those objects in information_schema.")

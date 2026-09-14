@@ -10,7 +10,17 @@ env:
   # Optional: restrict the assessment to specific catalogs (comma-separated).
   - name: ASSESS_CATALOGS
     value: ""
+  # Largest request body the app will accept, in bytes (default 2 MiB).
+  - name: MAX_REQUEST_BYTES
+    value: "2097152"
+  # Postgres TLS mode for the history database. "verify-full" (default) checks the
+  # certificate and hostname; lower it only if your endpoint presents a certificate
+  # outside the container's CA bundle.
+  - name: LAKEBASE_SSL_MODE
+    value: "verify-full"
   # Optional: enable the live Genie answer-quality test (pillar 5).
+  # A Genie answer returns rows from your warehouse. The test runs on-behalf-of
+  # the viewer where the workspace allows it; see GENIE_ALLOW_SP_FALLBACK below.
   - name: GENIE_SPACE_ID
     value: ""
   # The deployed workspace's id — seeds the default workspace-filter selection so
@@ -18,6 +28,18 @@ env:
   # default on a shared metastore. post_deploy.py resolves it automatically.
   - name: WORKSPACE_ID
     value: ""
+  # The Genie test runs on-behalf-of the viewer whenever a viewer token is
+  # forwarded. This controls what happens when there is no viewer token, which is
+  # the normal case unless user authorization is enabled for the app.
+  # "false" (default) = decline with a 403 instead of answering, so a viewer can
+  #   never read (via the app service principal) rows from tables they lack grants
+  #   on — this is the fail-closed default that closes the reported authorization
+  #   bypass (CWE-269/863).
+  # "true" = answer as the app service principal, as before, for a deployment that
+  #   explicitly accepts the risk (logs a warning on every such call).
+  # Either way the identity that answered is logged and returned as `ran_as`.
+  - name: GENIE_ALLOW_SP_FALLBACK
+    value: "false"
   # Branding shown in the app header.
   - name: BRAND_NAME
     value: "Databricks"

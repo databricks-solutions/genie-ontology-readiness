@@ -7,7 +7,30 @@ import aiohttp
 from contextvars import ContextVar
 from typing import Optional
 
+from fastapi import Header
+
+from server.security import resolve_principal, safe_error
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Authenticated principal
+# ---------------------------------------------------------------------------
+async def current_principal(
+    x_forwarded_email: Optional[str] = Header(default=None),
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+) -> str:
+    """The ownership key for this request's assessment history and saved plans.
+
+    Every per-user route depends on this instead of reading the forwarded email
+    header directly, so ownership is bound to an identity the app established —
+    from the forwarded token where one exists — rather than to a header value a
+    caller could set (CWE-290). This always resolves to a usable key, so no
+    request is ever refused for lack of an identity.
+    """
+    return await resolve_principal(forwarded_email=x_forwarded_email,
+                                   forwarded_token=x_forwarded_access_token)
 
 # ---------------------------------------------------------------------------
 # Lightweight server-side response cache. The assessment is relatively
@@ -102,10 +125,16 @@ def _supports_temperature(model: str) -> bool:
     return not any(tok in m for tok in _NO_TEMPERATURE_TOKENS)
 
 
+# No total timeout: a streamed completion legitimately runs for minutes. Bound the
+# connect and per-read stalls instead, so a hung upstream cannot pin a worker and
+# its connection open indefinitely (CWE-400).
+_LLM_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=120)
+
+
 async def _get_llm_session() -> aiohttp.ClientSession:
     global _llm_session
     if _llm_session is None or _llm_session.closed:
-        _llm_session = aiohttp.ClientSession()
+        _llm_session = aiohttp.ClientSession(timeout=_LLM_TIMEOUT)
     return _llm_session
 
 
@@ -196,8 +225,10 @@ async def _stream_from_fmapi(
                 yield "data: [DONE]\n\n"
                 return
     except Exception as e:
-        logger.error(f"LLM streaming error: {e}")
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        # The exception text can carry the request payload or upstream response
+        # body; send the client only a reference to the (redacted) server log.
+        reference, message = safe_error(e, "LLM streaming", logger)
+        yield f"data: {json.dumps({'error': message, 'reference': reference})}\n\n"
         yield "data: [DONE]\n\n"
 
 
