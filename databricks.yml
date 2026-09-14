@@ -16,6 +16,9 @@ sync:
 variables:
   warehouse_id:
     description: "SQL Warehouse ID used for assessment queries (databricks api get /api/2.0/sql/warehouses)"
+    # Empty default so `databricks bundle validate` (the local quality gate's CHECK 2)
+    # passes without a required-variable error; every deploy overrides via --var.
+    default: ""
   app_name:
     description: "Databricks App name"
     default: genie-ontology-readiness

@@ -1,7 +1,6 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from server import bindings
 from server.bindings import _select_accessible
 from server.routes import catalogs as cat_route
 from server.assessment import probes
