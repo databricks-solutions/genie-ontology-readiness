@@ -7,9 +7,12 @@ tactical plan to prepare for Genie Ontology, naming the public Databricks
 accelerators that help close each gap. The plan can be exported to a branded PDF.
 """
 
+import html as _html
 import io
 import json
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header
@@ -220,21 +223,116 @@ async def plan_get(plan_id: int, x_forwarded_email: Optional[str] = Header(defau
     return plan
 
 
+def _strip_document_h1(markdown_text: str) -> str:
+    """Remove the FIRST top-level H1 from the plan Markdown (the redundant title).
+
+    Fixes the duplicated-opening-line bug (issue #21): the PDF route renders the
+    document title itself (``<h1>{title}</h1>``), but the generated plan body also
+    tends to open with its own ``# <title>`` heading (the model adds one despite the
+    prompt), so the title rendered twice in the exported PDF. We remove that title by
+    structure — the first H1 — not by matching its text, so it's robust to the model
+    rephrasing the title or using a different dash. Only the FIRST H1 is removed: a
+    later legitimate ``# Appendix``-style heading is left intact (removing every H1
+    would orphan its content under the preceding section).
+
+    Matching details:
+    - ATX H1 is a single ``#`` (not ``##``) with up to 3 leading spaces; Python-
+      Markdown treats ``#Title`` (no space after ``#``) as an H1 too, so the space is
+      optional here — otherwise a space-less title would slip through and still dup.
+    - Setext H1 (a text line underlined by ``===``) is handled.
+    - Fenced code blocks are respected: a ``# comment`` inside a ``` / ~~~ fence is
+      code, not a heading. The closing fence must use the same character and be at
+      least as long as the opening one (CommonMark), so a longer outer fence isn't
+      closed early by a shorter inner one."""
+    lines = markdown_text.split("\n")
+    out: list[str] = []
+    fence_char: Optional[str] = None
+    fence_len = 0
+    removed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Track fenced code blocks; never treat their contents as headings.
+        if fence_char is None:
+            m_open = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if m_open:
+                fence_char, fence_len = m_open.group(1)[0], len(m_open.group(1))
+                out.append(line)
+                i += 1
+                continue
+        else:
+            if re.match(rf"^ {{0,3}}{re.escape(fence_char)}{{{fence_len},}}\s*$", line):
+                fence_char, fence_len = None, 0
+            out.append(line)
+            i += 1
+            continue
+        if not removed:
+            # ATX H1: one '#' (not '##'), optional space, then content.
+            if re.match(r"^ {0,3}#(?!#)\s*\S", line):
+                removed = True
+                i += 1
+                continue
+            # Setext H1: a text line immediately underlined by a run of '='.
+            if (
+                i + 1 < len(lines)
+                and line.strip()
+                and re.match(r"^\s*=+\s*$", lines[i + 1])
+            ):
+                removed = True
+                i += 2
+                continue
+        out.append(line)
+        i += 1
+    # Collapse the blank-line gap a removed heading leaves behind.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+
+
 _PDF_CSS = """
-@page { size: A4; margin: 2.2cm 2cm; }
+@page {
+  size: A4; margin: 2.2cm 2cm;
+  @frame footer { -pdf-frame-content: footerContent; left: 2cm; width: 17cm; bottom: 1.2cm; height: 1cm; }
+}
 body { font-family: Helvetica, Arial, sans-serif; font-size: 10.5pt; color: #1B3139; line-height: 1.5; }
 h1 { color: #1B3139; font-size: 19pt; border-bottom: 3px solid #FF3621; padding-bottom: 6px; margin: 0 0 4px 0; }
 .subtitle { color: #5B6B70; font-size: 9pt; margin-bottom: 16px; }
-h2 { color: #1B3139; font-size: 13pt; margin-top: 18px; border-bottom: 1px solid #E3E8E9; padding-bottom: 3px; }
-h3 { color: #1B3139; font-size: 11pt; margin-top: 12px; }
+h2 { color: #1B3139; font-size: 13pt; margin-top: 18px; border-bottom: 1px solid #E3E8E9; padding-bottom: 3px; -pdf-keep-with-next: true; page-break-after: avoid; }
+h3 { color: #1B3139; font-size: 11pt; margin-top: 12px; -pdf-keep-with-next: true; page-break-after: avoid; }
 ul, ol { margin: 6px 0 6px 0; padding-left: 18px; }
 li { margin-bottom: 4px; }
 strong { color: #1B3139; }
 code { font-family: Courier, monospace; background: #F4F6F6; padding: 1px 3px; }
-table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0; -pdf-keep-in-frame-mode: shrink; }
 th, td { border: 1px solid #D5DCDD; padding: 5px 7px; text-align: left; font-size: 9.5pt; }
 th { background: #1B3139; color: #fff; }
+.footer { color: #8A9499; font-size: 8pt; text-align: center; }
 """
+
+
+def _build_plan_pdf_html(markdown_text: str, title: str) -> str:
+    """Assemble the full branded HTML document for the plan PDF.
+
+    Renders the title exactly once (issue #21): the body's own redundant title H1 is
+    stripped, and the title is supplied here as the single ``<h1>``. ``title`` is
+    HTML-escaped so a title containing ``&``/``<``/``>`` can't produce malformed
+    markup that breaks xhtml2pdf. A page-number footer and a dated subtitle are
+    added for an executive-ready readout. Pure/deterministic so it can be unit-tested
+    against the real CSS + footer syntax without hitting the network."""
+    import markdown as md
+
+    clean_md = _strip_document_h1(markdown_text or "")
+    body_html = md.markdown(clean_md, extensions=["tables", "fenced_code", "toc", "sane_lists"])
+    d = datetime.now(timezone.utc)
+    generated_on = f"{d:%B} {d.day}, {d.year}"  # portable — avoids the glibc-only %-d
+    esc_title = _html.escape(title or "Action Plan")
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{_PDF_CSS}</style></head>"
+        f"<body>"
+        f"<div id='footerContent' class='footer'>Genie Ontology Readiness · Databricks · "
+        f"page <pdf:pagenumber> of <pdf:pagecount></div>"
+        f"<h1>{esc_title}</h1>"
+        f"<div class='subtitle'>Generated by the Genie Ontology Readiness app · Databricks · {generated_on}</div>"
+        f"{body_html}</body></html>"
+    )
 
 
 @router.post("/plan/pdf")
@@ -246,21 +344,15 @@ async def plan_pdf(req: PlanPdfRequest):
     (Assess, Learn, Plan chat) keeps working.
     """
     try:
-        import markdown as md
+        import markdown  # noqa: F401 - availability gate; imported for real in the builder
         from xhtml2pdf import pisa
     except Exception as e:  # pragma: no cover - depends on runtime deps
         logger.error(f"PDF engine unavailable: {e}")
         return Response(content="PDF export is unavailable on this deployment.", status_code=503)
 
-    body_html = md.markdown(req.markdown or "", extensions=["tables", "fenced_code", "toc", "sane_lists"])
-    html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{_PDF_CSS}</style></head>"
-        f"<body><h1>{req.title}</h1>"
-        f"<div class='subtitle'>Generated by the Genie Ontology Readiness app · Databricks</div>"
-        f"{body_html}</body></html>"
-    )
+    html_doc = _build_plan_pdf_html(req.markdown or "", req.title)
     buf = io.BytesIO()
-    result = pisa.CreatePDF(src=html, dest=buf, encoding="utf-8")
+    result = pisa.CreatePDF(src=html_doc, dest=buf, encoding="utf-8")
     if result.err:
         logger.error("PDF generation failed")
         return Response(content="PDF generation failed", status_code=500)
