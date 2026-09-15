@@ -18,7 +18,7 @@ starlette==1.6.0
 uvicorn[standard]~=0.52.4
 aiohttp~=3.14.3
 databricks-sdk~=0.138.0
-pydantic~=2.0
+pydantic~=2.13
 asyncpg~=0.31.0
 markdown>=3.10.3
 xhtml2pdf>=0.2.18
