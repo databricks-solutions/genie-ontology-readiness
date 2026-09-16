@@ -170,8 +170,11 @@ databricks.yml               — DABs: app + sql-warehouse resource
 
 Unity Catalog Foundation · Metadata Richness · Relationships & Modeling ·
 Metrics · Genie Agents · Domains & Stewardship ·
-Adoption & Activity. The overall score maps to a **Genie Foundations** session
-("Ready for Session 2 — Genie Room Setup", etc.).
+Adoption & Activity. The overall score maps to a generic, engagement-neutral
+readiness tier (Foundation building, Core foundation in place, Semantics and
+Genie forming, Curated and validating, Ontology-ready), and the next-step
+guidance is derived from the customer's actual pillar gaps rather than a fixed
+per-tier agenda.
 
 ## Local development
 

@@ -72,9 +72,9 @@ run a guided fix + auto‑optimize loop with measurable proof of lift.
 
 - **Genie Workbench (open source):** https://github.com/databricks-solutions/databricks-genie-workbench
 - **Getting your Genie Agents production-ready with Genie Workbench (Medium):** https://medium.com/@jenny.j.park/getting-your-genie-spaces-production-ready-with-genie-workbench-e9e7db8a88ca
-- **Curate an effective Genie Agent (docs):** https://docs.databricks.com/aws/en/genie/best-practices
-- **Create and manage a Genie Agent (docs):** https://docs.databricks.com/aws/en/genie/set-up
-- **Build a knowledge store for Genie (docs):** https://docs.databricks.com/aws/en/genie/knowledge-store
+- **Curate an effective Genie Agent (docs):** https://docs.databricks.com/aws/en/genie-agents/best-practices
+- **Create and manage a Genie Agent (docs):** https://docs.databricks.com/aws/en/genie-agents/set-up
+- **Tune Genie Agent quality, including knowledge (docs):** https://docs.databricks.com/aws/en/genie-agents/tune-quality
 - **From Data to Dialogue — best‑practices guide (blog):** https://www.databricks.com/blog/data-dialogue-best-practices-guide-building-high-performing-genie-spaces
 - **How to build production‑ready Genie Agents (blog):** https://www.databricks.com/blog/how-build-production-ready-genie-spaces-and-build-trust-along-way
 - **Building confidence with benchmarks & Ask Review (blog):** https://www.databricks.com/blog/building-confidence-your-genie-space-benchmarks-and-ask-review

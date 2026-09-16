@@ -14,6 +14,7 @@ from server.pillars import (
     LEVEL_LABELS,
     level_from_score,
     readiness_stage,
+    readiness_guidance,
 )
 from server.assessment.probes import PROBES, prime_request_sources, _progress_sink
 from server.sql_client import (
@@ -98,7 +99,9 @@ def _finalize(pillars_out: list[dict]) -> dict:
             "level": overall_level,
             "level_label": LEVEL_LABELS[overall_level],
             "readiness_stage": stage["label"],
-            "readiness_detail": stage["detail"],
+            # Gap-driven guidance derived from the customer's actual gaps, not the
+            # static per-tier agenda; generic tier detail is the no-gaps fallback.
+            "readiness_detail": readiness_guidance(ranked, stage["detail"]),
             "assessed_at": datetime.now(timezone.utc).isoformat(),
         },
         "top_gaps": top_gaps,

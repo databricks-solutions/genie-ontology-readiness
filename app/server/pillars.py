@@ -11,40 +11,43 @@ Maturity levels (0-4) apply to every pillar:
     3 Established  — broad coverage, governed
     4 Optimized    — comprehensive, certified, actively used
 
-Readiness is anchored on Databricks' "Genie Ready" framing plus the Genie
-Foundations 4-session delivery model. The user-defined UC Business Semantics
-foundation FEEDS the (gated) learned Genie Ontology layer, so "preparing for
-Genie Ontology" = maturing this foundation.
+Readiness is anchored on Databricks' "Genie Ready" framing. The user-defined UC
+Business Semantics foundation FEEDS the (gated) learned Genie Ontology layer, so
+"preparing for Genie Ontology" = maturing this foundation.
 """
 
 LEVEL_LABELS = ["Absent", "Initial", "Developing", "Established", "Optimized"]
 
-# Overall readiness stages, mapped to the Genie Foundations engagement.
+# Overall readiness tiers: generic, engagement-neutral maturity bands. Each tier
+# describes the customer's *state*, not a fixed sequence of work. The next-step
+# guidance shown to the user is derived from the customer's actual pillar gaps
+# (see readiness_guidance below); the per-tier "detail" here is only the generic
+# fallback used when there are no gaps to surface.
 READINESS_STAGES = [
     {
         "min_score": 0,
         "label": "Foundation building",
-        "detail": "Establish Unity Catalog governance and a curated gold layer before a Genie engagement.",
+        "detail": "Establish Unity Catalog governance and a curated gold layer as the base for Genie.",
     },
     {
         "min_score": 35,
-        "label": "Ready for Session 1 — Data & Governance Readiness",
-        "detail": "Core UC is in place; validate gold-layer data and metadata quality.",
+        "label": "Core foundation in place",
+        "detail": "Core Unity Catalog governance is in place; strengthen metadata and the semantic layer next.",
     },
     {
         "min_score": 55,
-        "label": "Ready for Session 2 — Genie Room Setup & Tuning",
-        "detail": "Metadata and a semantic layer exist; stand up and tune Genie Agents.",
+        "label": "Semantics and Genie forming",
+        "detail": "Metadata and a semantic layer are forming; curate and tune Genie Agents.",
     },
     {
         "min_score": 72,
-        "label": "Ready for Session 3 — Validation & Business Onboarding",
+        "label": "Curated and validating",
         "detail": "Genie Agents are curated; validate accuracy and onboard business users.",
     },
     {
         "min_score": 85,
-        "label": "Ontology-ready — Session 4 & beyond",
-        "detail": "Mature semantics, domains, and adoption. Strong candidate for the learned Genie Ontology preview.",
+        "label": "Ontology-ready",
+        "detail": "Mature semantics, domains, and adoption. A strong candidate for the learned Genie Ontology preview.",
     },
 ]
 
@@ -119,9 +122,40 @@ def level_from_score(score: float) -> int:
 
 
 def readiness_stage(overall_score: float) -> dict:
-    """Map an overall 0-100 score to a Genie Foundations readiness stage."""
+    """Map an overall 0-100 score to a generic readiness tier."""
     stage = READINESS_STAGES[0]
     for s in READINESS_STAGES:
         if overall_score >= s["min_score"]:
             stage = s
     return stage
+
+
+def _join_names(names: list[str]) -> str:
+    """Natural-language join: [a] -> "a", [a,b] -> "a and b", [a,b,c] -> "a, b, and c"."""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
+def readiness_guidance(ranked_pillars: list[dict], fallback: str) -> str:
+    """Gap-driven next-step guidance for the overall readiness tier.
+
+    Names the customer's lowest-scoring, highest-weight pillars that actually
+    have gaps. The score tier alone does not tell you which gaps a customer has,
+    so guidance comes from the assessment, not a static per-tier agenda. Falls
+    back to the tier's generic detail when there are no gaps to surface.
+
+    `ranked_pillars` must be pre-sorted lowest-score first, then highest-weight;
+    each item needs a "name" and a "gaps" list. At most three pillars are named.
+    """
+    gap_pillars: list[str] = []
+    for pil in ranked_pillars:
+        if pil.get("gaps") and pil["name"] not in gap_pillars:
+            gap_pillars.append(pil["name"])
+        if len(gap_pillars) == 3:
+            break
+    if not gap_pillars:
+        return fallback
+    return f"Focus next on {_join_names(gap_pillars)}: your lowest-scoring, highest-impact areas."

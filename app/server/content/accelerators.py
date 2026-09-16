@@ -356,8 +356,8 @@ ACCELERATORS: list[dict] = [
         "artifact_dir": "ai-ready-semantics",
         "artifact_file": "building-ai-ready-semantics.md",
         "source": {
-            "title": "Building AI-Ready Business Semantics (guide)",
-            "url": "https://docs.databricks.com/aws/en/genie/",
+            "title": "Curate an effective Genie agent (docs)",
+            "url": "https://docs.databricks.com/aws/en/genie-agents/best-practices",
         },
         "valid_as_of": "2026-08",
     },
@@ -470,7 +470,7 @@ ACCELERATORS: list[dict] = [
         ],
         "source": {
             "title": "Unity Catalog metric views (docs)",
-            "url": "https://docs.databricks.com/aws/en/metric-views/",
+            "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views",
         },
         "valid_as_of": "2026-07",
     },
@@ -540,7 +540,7 @@ ACCELERATORS: list[dict] = [
         "artifact_file": "building-ai-ready-semantics.md",
         "source": {
             "title": "Building AI-Ready Business Semantics (guide)",
-            "url": "https://docs.databricks.com/aws/en/metric-views/",
+            "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views",
         },
         "valid_as_of": "2026-08",
     },
@@ -725,40 +725,6 @@ ACCELERATORS: list[dict] = [
         "source": {
             "title": "System tables reference (docs)",
             "url": "https://docs.databricks.com/aws/en/admin/system-tables/",
-        },
-        "valid_as_of": "2026-07",
-    },
-    {
-        "key": "adoption-readiness-trend-job",
-        "title": "Track readiness over time",
-        "summary": "How to schedule the readiness assessment to run on a cadence and persist each result so the readiness score is charted over time — proof that accelerators are landing.",
-        "capability": "adoption",
-        "type": "guide",
-        "effort": "~1 hour",
-        "what_it_does": (
-            "Schedule the readiness assessment to run on a recurring cadence and persist each result as a Lakebase snapshot. "
-            "Then chart the overall score and per-pillar scores over time. This closes the loop: as accelerators land and "
-            "coverage rises, the trend visibly climbs — giving stakeholders a single chart that proves the ontology-readiness "
-            "program is working."
-        ),
-        "prerequisites": [
-            "The readiness app deployed with Lakebase snapshots enabled",
-            "Permission to deploy a job (via Databricks Asset Bundles) into the workspace",
-            "A service principal with the system-table and catalog read grants the assessment needs",
-        ],
-        "improves_signals": ["adoption"],
-        "target_level": 4,
-        "review_mode": False,
-        "steps": [
-            "Define a DAB job that runs the readiness assessment on a recurring schedule (see the linked docs for DAB syntax).",
-            "Configure the job to persist each assessment result as a Lakebase snapshot for historical tracking.",
-            "Apply the DAB configuration and let it run on its cadence (e.g. weekly) to accumulate a trend history.",
-            "Create a dashboard or use Lakebase to visualize the overall and per-pillar score trends over time.",
-            "Re-run the readiness assessment — the Adoption & Activity pillar reflects sustained activity and trend tracking.",
-        ],
-        "source": {
-            "title": "Databricks Asset Bundles (docs)",
-            "url": "https://docs.databricks.com/aws/en/dev-tools/bundles/",
         },
         "valid_as_of": "2026-07",
     },

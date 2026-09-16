@@ -12,6 +12,7 @@ from server.pillars import (
     READINESS_STAGES,
     level_from_score,
     readiness_stage,
+    readiness_guidance,
 )
 
 
@@ -72,3 +73,52 @@ def test_readiness_stage_is_monotonic_by_threshold():
         stage_min = readiness_stage(score)["min_score"]
         assert stage_min >= prev, f"readiness stage regressed at score {score}"
         prev = stage_min
+
+
+def test_readiness_stage_labels_are_engagement_neutral():
+    # #58: the public app must not bake in the internal Genie Foundations
+    # "Session N" engagement sequence; labels read as generic maturity tiers.
+    for s in READINESS_STAGES:
+        assert "Session" not in s["label"], f"stage label leaks engagement jargon: {s['label']!r}"
+        assert s["label"] and s["detail"]
+    assert [s["label"] for s in READINESS_STAGES] == [
+        "Foundation building",
+        "Core foundation in place",
+        "Semantics and Genie forming",
+        "Curated and validating",
+        "Ontology-ready",
+    ]
+
+
+def test_readiness_guidance_names_lowest_pillars_with_gaps():
+    # #58: next-step guidance is gap-driven, not a static per-tier agenda. Given
+    # ranked pillars (lowest-score first), it names up to three that have gaps.
+    ranked = [
+        {"name": "Metrics", "gaps": ["No metric views found."]},
+        {"name": "Domains & Stewardship", "gaps": ["No domains defined."]},
+        {"name": "Metadata Richness", "gaps": ["Sparse comments."]},
+        {"name": "Genie Agents", "gaps": ["Few curated agents."]},
+    ]
+    out = readiness_guidance(ranked, "fallback")
+    assert out == (
+        "Focus next on Metrics, Domains & Stewardship, and Metadata Richness: "
+        "your lowest-scoring, highest-impact areas."
+    )
+
+
+def test_readiness_guidance_skips_pillars_without_gaps():
+    # Pillars with no gaps (e.g. unavailable/degraded signals) are not named.
+    ranked = [
+        {"name": "Adoption & Activity", "gaps": []},
+        {"name": "Metrics", "gaps": ["No metric views found."]},
+    ]
+    assert readiness_guidance(ranked, "fallback") == (
+        "Focus next on Metrics: your lowest-scoring, highest-impact areas."
+    )
+
+
+def test_readiness_guidance_falls_back_when_no_gaps():
+    ranked = [{"name": "Metrics", "gaps": []}, {"name": "Genie Agents", "gaps": []}]
+    assert readiness_guidance(ranked, "All strong — a candidate for the preview.") == (
+        "All strong — a candidate for the preview."
+    )

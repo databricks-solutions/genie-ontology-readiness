@@ -174,7 +174,7 @@ CAPABILITIES: dict[str, dict] = {
             "Add synonyms reflecting how the business actually speaks.",
         ],
         "sources": [
-            {"title": "Unity Catalog metric views (docs)", "url": "https://docs.databricks.com/aws/en/business-semantics/metric-views/"},
+            {"title": "Unity Catalog metric views (docs)", "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views"},
             {"title": "Redefining the semantics layer for BI and AI (blog)", "url": "https://www.databricks.com/blog/redefining-semantics-data-layer-future-bi-and-ai"},
         ],
     },
@@ -200,8 +200,8 @@ CAPABILITIES: dict[str, dict] = {
             "Curate instructions/examples — an uncurated agent answers poorly.",
         ],
         "sources": [
-            {"title": "Curate an effective Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/best-practices"},
-            {"title": "Set up a Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/set-up"},
+            {"title": "Curate an effective Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie-agents/best-practices"},
+            {"title": "Set up a Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie-agents/set-up"},
         ],
     },
     "domains": {
