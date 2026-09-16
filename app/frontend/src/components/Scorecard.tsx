@@ -12,7 +12,7 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -170,6 +170,7 @@ export default function Scorecard({
   const [catalogsLoading, setCatalogsLoading] = useState(false);
   const [catFilter, setCatFilter] = useState<string[]>([]);
   const [zipBusy, setZipBusy] = useState(false);
+  const [pdfBusy, setPdfBusy] = useState(false);
 
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
@@ -187,6 +188,60 @@ export default function Scorecard({
       await downloadAllZip(config.pillars.map((cp) => pillarsByKey[cp.key]).filter(Boolean));
     } finally {
       setZipBusy(false);
+    }
+  }
+
+  // Export the whole scorecard as a branded PDF readout (issue #15). Prefer the
+  // saved snapshot (server-authoritative, smallest request); fall back to the
+  // in-session scorecard when history isn't persisted. The drill-down rows and
+  // per-query SQL are dropped from the inline payload — they bloat the body and
+  // aren't part of the executive readout (the CSV export covers those).
+  async function exportPdf() {
+    if (pdfBusy || !overall) return;
+    const tab = window.open('', '_blank');
+    setPdfBusy(true);
+    setError(null);
+    try {
+      let body: Record<string, unknown>;
+      if (currentId != null) {
+        body = { snapshot_id: currentId };
+      } else {
+        const pillars = config.pillars
+          .map((cp) => pillarsByKey[cp.key])
+          .filter(Boolean)
+          .map(({ drill_down, source_queries, ...rest }) => rest);
+        body = { scorecard: { overall, pillars, top_gaps: topGaps } };
+      }
+      const res = await fetch('/api/assess/pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        // Surface the server's specific message (JSON {error} for 400/404, plain
+        // text for 503/500) instead of a generic failure, so "run an assessment
+        // first" / "not found" actually reach the user.
+        const raw = await res.text().catch(() => '');
+        let msg = raw;
+        try { msg = JSON.parse(raw)?.error || raw; } catch { /* not JSON — use raw */ }
+        throw new Error(msg || 'PDF generation failed');
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      // Reuse the tab opened in the click gesture; otherwise try once more. If both
+      // are blocked (pop-up blocker), tell the user rather than failing silently.
+      const viewer = tab || window.open(url, '_blank');
+      if (!viewer) {
+        URL.revokeObjectURL(url);
+        throw new Error('Your browser blocked the PDF tab — allow pop-ups for this app and try again.');
+      }
+      if (tab) tab.location.href = url;
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch (e) {
+      if (tab) tab.close();
+      setError((e as Error).message);
+    } finally {
+      setPdfBusy(false);
     }
   }
 
@@ -506,13 +561,24 @@ export default function Scorecard({
                       <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
                       <LevelBadge level={overall.level} label={overall.level_label} />
                     </div>
-                    <button
-                      onClick={run}
-                      disabled={running}
-                      className="btn-primary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs shrink-0"
-                    >
-                      <RefreshCw size={14} /> New assessment
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={exportPdf}
+                        disabled={pdfBusy || running}
+                        className="btn-secondary py-1 px-3 flex items-center gap-1.5 text-xs disabled:opacity-60"
+                        title="Export this assessment as a branded PDF readout"
+                      >
+                        {pdfBusy ? <Loader2 size={13} className="animate-spin" /> : <FileDown size={13} />}
+                        {pdfBusy ? 'Exporting…' : 'Export PDF'}
+                      </button>
+                      <button
+                        onClick={run}
+                        disabled={running}
+                        className="btn-primary py-1 px-3 flex items-center gap-1.5 text-xs"
+                      >
+                        <RefreshCw size={13} /> New assessment
+                      </button>
+                    </div>
                   </div>
                   <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
                   <div className="flex items-center gap-3 flex-wrap mt-2">

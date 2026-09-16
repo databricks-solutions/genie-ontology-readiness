@@ -152,30 +152,30 @@ class PdfResourceBlockingTest(unittest.TestCase):
 
         from xhtml2pdf import pisa
 
-        from server.routes.plan import _PDF_CSS, ExternalResourceBlocked, _block_external_resources
+        from server.pdf import PDF_CSS, ExternalResourceBlocked, block_external_resources
 
         # Hand the engine a document that bypasses the sanitizer, so the backstop
         # is what is under test.
-        html = (f"<!DOCTYPE html><html><head><style>{_PDF_CSS}</style></head>"
+        html = (f"<!DOCTYPE html><html><head><style>{PDF_CSS}</style></head>"
                 f"<body><img src='file:///etc/hosts'></body></html>")
         with self.assertRaises(ExternalResourceBlocked):
             pisa.CreatePDF(src=html, dest=io.BytesIO(), encoding="utf-8",
-                           link_callback=_block_external_resources)
+                           link_callback=block_external_resources)
 
     def test_a_normal_plan_still_renders(self):
         import io
 
         from xhtml2pdf import pisa
 
-        from server.routes.plan import _PDF_CSS, _block_external_resources
+        from server.pdf import PDF_CSS, block_external_resources
         from server.security import sanitize_html_fragment
 
         body = sanitize_html_fragment("<h2>Where you are</h2><ul><li>one</li></ul>")
-        html = (f"<!DOCTYPE html><html><head><style>{_PDF_CSS}</style></head>"
+        html = (f"<!DOCTYPE html><html><head><style>{PDF_CSS}</style></head>"
                 f"<body><h1>Plan</h1>{body}</body></html>")
         buf = io.BytesIO()
         result = pisa.CreatePDF(src=html, dest=buf, encoding="utf-8",
-                                link_callback=_block_external_resources)
+                                link_callback=block_external_resources)
         self.assertFalse(result.err)
         self.assertTrue(buf.getvalue().startswith(b"%PDF-"))
 
