@@ -8,6 +8,7 @@ import json
 import logging
 
 from server.config import USE_LAKEBASE
+from server.snapshot_compare import compare_snapshots as _compare_loaded
 
 logger = logging.getLogger(__name__)
 
@@ -134,3 +135,14 @@ async def get_snapshot(snapshot_id: int, created_by: str | None = None) -> dict 
     except Exception as e:
         logger.warning(f"get_snapshot failed: {e}")
         return None
+
+
+async def compare_snapshots(
+    baseline_id: int, current_id: int, created_by: str | None = None
+) -> dict | None:
+    """Load two of the caller's snapshots and return the per-pillar diff.
+
+    Returns None when either id is missing or not owned by ``created_by``.
+    Reads stored JSONB only — never probes the workspace.
+    """
+    return await _compare_loaded(baseline_id, current_id, created_by, get_snapshot)

@@ -129,3 +129,16 @@ async def assess_snapshot(snapshot_id: int, principal: str = Depends(current_pri
     if snap is None:
         return JSONResponse(status_code=404, content={"error": "Assessment not found."})
     return snap
+
+
+@router.get("/assess/compare")
+async def assess_compare(
+    baseline_id: int,
+    current_id: int,
+    principal: str = Depends(current_principal),
+):
+    """Diff two stored assessments for the current user. Never re-runs probes."""
+    result = await snapshots.compare_snapshots(baseline_id, current_id, created_by=principal)
+    if result is None:
+        return JSONResponse(status_code=404, content={"error": "Assessment not found."})
+    return result

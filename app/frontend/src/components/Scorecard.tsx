@@ -6,13 +6,9 @@ import {
   PolarAngleAxis,
   PolarRadiusAxis,
   ResponsiveContainer,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -34,6 +30,7 @@ import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
+import ProgressOverTime from './ProgressOverTime';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
@@ -249,17 +246,6 @@ export default function Scorecard({
         score: Math.round(pillarsByKey[p.key]?.score ?? 0),
       })),
     [config.pillars, pillarsByKey]
-  );
-
-  const trendData = useMemo(
-    () =>
-      [...history]
-        .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-        .map((h) => ({
-          date: new Date(h.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-          score: h.overall_score,
-        })),
-    [history]
   );
 
   async function run() {
@@ -543,40 +529,20 @@ export default function Scorecard({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
-        {/* Left column: pillar maturity, then readiness-over-time beneath it */}
-        <div className="space-y-6">
-          <div className="card p-5">
-            <h3 className="text-sm font-semibold text-ink-700 mb-2">Pillar maturity</h3>
-            <ResponsiveContainer width="100%" height={340}>
-              <RadarChart data={radarData} outerRadius="62%" margin={{ top: 24, right: 56, bottom: 24, left: 56 }}>
-                <PolarGrid stroke="#e5e7eb" />
-                <PolarAngleAxis dataKey="pillar" tick={<RadarTick />} />
-                {/* Place the 0–100 radius ladder in the gap BETWEEN the top two
-                    spokes (~64° for 7 pillars) so it doesn't collide with the
-                    top "Unity Catalog Foundation" label. */}
-                <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={64} />
-                <Radar name="Score" dataKey="score" stroke="#FF3621" fill="#FF3621" fillOpacity={0.25} strokeWidth={2} />
-                <Tooltip />
-              </RadarChart>
-            </ResponsiveContainer>
-          </div>
-
-          {config.lakebase_enabled && trendData.length > 1 && (
-            <div className="card p-5">
-              <div className="flex items-center gap-2 mb-2">
-                <TrendingUp size={15} className="text-databricks-500" />
-                <h3 className="text-sm font-semibold text-ink-700">Readiness over time</h3>
-              </div>
-              <ResponsiveContainer width="100%" height={140}>
-                <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="score" stroke="#FF3621" strokeWidth={2} dot={{ r: 3 }} />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          )}
+        <div className="card p-5">
+          <h3 className="text-sm font-semibold text-ink-700 mb-2">Pillar maturity</h3>
+          <ResponsiveContainer width="100%" height={340}>
+            <RadarChart data={radarData} outerRadius="62%" margin={{ top: 24, right: 56, bottom: 24, left: 56 }}>
+              <PolarGrid stroke="#e5e7eb" />
+              <PolarAngleAxis dataKey="pillar" tick={<RadarTick />} />
+              {/* Place the 0–100 radius ladder in the gap BETWEEN the top two
+                  spokes (~64° for 7 pillars) so it doesn't collide with the
+                  top "Unity Catalog Foundation" label. */}
+              <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={64} />
+              <Radar name="Score" dataKey="score" stroke="#FF3621" fill="#FF3621" fillOpacity={0.25} strokeWidth={2} />
+              <Tooltip />
+            </RadarChart>
+          </ResponsiveContainer>
         </div>
 
         {/* Right column: top gaps, extended to match the left column's height */}
@@ -601,6 +567,13 @@ export default function Scorecard({
           )}
         </div>
       </div>
+
+      <ProgressOverTime
+        history={history}
+        lakebaseEnabled={config.lakebase_enabled}
+        currentSnapshotId={currentId}
+        levelLabels={config.level_labels}
+      />
 
       {/* Pillar cards — all pillars in canonical order; skeleton until each arrives */}
       <div className="space-y-3">

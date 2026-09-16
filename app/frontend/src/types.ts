@@ -174,6 +174,42 @@ export interface SnapshotResponse {
   scorecard: Scorecard;
 }
 
+export type CompareStatus =
+  | 'improved'
+  | 'declined'
+  | 'unchanged'
+  | 'new'
+  | 'removed'
+  | 'unavailable';
+
+export interface CompareSide {
+  id: string | number;
+  created_at: string | null;
+  overall_score: number;
+  overall_level: number;
+  readiness_stage: string;
+}
+
+export interface ComparePillar {
+  key: string;
+  name: string;
+  baseline_score: number | null;
+  baseline_level: number | null;
+  baseline_available: boolean | null;
+  current_score: number | null;
+  current_level: number | null;
+  current_available: boolean | null;
+  delta: number | null;
+  status: CompareStatus;
+}
+
+export interface CompareResponse {
+  baseline: CompareSide;
+  current: CompareSide;
+  overall_delta: number;
+  pillars: ComparePillar[];
+}
+
 export interface PlanListItem {
   id: number;
   created_at: string;
