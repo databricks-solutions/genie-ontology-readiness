@@ -174,6 +174,81 @@ export interface SnapshotResponse {
   scorecard: Scorecard;
 }
 
+// --- Assessment comparison (issue #12) -------------------------------------
+export interface LevelChange {
+  from: number;
+  to: number;
+  from_label: string;
+  to_label: string;
+  direction: 'up' | 'down';
+}
+
+export type PillarDiffStatus =
+  | 'improved'
+  | 'regressed'
+  | 'unchanged'
+  | 'new'
+  | 'removed'
+  | 'unavailable';
+
+export interface SignalDiff {
+  label: string;
+  unit: string;
+  baseline: number | string | null;
+  current: number | string | null;
+  delta: number | null;
+}
+
+export interface GapDiff {
+  resolved: string[];
+  introduced: string[];
+}
+
+export interface PillarDiff {
+  key: string;
+  name: string;
+  baseline_score: number | null;
+  current_score: number | null;
+  delta: number | null;
+  status: PillarDiffStatus;
+  level_change: LevelChange | null;
+  signals: SignalDiff[];
+  gaps: GapDiff;
+}
+
+export interface CompareOverall {
+  baseline_score: number | null;
+  current_score: number | null;
+  delta: number | null;
+  baseline_level: number | null;
+  current_level: number | null;
+  baseline_level_label: string;
+  current_level_label: string;
+  level_change: LevelChange | null;
+  stage_change: { from: string; to: string } | null;
+}
+
+export interface CompareEndpoint {
+  id: number | string | null;
+  created_at: string | null;
+  overall: ScorecardOverall;
+}
+
+export interface CompareResult {
+  baseline: CompareEndpoint;
+  current: CompareEndpoint;
+  overall: CompareOverall;
+  pillars: PillarDiff[];
+  summary: {
+    improved: number;
+    regressed: number;
+    unchanged: number;
+    new: number;
+    removed: number;
+    unavailable: number;
+  };
+}
+
 export interface PlanListItem {
   id: number;
   created_at: string;

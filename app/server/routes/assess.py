@@ -10,6 +10,7 @@ from fastapi import APIRouter, Body, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from server.assessment.compare import compare_snapshots
 from server.assessment.scoring import run_assessment, run_assessment_stream
 from server.routes._shared import _cache_get, _cache_set, current_principal
 from server.config import set_user_token
@@ -341,3 +342,31 @@ async def assess_pdf(req: AssessPdfRequest, principal: str = Depends(current_pri
 
     html_doc = _build_assessment_pdf_html(scorecard, req.title)
     return render_pdf_response(html_doc, _assessment_filename(req.title))
+@router.get("/assess/compare")
+async def assess_compare(
+    baseline: int,
+    current: int,
+    principal: str = Depends(current_principal),
+):
+    """Compare two of the user's saved assessments → per-pillar + overall deltas (#12).
+
+    Both snapshots are loaded server-side scoped to the requesting identity, so a
+    user can only diff their own history. The result is computed from the stored
+    pillar scores — the live workspace is never re-probed. ``baseline`` is the
+    earlier/reference run and ``current`` the one being measured against it, so a
+    positive delta reads as a gain.
+    """
+    if baseline == current:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Pick two different assessments to compare."},
+        )
+    base = await snapshots.get_snapshot(baseline, created_by=principal)
+    cur = await snapshots.get_snapshot(current, created_by=principal)
+    missing = [sid for sid, snap in ((baseline, base), (current, cur)) if snap is None]
+    if missing:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Assessment not found.", "missing": missing},
+        )
+    return compare_snapshots(base, cur)
