@@ -12,7 +12,7 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown } from 'lucide-react';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows } from 'lucide-react';
 import { apiGet, streamPostEvents } from '../hooks/useApi';
 import type {
   AppConfig,
@@ -34,6 +34,7 @@ import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
+import CompareModal from './CompareModal';
 
 type AssessEvent =
   | { type: 'pillar'; pillar: PillarScore }
@@ -171,6 +172,7 @@ export default function Scorecard({
   const [catFilter, setCatFilter] = useState<string[]>([]);
   const [zipBusy, setZipBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
+  const [compareOpen, setCompareOpen] = useState(false);
 
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
@@ -399,6 +401,15 @@ export default function Scorecard({
       >
         <Plus size={15} /> New assessment
       </button>
+      {history.length >= 2 && (
+        <button
+          onClick={() => setCompareOpen(true)}
+          className="btn-secondary w-full flex items-center justify-center gap-1.5 text-sm"
+          title="Compare two assessments and see what moved per pillar"
+        >
+          <GitCompareArrows size={15} /> Compare
+        </button>
+      )}
       <div className="card p-2">
         <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-400 px-2 py-1.5">
           <History size={13} className="text-databricks-500" /> Assessments
@@ -758,6 +769,13 @@ export default function Scorecard({
       <div className="min-w-0">
         {phase === 'idle' ? idleMain : resultsMain}
       </div>
+      {compareOpen && (
+        <CompareModal
+          history={history}
+          initialCurrentId={currentId ?? undefined}
+          onClose={() => setCompareOpen(false)}
+        />
+      )}
     </div>
   );
 }
