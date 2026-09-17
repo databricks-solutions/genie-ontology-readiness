@@ -293,6 +293,9 @@ export interface Accelerator {
   steps: string[];
   artifact_dir?: string;
   artifact_file?: string;
+  // Filename the artifact should download/import as, when it differs from the
+  // on-disk artifact_file (e.g. a notebook stored as `.py.txt` to survive deploy).
+  download_as?: string;
   source?: DocSource;
   valid_as_of?: string;
   superseded_by?: string;

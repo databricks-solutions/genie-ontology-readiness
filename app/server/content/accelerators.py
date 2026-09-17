@@ -15,6 +15,9 @@ serves a download + an import command (no workspace write permission required).
 Accelerators that point at an external repo (e.g. UCX) carry no bundled artifact.
 """
 
+from server.config import get_cloud_provider
+from server.doc_links import cloud_doc_url
+
 # Each entry. Optional fields: artifact_dir/artifact_file (bundled), source (link),
 # review_mode, superseded_by.
 ACCELERATORS: list[dict] = [
@@ -200,7 +203,11 @@ ACCELERATORS: list[dict] = [
             "Re-run the readiness assessment — column/table comment coverage (and the Metadata score) should rise.",
         ],
         "artifact_dir": "metadata-ai-comments",
-        "artifact_file": "ai_comments_rag.py",
+        # Stored with a `.txt` suffix so `bundle deploy` keeps it a plain FILE instead of
+        # importing the `# Databricks notebook source` header as an extension-less workspace
+        # NOTEBOOK (which 404s the download). `download_as` restores the real notebook name.
+        "artifact_file": "ai_comments_rag.py.txt",
+        "download_as": "ai_comments_rag.py",
         "source": {
             "title": "Add AI-generated comments (docs)",
             "url": "https://docs.databricks.com/aws/en/comments/ai-comments",
@@ -356,8 +363,8 @@ ACCELERATORS: list[dict] = [
         "artifact_dir": "ai-ready-semantics",
         "artifact_file": "building-ai-ready-semantics.md",
         "source": {
-            "title": "Building AI-Ready Business Semantics (guide)",
-            "url": "https://docs.databricks.com/aws/en/genie/",
+            "title": "Curate an effective Genie agent (docs)",
+            "url": "https://docs.databricks.com/aws/en/genie-agents/best-practices",
         },
         "valid_as_of": "2026-08",
     },
@@ -470,7 +477,7 @@ ACCELERATORS: list[dict] = [
         ],
         "source": {
             "title": "Unity Catalog metric views (docs)",
-            "url": "https://docs.databricks.com/aws/en/metric-views/",
+            "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views",
         },
         "valid_as_of": "2026-07",
     },
@@ -540,7 +547,7 @@ ACCELERATORS: list[dict] = [
         "artifact_file": "building-ai-ready-semantics.md",
         "source": {
             "title": "Building AI-Ready Business Semantics (guide)",
-            "url": "https://docs.databricks.com/aws/en/metric-views/",
+            "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views",
         },
         "valid_as_of": "2026-08",
     },
@@ -728,54 +735,34 @@ ACCELERATORS: list[dict] = [
         },
         "valid_as_of": "2026-07",
     },
-    {
-        "key": "adoption-readiness-trend-job",
-        "title": "Track readiness over time",
-        "summary": "How to schedule the readiness assessment to run on a cadence and persist each result so the readiness score is charted over time — proof that accelerators are landing.",
-        "capability": "adoption",
-        "type": "guide",
-        "effort": "~1 hour",
-        "what_it_does": (
-            "Schedule the readiness assessment to run on a recurring cadence and persist each result as a Lakebase snapshot. "
-            "Then chart the overall score and per-pillar scores over time. This closes the loop: as accelerators land and "
-            "coverage rises, the trend visibly climbs — giving stakeholders a single chart that proves the ontology-readiness "
-            "program is working."
-        ),
-        "prerequisites": [
-            "The readiness app deployed with Lakebase snapshots enabled",
-            "Permission to deploy a job (via Databricks Asset Bundles) into the workspace",
-            "A service principal with the system-table and catalog read grants the assessment needs",
-        ],
-        "improves_signals": ["adoption"],
-        "target_level": 4,
-        "review_mode": False,
-        "steps": [
-            "Define a DAB job that runs the readiness assessment on a recurring schedule (see the linked docs for DAB syntax).",
-            "Configure the job to persist each assessment result as a Lakebase snapshot for historical tracking.",
-            "Apply the DAB configuration and let it run on its cadence (e.g. weekly) to accumulate a trend history.",
-            "Create a dashboard or use Lakebase to visualize the overall and per-pillar score trends over time.",
-            "Re-run the readiness assessment — the Adoption & Activity pillar reflects sustained activity and trend tracking.",
-        ],
-        "source": {
-            "title": "Databricks Asset Bundles (docs)",
-            "url": "https://docs.databricks.com/aws/en/dev-tools/bundles/",
-        },
-        "valid_as_of": "2026-07",
-    },
 ]
 
 ACCELERATORS_BY_KEY = {a["key"]: a for a in ACCELERATORS}
 
 
+def _with_cloud_source(acc: dict) -> dict:
+    """Return a copy of an accelerator with its ``source`` documentation URL routed
+    to the deployment's cloud (see server.doc_links). Only Databricks doc links are
+    rewritten; the module-level ``ACCELERATORS`` constant is never mutated."""
+    source = acc.get("source")
+    if not source or not source.get("url"):
+        return acc
+    new_url = cloud_doc_url(source["url"], get_cloud_provider())
+    if new_url == source["url"]:
+        return acc
+    return {**acc, "source": {**source, "url": new_url}}
+
+
 def list_accelerators() -> list[dict]:
     """All accelerators, in registry order."""
-    return list(ACCELERATORS)
+    return [_with_cloud_source(a) for a in ACCELERATORS]
 
 
 def accelerators_for(capability_key: str) -> list[dict]:
     """Accelerators that improve a given capability/pillar."""
-    return [a for a in ACCELERATORS if a.get("capability") == capability_key]
+    return [_with_cloud_source(a) for a in ACCELERATORS if a.get("capability") == capability_key]
 
 
 def get_accelerator(key: str) -> dict | None:
-    return ACCELERATORS_BY_KEY.get(key)
+    acc = ACCELERATORS_BY_KEY.get(key)
+    return _with_cloud_source(acc) if acc else None

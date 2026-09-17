@@ -5,7 +5,7 @@ from fastapi import APIRouter
 
 from server.pillars import PILLARS, LEVEL_LABELS
 from server.routes._shared import list_available_models, resolve_default_model
-from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, ASSESS_CATALOGS
+from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, ASSESS_CATALOGS, get_cloud_provider
 
 router = APIRouter()
 
@@ -37,4 +37,7 @@ async def get_config():
         "lakebase_enabled": USE_LAKEBASE,
         "genie_space_configured": bool(GENIE_SPACE_ID),
         "assess_catalogs": ASSESS_CATALOGS,
+        # Cloud the app is deployed on (aws|azure|gcp); documentation links are
+        # routed to this cloud's docs server-side.
+        "cloud": get_cloud_provider(),
     }

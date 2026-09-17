@@ -90,10 +90,13 @@ const ACCEL_TYPE_LABELS: Record<Accelerator['type'], string> = {
 };
 
 function importCommand(a: Accelerator): string {
-  const base = (a.artifact_file || 'notebook.py').replace(/\.py$/, '');
+  // Use the download name (what the user actually saves) — the on-disk
+  // artifact_file may differ (e.g. a notebook stored as `.py.txt` to survive deploy).
+  const name = a.download_as || a.artifact_file || 'notebook.py';
+  const base = name.replace(/\.py$/, '');
   return (
     `databricks workspace import \\\n` +
-    `  --file ${a.artifact_file} --language PYTHON --format SOURCE \\\n` +
+    `  --file ${name} --language PYTHON --format SOURCE \\\n` +
     `  /Workspace/Users/<you>/${base}`
   );
 }

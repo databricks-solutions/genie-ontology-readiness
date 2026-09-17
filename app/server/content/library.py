@@ -11,6 +11,9 @@ Product accuracy to preserve (without release-stage labels):
     ontology — preparing for Genie Ontology means maturing the foundation.
 """
 
+from server.config import get_cloud_provider
+from server.doc_links import cloud_doc_url
+
 # Each capability is keyed; pillars reference these via pillars.PILLARS[*]["capability"].
 CAPABILITIES: dict[str, dict] = {
     "ontology": {
@@ -174,7 +177,7 @@ CAPABILITIES: dict[str, dict] = {
             "Add synonyms reflecting how the business actually speaks.",
         ],
         "sources": [
-            {"title": "Unity Catalog metric views (docs)", "url": "https://docs.databricks.com/aws/en/business-semantics/metric-views/"},
+            {"title": "Unity Catalog metric views (docs)", "url": "https://docs.databricks.com/aws/en/uc-semantics/metric-views"},
             {"title": "Redefining the semantics layer for BI and AI (blog)", "url": "https://www.databricks.com/blog/redefining-semantics-data-layer-future-bi-and-ai"},
         ],
     },
@@ -200,8 +203,8 @@ CAPABILITIES: dict[str, dict] = {
             "Curate instructions/examples — an uncurated agent answers poorly.",
         ],
         "sources": [
-            {"title": "Curate an effective Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/best-practices"},
-            {"title": "Set up a Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie/set-up"},
+            {"title": "Curate an effective Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie-agents/best-practices"},
+            {"title": "Set up a Genie agent (docs)", "url": "https://docs.databricks.com/aws/en/genie-agents/set-up"},
         ],
     },
     "domains": {
@@ -324,11 +327,25 @@ def best_practices_for(pillar_key: str) -> list[str]:
     return cap.get("best_practices", [])
 
 
+def _with_cloud_sources(cap: dict) -> dict:
+    """Return a copy of a capability dict with its documentation ``sources`` URLs
+    routed to the deployment's cloud (see server.doc_links). Copies the nested
+    source dicts so the module-level ``CAPABILITIES`` constant is never mutated."""
+    sources = cap.get("sources")
+    if not sources:
+        return cap
+    cloud = get_cloud_provider()
+    return {**cap, "sources": [
+        {**s, "url": cloud_doc_url(s["url"], cloud)} if s.get("url") else s
+        for s in sources
+    ]}
+
+
 def list_capabilities() -> list[dict]:
     """All capabilities in display order (for the Learn tab)."""
-    return [{"key": k, **CAPABILITIES[k]} for k in CAPABILITY_ORDER if k in CAPABILITIES]
+    return [_with_cloud_sources({"key": k, **CAPABILITIES[k]}) for k in CAPABILITY_ORDER if k in CAPABILITIES]
 
 
 def get_capability(key: str) -> dict | None:
     cap = CAPABILITIES.get(key)
-    return {"key": key, **cap} if cap else None
+    return _with_cloud_sources({"key": key, **cap}) if cap else None
