@@ -324,11 +324,27 @@ def best_practices_for(pillar_key: str) -> list[str]:
     return cap.get("best_practices", [])
 
 
+def _with_cloud_sources(cap: dict) -> dict:
+    """Return a copy of a capability dict with its documentation ``sources`` URLs
+    routed to the deployment's cloud (see server.doc_links). Copies the nested
+    source dicts so the module-level ``CAPABILITIES`` constant is never mutated."""
+    sources = cap.get("sources")
+    if not sources:
+        return cap
+    from server.config import get_cloud_provider
+    from server.doc_links import cloud_doc_url
+    cloud = get_cloud_provider()
+    return {**cap, "sources": [
+        {**s, "url": cloud_doc_url(s["url"], cloud)} if s.get("url") else s
+        for s in sources
+    ]}
+
+
 def list_capabilities() -> list[dict]:
     """All capabilities in display order (for the Learn tab)."""
-    return [{"key": k, **CAPABILITIES[k]} for k in CAPABILITY_ORDER if k in CAPABILITIES]
+    return [_with_cloud_sources({"key": k, **CAPABILITIES[k]}) for k in CAPABILITY_ORDER if k in CAPABILITIES]
 
 
 def get_capability(key: str) -> dict | None:
     cap = CAPABILITIES.get(key)
-    return {"key": key, **cap} if cap else None
+    return _with_cloud_sources({"key": key, **cap}) if cap else None

@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from server.content.library import list_capabilities, get_capability
 from server.content.accelerators import (
@@ -66,4 +66,15 @@ async def accelerator_artifact(key: str):
         ".md": "text/markdown",
         ".ipynb": "application/x-ipynb+json",
     }.get(Path(download_name).suffix.lower(), "application/octet-stream")
+    # Markdown handbooks embed docs.databricks.com links — route them to the
+    # deployment's cloud before serving (see server.doc_links).
+    if media_type == "text/markdown":
+        from server.config import get_cloud_provider
+        from server.doc_links import rewrite_doc_links_in_text
+        text = rewrite_doc_links_in_text(path.read_text(encoding="utf-8"), get_cloud_provider())
+        return Response(
+            content=text,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+        )
     return FileResponse(path, media_type=media_type, filename=download_name)

@@ -737,15 +737,31 @@ ACCELERATORS: list[dict] = [
 ACCELERATORS_BY_KEY = {a["key"]: a for a in ACCELERATORS}
 
 
+def _with_cloud_source(acc: dict) -> dict:
+    """Return a copy of an accelerator with its ``source`` documentation URL routed
+    to the deployment's cloud (see server.doc_links). Only Databricks doc links are
+    rewritten; the module-level ``ACCELERATORS`` constant is never mutated."""
+    source = acc.get("source")
+    if not source or not source.get("url"):
+        return acc
+    from server.config import get_cloud_provider
+    from server.doc_links import cloud_doc_url
+    new_url = cloud_doc_url(source["url"], get_cloud_provider())
+    if new_url == source["url"]:
+        return acc
+    return {**acc, "source": {**source, "url": new_url}}
+
+
 def list_accelerators() -> list[dict]:
     """All accelerators, in registry order."""
-    return list(ACCELERATORS)
+    return [_with_cloud_source(a) for a in ACCELERATORS]
 
 
 def accelerators_for(capability_key: str) -> list[dict]:
     """Accelerators that improve a given capability/pillar."""
-    return [a for a in ACCELERATORS if a.get("capability") == capability_key]
+    return [_with_cloud_source(a) for a in ACCELERATORS if a.get("capability") == capability_key]
 
 
 def get_accelerator(key: str) -> dict | None:
-    return ACCELERATORS_BY_KEY.get(key)
+    acc = ACCELERATORS_BY_KEY.get(key)
+    return _with_cloud_source(acc) if acc else None

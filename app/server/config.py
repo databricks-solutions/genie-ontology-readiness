@@ -23,6 +23,8 @@ import logging
 import contextvars
 from databricks.sdk import WorkspaceClient
 
+from server.doc_links import cloud_from_host
+
 logger = logging.getLogger(__name__)
 
 # Per-request forwarded end-user token (Databricks Apps on-behalf-of-user auth).
@@ -140,6 +142,27 @@ def get_workspace_host() -> str:
     except Exception as e:
         logger.error(f"Could not get workspace host: {e}")
         return ""
+
+
+_cloud_provider: str | None = None
+
+
+def get_cloud_provider() -> str:
+    """The cloud this workspace runs on (``aws`` | ``azure`` | ``gcp``), for
+    routing documentation links to the right cloud's docs.
+
+    ``DATABRICKS_CLOUD`` overrides detection (a safety valve when host parsing
+    fails, and how the value is forced in tests); otherwise it is inferred from
+    the workspace host. Cached — the cloud is constant for the app's lifetime.
+    """
+    global _cloud_provider
+    if _cloud_provider is None:
+        override = os.environ.get("DATABRICKS_CLOUD", "").strip().lower()
+        if override in ("aws", "azure", "gcp"):
+            _cloud_provider = override
+        else:
+            _cloud_provider = cloud_from_host(get_workspace_host())
+    return _cloud_provider
 
 
 def get_auth_headers(force_sp: bool = False) -> dict:
