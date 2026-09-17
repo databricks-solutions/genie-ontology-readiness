@@ -67,7 +67,7 @@ export LAKEBASE_DATABASE=ontology_readiness     # a dedicated DB created on that
 # export BRAND_NAME="Acme"                    # header branding
 # export FORCE_SP=true                        # SP-only mode: never attempt OBO, run every read as the app SP
 
-python3 scripts/post_deploy.py   # requires: pip install asyncpg
+python3 scripts/post_deploy.py   # requires: pip install "databricks-sdk>=0.36.0" asyncpg
 ```
 
 `post_deploy.py` renders `app/app.yml`, grants the **app service principal** read

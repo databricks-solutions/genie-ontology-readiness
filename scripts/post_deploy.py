@@ -23,7 +23,9 @@ Usage:
     #   export LAKEBASE_DATABASE=ontology_readiness
     python3 scripts/post_deploy.py
 
-Python 3.9+. Lakebase steps require: databricks-sdk>=0.36.0, asyncpg.
+Python 3.9+. Requires databricks-sdk>=0.36.0 (the SP-grant step,
+setup_app_permissions.py, resolves the app SP via the SDK). The Lakebase
+history steps additionally require asyncpg.
 """
 
 import json

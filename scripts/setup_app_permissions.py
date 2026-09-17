@@ -18,6 +18,8 @@ Usage:
     export WAREHOUSE_ID=<warehouse_id>
     # optional: export ASSESS_CATALOGS="cat_a,cat_b"  (else grants on all non-system catalogs)
     python3 scripts/setup_app_permissions.py
+
+Requires: databricks-sdk>=0.36.0 (this script resolves the app SP via the SDK).
 """
 
 import json
