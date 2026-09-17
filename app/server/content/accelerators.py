@@ -15,6 +15,9 @@ serves a download + an import command (no workspace write permission required).
 Accelerators that point at an external repo (e.g. UCX) carry no bundled artifact.
 """
 
+from server.config import get_cloud_provider
+from server.doc_links import cloud_doc_url
+
 # Each entry. Optional fields: artifact_dir/artifact_file (bundled), source (link),
 # review_mode, superseded_by.
 ACCELERATORS: list[dict] = [
@@ -744,8 +747,6 @@ def _with_cloud_source(acc: dict) -> dict:
     source = acc.get("source")
     if not source or not source.get("url"):
         return acc
-    from server.config import get_cloud_provider
-    from server.doc_links import cloud_doc_url
     new_url = cloud_doc_url(source["url"], get_cloud_provider())
     if new_url == source["url"]:
         return acc

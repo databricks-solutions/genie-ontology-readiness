@@ -11,6 +11,9 @@ Product accuracy to preserve (without release-stage labels):
     ontology — preparing for Genie Ontology means maturing the foundation.
 """
 
+from server.config import get_cloud_provider
+from server.doc_links import cloud_doc_url
+
 # Each capability is keyed; pillars reference these via pillars.PILLARS[*]["capability"].
 CAPABILITIES: dict[str, dict] = {
     "ontology": {
@@ -331,8 +334,6 @@ def _with_cloud_sources(cap: dict) -> dict:
     sources = cap.get("sources")
     if not sources:
         return cap
-    from server.config import get_cloud_provider
-    from server.doc_links import cloud_doc_url
     cloud = get_cloud_provider()
     return {**cap, "sources": [
         {**s, "url": cloud_doc_url(s["url"], cloud)} if s.get("url") else s

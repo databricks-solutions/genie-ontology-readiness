@@ -64,9 +64,11 @@ def cloud_doc_url(url: str, cloud: str) -> str:
     return url
 
 
-# Matches a bare AWS docs URL inside free text (stops at whitespace or common
-# Markdown delimiters), for rewriting links embedded in served artifacts.
-_AWS_URL_RE = re.compile(r"https://docs\.databricks\.com/aws/en/[^\s)\]\"'>]+")
+# Matches a bare AWS docs URL inside free text, for rewriting links embedded in
+# served artifacts. Stops at whitespace, common Markdown delimiters, and trailing
+# sentence punctuation (,.;:) so a URL followed by prose punctuation isn't glued
+# into the path. Databricks doc paths never contain those characters.
+_AWS_URL_RE = re.compile(r"https://docs\.databricks\.com/aws/en/[^\s)\]\"'>,.;:]+")
 
 
 def rewrite_doc_links_in_text(text: str, cloud: str) -> str:
