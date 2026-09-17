@@ -19,9 +19,6 @@ variables:
     # Empty default so `databricks bundle validate` (the local quality gate's CHECK 2)
     # passes without a required-variable error; every deploy overrides via --var.
     default: ""
-  app_name:
-    description: "Databricks App name"
-    default: genie-ontology-readiness
   assess_catalogs:
     description: "Optional comma-separated catalogs to assess (empty = all non-system catalogs the app SP can see)"
     default: ""
@@ -38,7 +35,17 @@ variables:
 resources:
   apps:
     ontology_readiness:
-      name: ${var.app_name}
+      # App name is fixed PER TARGET (see the `targets:` block below), NOT a
+      # variable — so it cannot be overridden with `--var app_name=…`. That
+      # override, combined with shared Terraform state, is what let a deploy
+      # rename/destroy another environment's app. `bundle deploy -t <target>`
+      # can now only ever touch that target's own pinned app name.
+      #
+      # This base value is a deliberate non-environment placeholder: every target
+      # overrides it, so it is never deployed. If a future target forgets its
+      # override it stands up this obviously-wrong app instead of silently
+      # reconciling the live prod app's state.
+      name: gor-no-target-selected
       description: "Genie Ontology Readiness — assess, learn, and plan"
       source_code_path: ./app
       # On-behalf-of-user (user authorization): when enabled, the app can run
@@ -68,5 +75,34 @@ resources:
       # empty keeps the app stateless.
 
 targets:
+  # Each environment is its OWN target, so it gets its OWN bundle/Terraform state
+  # (…/.bundle/${bundle.name}/<target>) and pins its own app name via a resource
+  # override (not a variable — there is nothing to `--var`). A `bundle deploy` to
+  # one target therefore can NEVER rename or destroy another target's app — the
+  # shared-state footgun that silently deletes apps.
+  #
+  # Routine redeploys should use `databricks apps deploy <name>` (code-only,
+  # non-destructive, needs no bundle state); reserve `bundle deploy` for the
+  # first-time create / infra reconcile. If the app already exists OUTSIDE this
+  # target's Terraform state (e.g. it was created with `apps create`), use
+  # `apps deploy` — a `bundle deploy` would try to create it and conflict.
+  #
+  # Names: dev (the default target) → …-dev, stg → …-stg, prod → the bare
+  # `genie-ontology-readiness`. Deploy `-t prod` for the unsuffixed production
+  # name; a plain `bundle deploy` (or `-t dev`) targets the …-dev app.
   dev:
     default: true
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness-dev
+  stg:
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness-stg
+  prod:
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness

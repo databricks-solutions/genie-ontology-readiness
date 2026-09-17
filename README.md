@@ -65,8 +65,15 @@ Then build and deploy:
 ```bash
 cd app/frontend && npm install && npm run build && cd ../..
 databricks bundle deploy -t dev --profile <p> --var="warehouse_id=<id>"
-DATABRICKS_PROFILE=<p> WAREHOUSE_ID=<id> python3 scripts/post_deploy.py
+DATABRICKS_PROFILE=<p> TARGET=dev WAREHOUSE_ID=<id> python3 scripts/post_deploy.py
 ```
+
+The `-t <target>` selects the environment and fixes the app name (`dev`, the
+default → `genie-ontology-readiness-dev`, `stg` → `…-stg`, `prod` → the bare
+`genie-ontology-readiness`). There is no `--var app_name` — the name is pinned
+per target so a deploy can never rename or delete another environment's app. Keep
+`TARGET` in step 2 matching the `-t` in step 1. **For a production install**, use
+`-t prod` (with `TARGET=prod`) to get the unsuffixed `genie-ontology-readiness`.
 
 See **[CLAUDE.md](./CLAUDE.md)** for prerequisites, the service-principal grants the
 assessment needs, local development, optional Lakebase history, and branding.

@@ -5,7 +5,13 @@ Run AFTER `databricks bundle deploy`.
 
 Usage:
     export DATABRICKS_PROFILE=<profile>
-    export APP_NAME=genie-ontology-readiness
+    export TARGET=dev            # bundle target: dev (default) | stg | prod.
+                                 # The app name is fixed per target in
+                                 # databricks.yml and read back from the bundle;
+                                 # do NOT pass an app name. (An APP_NAME env is
+                                 # IGNORED — only warned about — so it can never
+                                 # redirect grants to another environment; the
+                                 # target is the sole source of truth.)
     export WAREHOUSE_ID=<warehouse_id>
     # optional:
     #   export ASSESS_CATALOGS="cat_a,cat_b"
@@ -29,6 +35,18 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent / "app"
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
+# Bundle target (dev|stg|prod). The app name is pinned per target in
+# databricks.yml and resolved from the bundle in main(); TARGET — not an app
+# name — is what selects the environment.
+TARGET = os.environ.get("TARGET", "dev")
+# The bundle targets defined in databricks.yml. Kept here to validate TARGET and
+# to derive a deterministic fallback app name (prod -> bare, else -<target>) that
+# matches the yaml, so a failed `bundle summary` never silently falls back to the
+# live prod app name for a dev/stg deploy.
+VALID_TARGETS = ("dev", "stg", "prod")
+# Placeholder only — main() reassigns this via resolve_app_name(), which resolves
+# the name from the bundle target. An explicit APP_NAME env is IGNORED there (only
+# warned about), never honored, so it cannot redirect this run to another env.
 APP_NAME = os.environ.get("APP_NAME", "genie-ontology-readiness")
 WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOUSE_ID", ""))
 USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
@@ -135,6 +153,41 @@ def cli(*args, check=True):
     if check and result.returncode != 0:
         print(f"  command failed ({result.returncode})")
     return result.returncode
+
+
+def _fallback_app_name():
+    """Deterministic name for TARGET matching the databricks.yml convention.
+
+    Used only when `bundle summary` can't be read; it mirrors the yaml (prod ->
+    bare, dev/stg -> suffixed) so a transient failure never resolves a dev/stg
+    deploy to the live prod app name."""
+    return "genie-ontology-readiness" if TARGET == "prod" else f"genie-ontology-readiness-{TARGET}"
+
+
+def resolve_app_name():
+    """Read the target's pinned app name back from the bundle.
+
+    The name lives ONLY in databricks.yml (per-target resource override), so the
+    bundle target — never a caller-supplied APP_NAME — is the source of truth and
+    this script can't disagree with the actual deploy. If `bundle summary` can't
+    be read, fall back to the target-derived name (not the bare prod name). An
+    explicit APP_NAME env is ignored (with a warning) — it exists only as a last
+    resort and must never silently redirect grants to another environment."""
+    args = ["bundle", "summary", "-t", TARGET]
+    if WAREHOUSE_ID:
+        args += ["--var", f"warehouse_id={WAREHOUSE_ID}"]
+    summ = cli_json(*args)
+    try:
+        name = summ["resources"]["apps"]["ontology_readiness"]["name"]
+    except (TypeError, KeyError):
+        name = None
+    if not name:
+        name = _fallback_app_name()
+    explicit = os.environ.get("APP_NAME")
+    if explicit and explicit != name:
+        print(f"  (warning) APP_NAME={explicit!r} ignored — target '{TARGET}' resolves the "
+              f"app name to {name!r}; the target is the source of truth.")
+    return name
 
 
 def _instance(name):
@@ -289,13 +342,20 @@ def attach_lakebase():
 
 
 def main():
+    global APP_NAME
     if not PROFILE:
         print("ERROR: DATABRICKS_PROFILE not set.")
+        sys.exit(1)
+    if TARGET not in VALID_TARGETS:
+        print(f"ERROR: TARGET={TARGET!r} is not a known bundle target {VALID_TARGETS}.")
         sys.exit(1)
 
     print("=" * 60)
     print("Genie Ontology Readiness — post-deploy")
     print("=" * 60)
+
+    APP_NAME = resolve_app_name()
+    print(f"Target: {TARGET}   App: {APP_NAME}")
 
     if USE_LAKEBASE:
         setup_lakebase()
@@ -305,19 +365,25 @@ def main():
 
     print("\n[2/3] Granting app SP read access...")
     env = os.environ.copy()
-    env.setdefault("APP_NAME", APP_NAME)
+    # Force-set (not setdefault): a stale APP_NAME already in the environment must
+    # NOT win over the target-resolved name, or the child would grant the SP on the
+    # wrong environment's app.
+    env["APP_NAME"] = APP_NAME
     if WAREHOUSE_ID:
         env["WAREHOUSE_ID"] = WAREHOUSE_ID
     subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
 
-    print("\n[3/3] Publishing the app (re-sync app.yml + dist, start compute, deploy)...")
-    var_args = []
-    if WAREHOUSE_ID:
-        var_args = [f"--var=warehouse_id={WAREHOUSE_ID}", f"--var=app_name={APP_NAME}"]
-    cli("bundle", "deploy", "-t", "dev", *var_args, check=False)
-    rc = cli("bundle", "run", "ontology_readiness", "-t", "dev", *var_args, check=False)
+    print(f"\n[3/3] Publishing the app to target '{TARGET}' (re-sync app.yml + dist, start compute, deploy)...")
+    # The app name is fixed by the target in databricks.yml — do NOT pass
+    # --var app_name (the variable no longer exists; passing it would fail and,
+    # historically, sharing one target's state across app names is the delete
+    # footgun this hardening removes). Only warehouse_id is a real per-deploy var.
+    var_args = [f"--var=warehouse_id={WAREHOUSE_ID}"] if WAREHOUSE_ID else []
+    cli("bundle", "deploy", "-t", TARGET, *var_args, check=False)
+    rc = cli("bundle", "run", "ontology_readiness", "-t", TARGET, *var_args, check=False)
     if rc != 0:
-        print("  (bundle run failed — ensure --var warehouse_id is set and the app name matches)")
+        print(f"  (bundle run failed — ensure --var warehouse_id is set. If the app already "
+              f"exists outside target '{TARGET}' state, redeploy code with `databricks apps deploy {APP_NAME}`.)")
 
     # Attach Lakebase AFTER publishing so `bundle deploy` doesn't strip the resource.
     if USE_LAKEBASE and _LAKEBASE["host"]:

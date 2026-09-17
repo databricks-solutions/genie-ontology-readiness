@@ -38,15 +38,24 @@ cd app/frontend && npm install && npm run build && cd ../..
 ```bash
 databricks bundle deploy -t dev \
   --profile <your-profile> \
-  --var="warehouse_id=<your_warehouse_id>" \
-  --var="app_name=genie-ontology-readiness"
+  --var="warehouse_id=<your_warehouse_id>"
 ```
+
+Each environment is a **bundle target** with its own Terraform state and a
+**fixed app name** (`dev` → `genie-ontology-readiness-dev`, `stg` → `…-stg`,
+`prod` → the bare `genie-ontology-readiness`). Pick the environment with
+`-t <target>`; there is **no `--var app_name`** — the name is pinned per target
+in `databricks.yml` on purpose, so a deploy can't rename/destroy another env's
+app. For a clean production name, deploy `-t prod`. Routine redeploys of an
+existing app should use the non-destructive `databricks apps deploy <name>`;
+reserve `bundle deploy` for first-time create / infra changes.
 
 ### 3. Post-deploy (render app.yml, grant SP read access, publish)
 
 ```bash
 export DATABRICKS_PROFILE=<your-profile>
-export APP_NAME=genie-ontology-readiness
+export TARGET=dev   # dev (default) | stg | prod — must match the `-t` above;
+                    # the app name is derived from the target, don't set it here
 export WAREHOUSE_ID=<your_warehouse_id>
 # Per-user history (assessment runs + saved plans) — recommended:
 export USE_LAKEBASE=true

@@ -11,7 +11,10 @@ forwarding), the SP needs these grants or the assessment degrades to
 
 Usage:
     export DATABRICKS_PROFILE=<profile>
-    export APP_NAME=genie-ontology-readiness
+    export APP_NAME=<your-app-name>   # e.g. genie-ontology-readiness-dev; required
+                                      # (no default — must match the app you
+                                      # deployed). Normally set for you by
+                                      # post_deploy.py from the bundle target.
     export WAREHOUSE_ID=<warehouse_id>
     # optional: export ASSESS_CATALOGS="cat_a,cat_b"  (else grants on all non-system catalogs)
     python3 scripts/setup_app_permissions.py
@@ -23,9 +26,19 @@ import subprocess
 import sys
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
-APP_NAME = os.environ.get("APP_NAME", "genie-ontology-readiness")
+# No default: the app name is per-environment, so defaulting to a real name
+# (the prod app) would silently grant the SP on the wrong environment. The
+# parent post_deploy.py resolves the name from the bundle target and force-sets
+# it in the child env; a direct invocation must pass APP_NAME explicitly.
+APP_NAME = os.environ.get("APP_NAME", "")
 WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOUSE_ID", ""))
 ASSESS_CATALOGS = [c.strip() for c in os.environ.get("ASSESS_CATALOGS", "").split(",") if c.strip()]
+
+if not APP_NAME:
+    print("ERROR: APP_NAME is not set. Run this via scripts/post_deploy.py (which resolves "
+          "the app name from the bundle target), or export APP_NAME explicitly. Refusing to "
+          "default to a live environment's app name.", file=sys.stderr)
+    sys.exit(1)
 
 _INTERNAL = {"system", "__databricks_internal", "samples", "information_schema"}
 
