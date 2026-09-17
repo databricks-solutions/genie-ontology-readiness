@@ -200,7 +200,11 @@ ACCELERATORS: list[dict] = [
             "Re-run the readiness assessment — column/table comment coverage (and the Metadata score) should rise.",
         ],
         "artifact_dir": "metadata-ai-comments",
-        "artifact_file": "ai_comments_rag.py",
+        # Stored with a `.txt` suffix so `bundle deploy` keeps it a plain FILE instead of
+        # importing the `# Databricks notebook source` header as an extension-less workspace
+        # NOTEBOOK (which 404s the download). `download_as` restores the real notebook name.
+        "artifact_file": "ai_comments_rag.py.txt",
+        "download_as": "ai_comments_rag.py",
         "source": {
             "title": "Add AI-generated comments (docs)",
             "url": "https://docs.databricks.com/aws/en/comments/ai-comments",

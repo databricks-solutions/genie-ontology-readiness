@@ -52,11 +52,18 @@ async def accelerator_artifact(key: str):
     # Path-traversal guard: the resolved path must stay under the accelerators root.
     if ACCEL_ROOT not in path.parents or not path.is_file():
         return JSONResponse(status_code=404, content={"error": "Artifact not found."})
+    # The on-disk name may differ from what the user should download. A Databricks
+    # notebook (`.py` with a `# Databricks notebook source` header) is imported by
+    # `bundle deploy` as a workspace NOTEBOOK — the `.py` is stripped and the app can
+    # no longer find it — so such artifacts are stored with a neutral `.txt` extension
+    # and expose the real download name via `download_as`. The served content-type and
+    # filename come from the download name, not the storage name.
+    download_name = acc.get("download_as") or acc["artifact_file"]
     # Artifacts can be notebooks, SQL, or (e.g. workshop) docs — serve the right type.
     media_type = {
         ".py": "text/x-python",
         ".sql": "application/sql",
         ".md": "text/markdown",
         ".ipynb": "application/x-ipynb+json",
-    }.get(path.suffix.lower(), "application/octet-stream")
-    return FileResponse(path, media_type=media_type, filename=acc["artifact_file"])
+    }.get(Path(download_name).suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media_type, filename=download_name)
