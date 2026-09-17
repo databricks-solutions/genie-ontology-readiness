@@ -165,6 +165,18 @@ def get_cloud_provider() -> str:
     return _cloud_provider
 
 
+def reset_cloud_provider_cache() -> None:
+    """Clear the cached cloud so the next ``get_cloud_provider()`` re-detects.
+
+    The cloud is constant in a deployed app, so it is resolved once and cached.
+    Tests (and any code that sets ``DATABRICKS_CLOUD`` or the host after the first
+    call) need a way to force re-detection; without this the first call's value
+    sticks for the whole process, making the per-cloud routing helpers untestable.
+    """
+    global _cloud_provider
+    _cloud_provider = None
+
+
 def get_auth_headers(force_sp: bool = False) -> dict:
     """Get authorization headers -- works locally and in Databricks Apps.
 

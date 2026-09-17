@@ -10,8 +10,11 @@
 #   4. python lint (ruff)
 #   5. python tests (pytest)
 #   6. compliance / secrets-and-raw-data scan
+#   7. cross-cloud doc-link coverage (OPT-IN — makes network calls, so it is off
+#      by default to keep this gate hermetic/offline; enable when cutting a release)
 #
 # Usage:  bash scripts/check.sh
+#         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 7 (needs network)
 # Exits non-zero on the first failing gate.
 set -euo pipefail
 
@@ -50,5 +53,15 @@ fi
 
 step "Compliance: secrets / raw-data scan"
 bash scripts/__tests__/compliance_scan.test.sh
+
+# Cross-cloud doc-link coverage. Off by default (this gate is hermetic/offline);
+# it HEAD-checks every embedded docs link on gcp/azure, so it needs the network.
+# Enable for a release: GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh
+if [ "${GOR_VERIFY_DOC_LINKS:-0}" = "1" ]; then
+  step "Docs: cross-cloud link coverage (network)"
+  python3 scripts/verify_doc_links.py
+else
+  printf '\n\033[2m(skipping cross-cloud doc-link check — set GOR_VERIFY_DOC_LINKS=1 to run it)\033[0m\n'
+fi
 
 printf '\n\033[1;32mAll checks passed.\033[0m\n'

@@ -66,9 +66,13 @@ async def accelerator_artifact(key: str):
         ".md": "text/markdown",
         ".ipynb": "application/x-ipynb+json",
     }.get(Path(download_name).suffix.lower(), "application/octet-stream")
-    # Markdown handbooks embed docs.databricks.com links — route them to the
-    # deployment's cloud before serving (see server.doc_links).
-    if media_type == "text/markdown":
+    # Text artifacts (markdown handbooks, .py notebooks, .sql) embed
+    # docs.databricks.com links authored for AWS — route them to the deployment's
+    # cloud before serving (see server.doc_links) so an Azure/GCP viewer never gets
+    # an AWS-only link. Binary/opaque types (.ipynb JSON, octet-stream) are served
+    # verbatim.
+    _REWRITE_MEDIA = {"text/markdown", "text/x-python", "application/sql"}
+    if media_type in _REWRITE_MEDIA:
         from server.config import get_cloud_provider
         from server.doc_links import rewrite_doc_links_in_text
         text = rewrite_doc_links_in_text(path.read_text(encoding="utf-8"), get_cloud_provider())
