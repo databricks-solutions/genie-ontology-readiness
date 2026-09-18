@@ -10,7 +10,7 @@ product).
 
 from fastapi import APIRouter, Depends
 
-from server._telemetry import set_product_phase
+from server.user_agent import set_product_phase
 
 from .config import router as config_router
 from .assess import router as assess_router

@@ -25,7 +25,7 @@ from typing import Optional
 
 import aiohttp
 
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import logging
 
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 from server.config import (
     GENIE_ALLOW_SP_FALLBACK,
     GENIE_SPACE_ID,

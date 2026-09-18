@@ -31,7 +31,7 @@ from pathlib import Path
 # Reuse the app's git-tag version resolver (dependency-light — stdlib only) so
 # deploy-time API calls carry the same semver-valid product version as the app.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
-from server._telemetry import resolve_version  # noqa: E402
+from server.user_agent import resolve_version  # noqa: E402
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
 # No default: the app name is per-environment, so defaulting to a real name
@@ -101,8 +101,8 @@ def main():
 
     from databricks.sdk import WorkspaceClient
 
-    # Tag deploy-time API traffic for logfood, with the same semver-valid,
-    # git-tag-derived version the running app uses.
+    # Identify deploy-time API calls with the same descriptive User-Agent (and the
+    # same semver-valid, git-tag-derived version) the running app uses.
     w = WorkspaceClient(
         profile=PROFILE,
         product="genie-ontology-readiness",

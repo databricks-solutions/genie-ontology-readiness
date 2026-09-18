@@ -6,7 +6,7 @@ import contextvars
 import logging
 from typing import Any, Optional
 from server.config import get_workspace_host, get_auth_headers, get_user_token, FORCE_SP, WAREHOUSE_ID, CATALOG, SCHEMA
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 
 logger = logging.getLogger(__name__)
 

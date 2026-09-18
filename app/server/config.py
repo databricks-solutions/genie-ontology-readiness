@@ -24,7 +24,7 @@ import contextvars
 from databricks.sdk import WorkspaceClient
 
 from server.doc_links import cloud_from_host
-from server._telemetry import PRODUCT_NAME, PRODUCT_VERSION
+from server.user_agent import PRODUCT_NAME, PRODUCT_VERSION
 
 logger = logging.getLogger(__name__)
 

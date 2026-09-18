@@ -24,7 +24,7 @@ import aiohttp
 
 from server.config import get_workspace_host, get_auth_headers
 from server.sql_client import record_rest_identity, execute_sql
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 
 logger = logging.getLogger(__name__)
 

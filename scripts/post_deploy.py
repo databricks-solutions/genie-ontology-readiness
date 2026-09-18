@@ -40,7 +40,7 @@ APP_DIR = Path(__file__).resolve().parent.parent / "app"
 # Reuse the app's git-tag version resolver (dependency-light — stdlib only) so
 # the baked version matches what the running app reports.
 sys.path.insert(0, str(APP_DIR))
-from server._telemetry import git_version  # noqa: E402
+from server.user_agent import git_version  # noqa: E402
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
 # Bundle target (dev|stg|prod). The app name is pinned per target in
@@ -111,8 +111,8 @@ def render_app_yml():
     set_env("GENIE_SPACE_ID", os.environ.get("GENIE_SPACE_ID", ""))
     set_env("WORKSPACE_ID", _resolve_workspace_id())
     # Bake the released version into the app's env (the deployed app has no .git),
-    # so its Databricks API calls carry it in the User-Agent for logfood. Empty
-    # is fine — the app then resolves its own fallback (see _telemetry.py).
+    # so its Databricks API calls carry it in the User-Agent. Empty is fine — the
+    # app then resolves its own fallback (see user_agent.py).
     set_env("GOR_VERSION", git_version() or "")
     set_env("BRAND_NAME", os.environ.get("BRAND_NAME", "Databricks"))
     set_env("FORCE_SP", os.environ.get("FORCE_SP", "false"))
