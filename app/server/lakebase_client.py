@@ -9,6 +9,8 @@ import asyncio
 import aiohttp
 from typing import Optional
 
+from server._telemetry import with_ua
+
 logger = logging.getLogger(__name__)
 
 # Will be set during app lifespan
@@ -63,7 +65,7 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
 
         logger.info(f"Fetching SP-scoped Lakebase credential for {resource}")
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10), headers=with_ua()) as session:
             async with session.post(url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()

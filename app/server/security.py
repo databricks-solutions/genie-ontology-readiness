@@ -25,6 +25,8 @@ from typing import Optional
 
 import aiohttp
 
+from server._telemetry import with_ua
+
 logger = logging.getLogger(__name__)
 
 
@@ -344,7 +346,7 @@ async def _identity_from_token(token: str) -> Optional[str]:
         _remember_identity(fingerprint, None)
         return None
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_IDENTITY_LOOKUP_TIMEOUT)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_IDENTITY_LOOKUP_TIMEOUT), headers=with_ua()) as session:
             async with session.get(
                 f"{host}/api/2.0/preview/scim/v2/Me",
                 headers={"Authorization": f"Bearer {token}"},

@@ -4,6 +4,8 @@ import aiohttp
 import asyncio
 import hashlib
 import logging
+
+from server._telemetry import with_ua
 from server.config import (
     GENIE_ALLOW_SP_FALLBACK,
     GENIE_SPACE_ID,
@@ -124,7 +126,7 @@ async def start_conversation(content: str) -> dict:
     logger.info("Starting Genie conversation: question=%s len=%d",
                 _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT, headers=with_ua()) as session:
         result, auth_headers, identity = await _post_with_identity(session, url, payload)
 
         conversation_id = result.get("conversation_id")
@@ -168,7 +170,7 @@ async def send_message(conversation_id: str, content: str) -> dict:
     logger.info("Sending Genie message in conv=%s: question=%s len=%d",
                 conversation_id, _question_ref(content), len(content or ""))
 
-    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT) as session:
+    async with aiohttp.ClientSession(timeout=_GENIE_TIMEOUT, headers=with_ua()) as session:
         result, auth_headers, identity = await _post_with_identity(session, url, payload)
 
         message_id = result.get("id") or result.get("message_id")

@@ -10,6 +10,7 @@ from typing import Optional
 from fastapi import Header
 
 from server.security import resolve_principal, safe_error
+from server._telemetry import with_ua
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,9 @@ async def _stream_from_fmapi(
     auth_headers = get_auth_headers()
     url = f"{host}/serving-endpoints/{model}/invocations"
 
-    headers = {**auth_headers, "Content-Type": "application/json"}
+    # Shared long-lived session (_get_llm_session): set the product tag per
+    # request here, not as a session default, so it reflects the calling tab.
+    headers = with_ua({**auth_headers, "Content-Type": "application/json"})
     payload = {
         "messages": messages,
         "max_tokens": max_tokens,
@@ -363,7 +366,8 @@ async def list_available_models() -> list[dict]:
         url = f"{host}/api/2.0/serving-endpoints"
 
         session = await _get_llm_session()
-        async with session.get(url, headers=auth_headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+        # Shared long-lived session: tag per request (see _stream_from_fmapi).
+        async with session.get(url, headers=with_ua(auth_headers), timeout=aiohttp.ClientTimeout(total=10)) as response:
             if response.status != 200:
                 error_text = await response.text()
                 logger.warning(f"serving-endpoints API error ({response.status}): {error_text[:200]}")

@@ -33,6 +33,15 @@ step "Frontend: build-artifact assertion"
 bash __tests__/build.test.sh
 popd >/dev/null
 
+step "Backend: install deps (app requirements + tooling)"
+# The backend test suite (tests/ + app/server/test_*.py) imports the app's
+# runtime deps (fastapi, aiohttp, databricks-sdk, ...), so the gate must
+# provision them before collecting — mirror the frontend's `npm ci`. Best-effort
+# so a machine without a writable pip env degrades to the skips below rather than
+# aborting; use a venv/uv if this warns (e.g. PEP 668 externally-managed).
+python3 -m pip install -q -r app/requirements.txt ruff pytest || \
+  echo "  (warning) backend dep install failed — ruff/pytest may be skipped below" >&2
+
 step "Backend: ruff lint"
 if command -v ruff >/dev/null 2>&1; then
   ruff check app scripts

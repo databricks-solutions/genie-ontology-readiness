@@ -6,6 +6,7 @@ import contextvars
 import logging
 from typing import Any, Optional
 from server.config import get_workspace_host, get_auth_headers, get_user_token, FORCE_SP, WAREHOUSE_ID, CATALOG, SCHEMA
+from server._telemetry import with_ua
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +264,7 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
     # are bounded per-socket rather than in total because _poll_statement reuses
     # this session for up to two minutes of polling.
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=90)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers=with_ua()) as session:
         async with session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()

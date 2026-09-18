@@ -28,6 +28,12 @@ env:
   # default on a shared metastore. post_deploy.py resolves it automatically.
   - name: WORKSPACE_ID
     value: ""
+  # Product-telemetry version tag, attached to the User-Agent of every Databricks
+  # API call so logfood can attribute usage by version. Baked from `git describe`
+  # by post_deploy.py because the deployed app has no .git. See
+  # app/server/_telemetry.py.
+  - name: GOR_VERSION
+    value: ""
   # The Genie test runs on-behalf-of the viewer whenever a viewer token is
   # forwarded. This controls what happens when there is no viewer token, which is
   # the normal case unless user authorization is enabled for the app.
