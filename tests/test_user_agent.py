@@ -1,20 +1,26 @@
-"""Tests for per-CUJ User-Agent product tagging (logfood attribution).
+"""Tests for the per-CUJ ``User-Agent`` on the app's Databricks API calls.
 
 Two jobs:
   1. The contextvar-driven ``user_agent()`` / ``with_ua()`` produce the right
-     phase-qualified product token.
-  2. A drift guard: every outbound Databricks API call carries the tag. Because
-     the tag rides a per-request contextvar, an untagged ``aiohttp.ClientSession``
-     would silently emit traffic under aiohttp's default UA and vanish from
-     logfood attribution — so we assert every session is tagged at the source.
+     phase-qualified client token.
+  2. A drift guard: every outbound Databricks API call carries the token. Because
+     the token rides a per-request contextvar, an untagged ``aiohttp.ClientSession``
+     would fall back to aiohttp's generic default ``User-Agent`` — so we assert
+     every session sets ours at the source.
 """
 
 import pathlib
 import re
 import unittest
 
-from server import _telemetry
-from server._telemetry import PRODUCT_NAME, PRODUCT_VERSION, set_product_phase, user_agent, with_ua
+from server.user_agent import (
+    PRODUCT_NAME,
+    PRODUCT_VERSION,
+    VALID_PHASES,
+    set_product_phase,
+    user_agent,
+    with_ua,
+)
 
 _SERVER_DIR = pathlib.Path(__file__).resolve().parent.parent / "app" / "server"
 
@@ -58,7 +64,7 @@ class WithUaTest(unittest.TestCase):
 
 
 class SessionTaggingDriftGuard(unittest.TestCase):
-    """Every aiohttp session must be product-tagged, or logfood loses the traffic.
+    """Every aiohttp session must set our ``User-Agent``, or it uses aiohttp's default.
 
     The one long-lived, cross-request session (``_llm_session`` in
     routes/_shared.py) can't carry a phase as a session default because it
@@ -117,7 +123,7 @@ class PhaseWiringTest(unittest.TestCase):
         from server.routes import _PHASE_BY_ROUTER
 
         phases = {phase for _router, phase in _PHASE_BY_ROUTER}
-        self.assertEqual(phases, _telemetry.VALID_PHASES)
+        self.assertEqual(phases, VALID_PHASES)
 
 
 class PhaseDependencyPropagationTest(unittest.TestCase):
@@ -127,8 +133,9 @@ class PhaseDependencyPropagationTest(unittest.TestCase):
     a *sync* dependency in a threadpool, so the ``set()`` mutates a copied context
     and never reaches the request task — the endpoint (and its outbound aiohttp
     calls) then read the default (base product, no phase suffix). This is the bug
-    that shipped in the first UAT build: every DECO row was the base product. An
-    *async* dependency runs in the request task itself and propagates. The unit
+    that shipped in the first UAT build: every request used the base product token
+    regardless of tab. An *async* dependency runs in the request task itself and
+    propagates. The unit
     tests above set the phase directly, so they could not catch this; here we
     drive a real request through a ``TestClient`` and pin the real ``_mark`` async.
     """

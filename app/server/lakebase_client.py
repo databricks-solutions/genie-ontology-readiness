@@ -9,7 +9,7 @@ import asyncio
 import aiohttp
 from typing import Optional
 
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 
 logger = logging.getLogger(__name__)
 

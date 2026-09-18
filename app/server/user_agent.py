@@ -1,21 +1,20 @@
-"""Product telemetry: per-CUJ User-Agent tagging for logfood attribution.
+"""Outbound ``User-Agent`` for the app's Databricks API calls.
 
-Every Databricks API call this app makes (SQL Statement Execution, the Genie
-Conversation API, SCIM, serving endpoints / Foundation Model API, Lakebase
-credential minting, catalog/domain reads) goes to the *customer's own*
-workspace control plane. Databricks records the request User-Agent server-side,
-so tagging our calls with a product token lets logfood attribute adoption and
-version without any data leaving the workspace.
+Builds the ``User-Agent`` header this app stamps on every Databricks API call it
+makes (SQL Statement Execution, the Genie Conversation API, SCIM, serving
+endpoints / Foundation Model API, Lakebase credential minting, catalog/domain
+reads), so its requests are identified by a descriptive, versioned client token
+instead of a generic HTTP-client default. This is standard client hygiene: a
+well-behaved API client names and versions itself.
 
-The three tabs of the critical user journey are tagged as distinct products so
-usage can be split by phase:
+Each tab of the critical user journey identifies itself distinctly:
 
     genie-ontology-readiness-assess/<version>
     genie-ontology-readiness-plan/<version>
     genie-ontology-readiness-learn/<version>
 
 Calls outside a tabbed request (app bootstrap ``/config``, background/unattended
-runs, the SDK ``WorkspaceClient``) carry the un-suffixed base product:
+runs, the SDK ``WorkspaceClient``) use the un-suffixed base token:
 
     genie-ontology-readiness/<version>
 
@@ -23,8 +22,8 @@ The active phase is held in a contextvar set once per request by a router-level
 dependency (see ``routes/__init__.py``), mirroring how the OBO user token is
 scoped per request. Because the app never hands API work to threads/executors,
 the contextvar is visible to every aiohttp session created while serving the
-request, so a shared service module (``sql_client`` etc.) is tagged with the
-phase of whichever tab invoked it.
+request, so a shared service module (``sql_client`` etc.) reports the phase of
+whichever tab invoked it.
 """
 
 import contextvars
@@ -105,10 +104,10 @@ _product_phase: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 
 
 def set_product_phase(phase: str | None) -> None:
-    """Record the CUJ phase for the current request context.
+    """Set the CUJ phase for the current request context.
 
     Unknown values fall back to ``None`` (base product) so a typo degrades to a
-    valid, if less specific, tag rather than emitting a bogus product name.
+    valid, if less specific, token rather than emitting a bogus product name.
     """
     _product_phase.set(phase if phase in VALID_PHASES else None)
 

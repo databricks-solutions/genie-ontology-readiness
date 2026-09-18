@@ -34,7 +34,7 @@ import aiohttp
 
 from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 from server.config import (
     get_workspace_host,
     get_auth_headers,

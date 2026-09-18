@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import Header
 
 from server.security import resolve_principal, safe_error
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 
 logger = logging.getLogger(__name__)
 

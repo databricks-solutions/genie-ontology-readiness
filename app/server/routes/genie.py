@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from server.config import get_workspace_host, get_auth_headers, set_user_token, GENIE_SPACE_ID
-from server._telemetry import with_ua
+from server.user_agent import with_ua
 from server.genie_client import (
     GENIE_IDENTITY_REQUIRED,
     GenieIdentityUnavailable,
