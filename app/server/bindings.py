@@ -24,6 +24,7 @@ import aiohttp
 
 from server.config import get_workspace_host, get_auth_headers
 from server.sql_client import record_rest_identity, execute_sql
+from server._telemetry import with_ua
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,8 @@ async def accessible_catalogs(workspace_ids: set[str]) -> Optional[list[dict]]:
         return None
 
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20),
+        headers=with_ua(),
     ) as session:
         cat_data = await _get_json(session, f"{host}/api/2.1/unity-catalog/catalogs", headers)
         if not isinstance(cat_data, dict):
@@ -123,7 +125,8 @@ async def all_catalogs() -> Optional[list[dict]]:
     if not host or not headers:
         return None
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
+        timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20),
+        headers=with_ua(),
     ) as session:
         cat_data = await _get_json(session, f"{host}/api/2.1/unity-catalog/catalogs", headers)
     if not isinstance(cat_data, dict):

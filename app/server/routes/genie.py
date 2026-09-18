@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from server.config import get_workspace_host, get_auth_headers, set_user_token, GENIE_SPACE_ID
+from server._telemetry import with_ua
 from server.genie_client import (
     GENIE_IDENTITY_REQUIRED,
     GenieIdentityUnavailable,
@@ -54,7 +55,7 @@ async def list_genie_agents(
     if not host or not headers:
         return {"spaces": [], "note": "Workspace credentials unavailable."}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers=with_ua()) as session:
             async with session.get(f"{host}/api/2.0/genie/spaces", headers=headers, params={"page_size": 100}) as resp:
                 if resp.status != 200:
                     return {"spaces": [], "note": f"Genie API returned {resp.status}"}

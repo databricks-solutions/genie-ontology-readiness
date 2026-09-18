@@ -34,6 +34,7 @@ import aiohttp
 
 from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
+from server._telemetry import with_ua
 from server.config import (
     get_workspace_host,
     get_auth_headers,
@@ -1002,7 +1003,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
       ("error", None)       — transient/other failure
     """
     try:
-        async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
+        async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers=with_ua()) as session:
             async with session.get(
                 f"{host}/api/2.0/genie/spaces/{sid}",
                 headers=headers, params={"include_serialized_space": "true"},
@@ -1224,7 +1225,7 @@ async def _native_domains() -> int | None:
         f"{host}/api/2.0/data-domains",
     ):
         try:
-            async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT) as session:
+            async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers=with_ua()) as session:
                 async with session.get(url, headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()

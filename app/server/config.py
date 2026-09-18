@@ -24,6 +24,7 @@ import contextvars
 from databricks.sdk import WorkspaceClient
 
 from server.doc_links import cloud_from_host
+from server._telemetry import PRODUCT_NAME, PRODUCT_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -115,11 +116,13 @@ def _get_workspace_client() -> WorkspaceClient:
     if _workspace_client is None:
         if IS_DATABRICKS_APP:
             logger.info("Creating WorkspaceClient for Databricks App environment")
-            _workspace_client = WorkspaceClient()
+            _workspace_client = WorkspaceClient(product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
         else:
             profile = os.environ.get("DATABRICKS_CLI_PROFILE", "")
             logger.info(f"Creating WorkspaceClient with profile: {profile}")
-            _workspace_client = WorkspaceClient(profile=profile)
+            _workspace_client = WorkspaceClient(
+                profile=profile, product=PRODUCT_NAME, product_version=PRODUCT_VERSION
+            )
         logger.info(f"WorkspaceClient host: {_workspace_client.config.host}")
         logger.info(f"WorkspaceClient auth_type: {_workspace_client.config.auth_type}")
     return _workspace_client

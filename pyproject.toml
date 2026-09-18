@@ -25,4 +25,8 @@ select = ["E9", "F"]
 # pillars.py is import-free, so tests can import it via the server package
 # (app/server/__init__.py is empty) without pulling the app's runtime deps.
 pythonpath = ["app"]
-testpaths = ["tests"]
+# tests/ holds import-light suites; app/server/test_*.py holds the backend unit
+# tests (security, scanner, OBO, etc.) that used to run only under a separate
+# `unittest discover` and so never gated CI. Collecting both here makes the whole
+# backend suite part of `pytest -q` (the one gate scripts/check.sh runs).
+testpaths = ["tests", "app/server"]
