@@ -137,52 +137,67 @@ def build_serialized_space(c: str) -> str:
     return json.dumps(space)
 
 
+# Very large ceiling purely to prevent an unbounded loop if the API kept returning
+# a next_page_token forever. Reaching it is treated as an ERROR (we can't prove the
+# space is absent), never as "not found" — so we never create a duplicate on doubt.
+_MAX_LIST_PAGES = 100_000
+
+
 def find_space_by_title(w, title: str) -> str | None:
-    """Return the space_id of the first space whose display name equals `title`,
-    paging through the Genie list API. None if no such space exists."""
+    """Return the space_id of the first space whose display name equals `title`.
+
+    Pages through the Genie list API to completion (until `next_page_token` is
+    absent). Returns None ONLY after a full, successful scan finds no match — that
+    is the sole signal the caller may use to create. Any list_spaces error
+    propagates (fail closed), and exhausting the page ceiling raises rather than
+    returning None, so an incomplete scan can never be mistaken for "not found"."""
     page_token = None
-    for _ in range(200):  # safety cap on pagination
+    for _ in range(_MAX_LIST_PAGES):
         resp = w.genie.list_spaces(page_token=page_token) if page_token else w.genie.list_spaces()
         for s in getattr(resp, "spaces", None) or []:
             if getattr(s, "title", None) == title:
                 return getattr(s, "space_id", None)
         page_token = getattr(resp, "next_page_token", None)
         if not page_token:
-            break
-    return None
+            return None  # full scan completed, no match → safe to create
+    raise RuntimeError(
+        f"list_spaces pagination exceeded {_MAX_LIST_PAGES} pages without exhausting "
+        "the token; refusing to create a space that might already exist."
+    )
+
+
+def curate_space(w, sid, catalog, warehouse_id) -> str:
+    """(Re)curate an existing space via update_space. Raises on failure so a failed
+    curation is never mistaken for a successful reuse. Returns the space_id."""
+    w.genie.update_space(
+        sid,
+        serialized_space=build_serialized_space(catalog),
+        title=TITLE,
+        description=description_for(catalog),
+        warehouse_id=warehouse_id,
+    )
+    return sid
 
 
 def create_or_update_space(w, catalog, warehouse_id):
-    """Find-or-create the space by its stable title, then (re)curate it.
-    Returns space_id, or None on failure. Idempotent: reuses an existing space."""
-    serialized = build_serialized_space(catalog)
-    description = description_for(catalog)
-    try:
-        existing = find_space_by_title(w, TITLE)
-    except Exception as e:
-        print(f"  list_spaces failed (will attempt create): {str(e)[:200]}")
-        existing = None
+    """Find-or-create the space by its stable title, then (re)curate it. Idempotent.
 
+    FAIL CLOSED: the lookup (find_space_by_title) is NOT wrapped — any list error or
+    incomplete scan propagates, so a transient failure never leads to creating a
+    duplicate. A re-curation (update_space) failure on an existing space also
+    propagates. Returns space_id on success, or None only when create_space could
+    not create one (e.g. the API is disabled on this workspace)."""
+    existing = find_space_by_title(w, TITLE)  # may raise → caller exits non-zero, no create
     if existing:
-        try:
-            w.genie.update_space(
-                existing,
-                serialized_space=serialized,
-                title=TITLE,
-                description=description,
-                warehouse_id=warehouse_id,
-            )
-            print(f"  reused + re-curated existing space {existing}")
-            return existing
-        except Exception as e:
-            print(f"  update_space failed for {existing}: {str(e)[:250]}")
-            return existing  # still usable for asking, even if re-curation failed
+        curate_space(w, existing, catalog, warehouse_id)  # may raise → non-zero, no false success
+        print(f"  reused + re-curated existing space {existing}")
+        return existing
     try:
         space = w.genie.create_space(
             warehouse_id=warehouse_id,
-            serialized_space=serialized,
+            serialized_space=build_serialized_space(catalog),
             title=TITLE,
-            description=description,
+            description=description_for(catalog),
         )
         sid = getattr(space, "space_id", None) or getattr(space, "id", None)
         print(f"  created + curated space {sid}")
@@ -224,23 +239,20 @@ def main():
     args = ap.parse_args()
 
     w = get_client(args.profile)
-    sid = args.space_id
-    if sid:
-        # Explicit space: (re)curate it too, so --space-id stays idempotent.
-        try:
-            w.genie.update_space(
-                sid,
-                serialized_space=build_serialized_space(args.catalog),
-                title=TITLE,
-                description=description_for(args.catalog),
-                warehouse_id=args.warehouse_id,
-            )
+    # Fail closed: any error looking up or (re)curating a space exits non-zero
+    # WITHOUT creating anything — a transient list/auth error or a failed curation
+    # must never produce a duplicate space or a false success.
+    try:
+        if args.space_id:
+            # Explicit space: (re)curate it too, so --space-id stays idempotent.
+            sid = curate_space(w, args.space_id, args.catalog, args.warehouse_id)
             print(f"  re-curated space {sid}")
-        except Exception as e:
-            print(f"  update_space failed for {sid} (continuing to ask): {str(e)[:200]}")
-    else:
-        print("Finding-or-creating Genie space via SDK…")
-        sid = create_or_update_space(w, args.catalog, args.warehouse_id)
+        else:
+            print("Finding-or-creating Genie space via SDK…")
+            sid = create_or_update_space(w, args.catalog, args.warehouse_id)
+    except Exception as e:
+        print(f"\nGenie space setup FAILED (fail-closed, no space created): {str(e)[:300]}")
+        sys.exit(1)
     if not sid:
         print("\n" + "!" * 62)
         print("Could not create a Genie space via API on this workspace.")
