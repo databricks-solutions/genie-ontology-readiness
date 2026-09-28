@@ -8,12 +8,17 @@ EXISTS and has been ASKED questions (which emits audit events). We still curate
 the space fully (instructions + sample questions + verified example SQL) so it is
 a realistic, high-quality agent.
 
-Space creation uses the SDK `w.genie.create_space(warehouse_id, serialized_space,
-title, description)`. `serialized_space` is a JSON string whose shape we build in
+Idempotent: a run without `--space-id` first looks up an existing space by its
+stable display name (TITLE) via the Genie list API and, if found, **re-curates
+that space** rather than creating a new one — so repeated runs converge on a
+single space. It only creates a new space when none with that title exists.
+
+Space create/curate uses the SDK (`w.genie.create_space` / `w.genie.update_space`);
+`serialized_space` is a JSON string whose shape we build in
 `build_serialized_space()` (learned from a live space on this workspace).
 
-    python3 genie_setup.py                       # create + curate + ask
-    python3 genie_setup.py --space-id <id>       # ask an existing space only
+    python3 genie_setup.py                       # find-or-create + curate + ask
+    python3 genie_setup.py --space-id <id>       # curate + ask a specific space
 
 NOTE: system.access.audit ingestion LAGS (minutes, sometimes hours), so the
 Genie pillar may not reflect this activity immediately.
@@ -21,15 +26,14 @@ Genie pillar may not reflect this activity immediately.
 
 import argparse
 import json
+import sys
 import uuid
 
 from _dbx import DEFAULT_CATALOG, DEFAULT_PROFILE, DEFAULT_WAREHOUSE, get_client
 
+# Stable display name — the idempotence key. Repeated runs reuse the space with
+# this exact title instead of creating duplicates.
 TITLE = "Ontology Demo — Sales, Finance & Operations"
-DESCRIPTION = (
-    "Analytics over the ontology_demo governed star schema. Ask about revenue, "
-    "orders, payments, shipments and inventory."
-)
 INSTRUCTIONS = (
     "SCOPE. This space covers a governed star schema across sales, finance and "
     "operations. Facts: sales.fact_orders, finance.fact_payments, "
@@ -49,6 +53,13 @@ SAMPLE_QUESTIONS = [
     "What is the on-time shipment rate by warehouse region?",
     "What is total payment value by payment method?",
 ]
+
+
+def description_for(catalog: str) -> str:
+    return (
+        f"Analytics over the {catalog} governed star schema. Ask about revenue, "
+        "orders, payments, shipments and inventory."
+    )
 
 
 def _tbl(identifier: str, description: str, cols: dict | None = None) -> dict:
@@ -126,15 +137,52 @@ def build_serialized_space(c: str) -> str:
     return json.dumps(space)
 
 
-def create_space(w, catalog, warehouse_id):
-    """Create + curate a Genie space via the SDK. Returns space_id or None."""
+def find_space_by_title(w, title: str) -> str | None:
+    """Return the space_id of the first space whose display name equals `title`,
+    paging through the Genie list API. None if no such space exists."""
+    page_token = None
+    for _ in range(200):  # safety cap on pagination
+        resp = w.genie.list_spaces(page_token=page_token) if page_token else w.genie.list_spaces()
+        for s in getattr(resp, "spaces", None) or []:
+            if getattr(s, "title", None) == title:
+                return getattr(s, "space_id", None)
+        page_token = getattr(resp, "next_page_token", None)
+        if not page_token:
+            break
+    return None
+
+
+def create_or_update_space(w, catalog, warehouse_id):
+    """Find-or-create the space by its stable title, then (re)curate it.
+    Returns space_id, or None on failure. Idempotent: reuses an existing space."""
     serialized = build_serialized_space(catalog)
+    description = description_for(catalog)
+    try:
+        existing = find_space_by_title(w, TITLE)
+    except Exception as e:
+        print(f"  list_spaces failed (will attempt create): {str(e)[:200]}")
+        existing = None
+
+    if existing:
+        try:
+            w.genie.update_space(
+                existing,
+                serialized_space=serialized,
+                title=TITLE,
+                description=description,
+                warehouse_id=warehouse_id,
+            )
+            print(f"  reused + re-curated existing space {existing}")
+            return existing
+        except Exception as e:
+            print(f"  update_space failed for {existing}: {str(e)[:250]}")
+            return existing  # still usable for asking, even if re-curation failed
     try:
         space = w.genie.create_space(
             warehouse_id=warehouse_id,
             serialized_space=serialized,
             title=TITLE,
-            description=DESCRIPTION,
+            description=description,
         )
         sid = getattr(space, "space_id", None) or getattr(space, "id", None)
         print(f"  created + curated space {sid}")
@@ -144,23 +192,26 @@ def create_space(w, catalog, warehouse_id):
         return None
 
 
-def ask(w, sid, question):
-    """Start a conversation and wait for the answer. Emits aibiGenie audit events."""
+def ask(w, sid, question) -> str | None:
+    """Start a conversation and wait for the answer. Emits aibiGenie audit events.
+    Returns the terminal status string (e.g. 'COMPLETED', 'FAILED'), or None if the
+    request itself raised. Only 'COMPLETED' means the question was answered."""
     try:
         msg = w.genie.start_conversation_and_wait(space_id=sid, content=question)
     except Exception as e:
-        print(f"    ask failed: {str(e)[:200]}")
-        return False
-    status = getattr(getattr(msg, "status", None), "value", None) or getattr(msg, "status", None)
-    attachments = getattr(msg, "attachments", None) or []
+        print(f"    ask errored: {str(e)[:200]}")
+        return None
+    status_obj = getattr(msg, "status", None)
+    status = getattr(status_obj, "value", None) or (str(status_obj) if status_obj is not None else None)
     text = ""
-    for a in attachments:
+    for a in getattr(msg, "attachments", None) or []:
         t = getattr(a, "text", None)
         if t is not None:
             text = getattr(t, "content", "") or ""
             break
-    print(f"    -> status={status}; answer: {text[:160] if text else '(query/result attachment)'}")
-    return True
+    detail = text[:160] if text else "(query/result attachment)"
+    print(f"    -> status={status}; answer: {detail if status == 'COMPLETED' else '(not answered)'}")
+    return status
 
 
 def main():
@@ -168,31 +219,52 @@ def main():
     ap.add_argument("--profile", default=DEFAULT_PROFILE)
     ap.add_argument("--warehouse-id", default=DEFAULT_WAREHOUSE)
     ap.add_argument("--catalog", default=DEFAULT_CATALOG)
-    ap.add_argument("--space-id", help="Use an existing space instead of creating one.")
+    ap.add_argument("--space-id", help="Curate/ask a specific space instead of find-or-create.")
     ap.add_argument("--rounds", type=int, default=1, help="Times to ask the sample questions.")
     args = ap.parse_args()
 
     w = get_client(args.profile)
     sid = args.space_id
-    if not sid:
-        print("Creating + curating Genie space via SDK…")
-        sid = create_space(w, args.catalog, args.warehouse_id)
+    if sid:
+        # Explicit space: (re)curate it too, so --space-id stays idempotent.
+        try:
+            w.genie.update_space(
+                sid,
+                serialized_space=build_serialized_space(args.catalog),
+                title=TITLE,
+                description=description_for(args.catalog),
+                warehouse_id=args.warehouse_id,
+            )
+            print(f"  re-curated space {sid}")
+        except Exception as e:
+            print(f"  update_space failed for {sid} (continuing to ask): {str(e)[:200]}")
+    else:
+        print("Finding-or-creating Genie space via SDK…")
+        sid = create_or_update_space(w, args.catalog, args.warehouse_id)
     if not sid:
         print("\n" + "!" * 62)
         print("Could not create a Genie space via API on this workspace.")
         print("Create it in the UI (see README → 'Genie space'), then re-run:")
         print("  python3 genie_setup.py --space-id <SPACE_ID>")
         print("!" * 62)
-        return
+        sys.exit(1)
 
     print(f"\nAsking {len(SAMPLE_QUESTIONS)} question(s) x {args.rounds} round(s) on space {sid}…")
+    completed = failed = 0
     for _ in range(args.rounds):
         for q in SAMPLE_QUESTIONS:
             print(f"  Q: {q}")
-            ask(w, sid, q)
+            if ask(w, sid, q) == "COMPLETED":
+                completed += 1
+            else:
+                failed += 1
     print(f"\nDONE. Space id: {sid}")
     print(f"Space URL: {w.config.host}/genie/rooms/{sid}")
+    print(f"Answered COMPLETED: {completed}; not-answered: {failed}.")
     print("system.access.audit (aibiGenie) ingestion may lag a few hours.")
+    # Non-zero exit if any question failed to complete, so automation can't read a
+    # FAILED/CANCELLED answer as success.
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

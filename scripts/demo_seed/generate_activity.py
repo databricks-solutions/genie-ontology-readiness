@@ -13,6 +13,7 @@ Adoption pillar may not reflect this activity immediately.
 """
 
 import argparse
+import sys
 
 from _dbx import (
     DEFAULT_CATALOG,
@@ -73,6 +74,9 @@ def main():
                 print(f"  [{i}/{len(qs)}] FAIL {e}")
     print(f"\nDONE: {ok} queries ok, {fail} failed.")
     print("system.query.history / system.access.audit ingestion may lag a few hours.")
+    # Exit non-zero if any query failed so automation can distinguish partial/total
+    # failure from a fully successful run.
+    sys.exit(1 if fail else 0)
 
 
 if __name__ == "__main__":

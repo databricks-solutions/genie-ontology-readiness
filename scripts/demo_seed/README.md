@@ -4,9 +4,9 @@ Idempotent scripts that provision a **synthetic, governed star schema** so the
 [`genie-ontology-readiness`](../../README.md) app produces a **full, representative
 readiness report across all 7 pillars**. The seed reads nothing customer-specific;
 it populates an existing catalog (`ontology_demo`) end-to-end: managed Delta tables
-with real rows, table/column comments, UC governed tags (domain / steward /
-certification), PK/FK (RELY) constraints, UC metric views, a curated Genie space,
-and query activity.
+with real rows, table/column comments, UC governed tags (`subject_area` / `steward` /
+`certification_status`), PK/FK (RELY) constraints, UC metric views, a curated Genie
+space, and query activity.
 
 Everything is **safe to re-run** (`CREATE ... IF NOT EXISTS`, guarded `INSERT`s,
 `CREATE OR REPLACE`, drop-then-add constraints, `SET TAGS` overwrite). No secrets
@@ -56,8 +56,8 @@ python3 seed.py                      # idempotent; prints a per-pillar verificat
 python3 generate_activity.py --rounds 3
 
 # 3. create + curate + exercise a Genie space (Genie Agents pillar; audit lags)
-python3 genie_setup.py               # creates via SDK; falls back to manual steps if the API is off
-# or, after creating the space by hand:  python3 genie_setup.py --space-id <SPACE_ID>
+python3 genie_setup.py               # find-or-create by title (idempotent) + curate + ask
+# or, to curate/ask a specific space:  python3 genie_setup.py --space-id <SPACE_ID>
 ```
 
 Run a single step with `python3 seed.py --only 07_metric_views`.
@@ -140,12 +140,15 @@ read 0 until `system.access.audit` / `system.query.history` ingestion catches up
 
 ## Genie space
 
-`genie_setup.py` creates the space via the SDK
-(`w.genie.create_space(warehouse_id, serialized_space, title, description)`) with a
-fully curated `serialized_space`: 11 data-source tables (with descriptions),
-general instructions (scope + revenue definitions), 5 sample questions, and 3
-verified example SQL queries. It then asks the 5 sample questions and confirms each
-returns `COMPLETED`.
+`genie_setup.py` is **idempotent**: it first looks up an existing space by its stable
+title (`Ontology Demo — Sales, Finance & Operations`) via `w.genie.list_spaces`; if
+found it re-curates that space with `w.genie.update_space`, otherwise it creates one
+with `w.genie.create_space`. Either way the `serialized_space` is fully curated: 11
+data-source tables (with descriptions), general instructions (scope + revenue
+definitions), 5 sample questions, and 3 verified example SQL queries. It then asks the
+5 sample questions, treats **only `COMPLETED` as answered**, and exits non-zero if any
+question fails to complete. Repeated runs converge on this single space rather than
+creating duplicates.
 
 - **Live space id:** `01f1bb177b4a150abc62ea122990b0b1`
 - **URL:** `https://e2-demo-field-eng.cloud.databricks.com/genie/rooms/01f1bb177b4a150abc62ea122990b0b1`
