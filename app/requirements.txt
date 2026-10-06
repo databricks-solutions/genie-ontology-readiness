@@ -21,4 +21,4 @@ databricks-sdk~=0.138.0
 pydantic~=2.13
 asyncpg~=0.31.0
 markdown>=3.10.3
-xhtml2pdf>=0.2.18
+xhtml2pdf>=0.2.21
