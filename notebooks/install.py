@@ -51,6 +51,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
@@ -205,21 +206,25 @@ def run_sql(statement: str) -> str | None:
             return None
         return res.status.error.message if res.status.error else res.status.state.value
     except Exception as e:
-        return str(e)
+        return f"{type(e).__name__}: {e}"
 
 
-def grant(statement: str) -> bool:
-    error = run_sql(statement)
-    print(f"  {'OK  ' if error is None else 'FAIL'} {statement}" + (f" — {error[:150]}" if error else ""))
-    return error is None
+def grant_all(statements: list[str]) -> list[bool]:
+    """Run GRANT statements in parallel and print one OK/FAIL line per statement."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        errors = list(pool.map(run_sql, statements))
+    for statement, error in zip(statements, errors):
+        print(f"  {'OK  ' if error is None else 'FAIL'} {statement}" + (f" — {error[:150]}" if error else ""))
+    return [error is None for error in errors]
 
 
 step("Granting read access on system schemas")
 sp = _ident(SP_CLIENT_ID)
-grant_results = [grant(f"GRANT USE CATALOG ON CATALOG system TO {sp}")]
-for schema in ("information_schema", "access", "query"):
-    grant_results.append(grant(f"GRANT USE SCHEMA ON SCHEMA system.{schema} TO {sp}"))
-    grant_results.append(grant(f"GRANT SELECT ON SCHEMA system.{schema} TO {sp}"))
+grant_results = grant_all([f"GRANT USE CATALOG ON CATALOG system TO {sp}"])
+grant_results += grant_all([
+    f"GRANT USE SCHEMA, SELECT ON SCHEMA system.{schema} TO {sp}"
+    for schema in ("information_schema", "access", "query")
+])
 
 step("Granting read access on assessed catalogs")
 catalogs = [c.strip() for c in cfg["assess_catalogs"].split(",") if c.strip()]
@@ -229,9 +234,9 @@ if not catalogs:
         if c.name and c.name not in _INTERNAL_CATALOGS and not c.name.startswith("__")
     ]
     print(f"  discovered {len(catalogs)} non-system catalogs")
-for cat in catalogs:
-    for privilege in ("USE CATALOG", "USE SCHEMA", "SELECT"):
-        grant_results.append(grant(f"GRANT {privilege} ON CATALOG {_ident(cat)} TO {sp}"))
+grant_results += grant_all([
+    f"GRANT USE CATALOG, USE SCHEMA, SELECT ON CATALOG {_ident(cat)} TO {sp}" for cat in catalogs
+])
 
 failed_grants = grant_results.count(False)
 print(f"\n  {len(grant_results) - failed_grants} grants applied, {failed_grants} failed")
