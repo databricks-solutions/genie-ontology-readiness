@@ -50,6 +50,7 @@ dbutils.widgets.text("lakebase_database", "ontology_readiness", "Lakebase databa
 import re
 import shutil
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -195,6 +196,11 @@ def run_sql(statement: str) -> str | None:
         res = w.statement_execution.execute_statement(
             warehouse_id=cfg["warehouse_id"], statement=statement, wait_timeout="50s"
         )
+        # A stopped warehouse can take longer than the 50s inline wait to start.
+        deadline = time.time() + 600
+        while res.status.state.value in ("PENDING", "RUNNING") and time.time() < deadline:
+            time.sleep(5)
+            res = w.statement_execution.get_statement(res.statement_id)
         if res.status.state.value == "SUCCEEDED":
             return None
         return res.status.error.message if res.status.error else res.status.state.value
