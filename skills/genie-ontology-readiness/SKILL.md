@@ -88,6 +88,17 @@ once and reuse it everywhere:
    `SHOW CATALOGS` lists but whose `information_schema` you can't query should be
    dropped from the union (test each with a `SELECT 1 ... LIMIT 1`).
 
+   **Always quote enumerated names.** Catalog names come from the metastore, not
+   from you, so a name can contain a backtick, a hyphen, or a space. Wrap every
+   catalog name you interpolate as an identifier in backticks **and double any
+   backtick inside it** (`` my`cat `` → `` `my``cat` ``). Skip any name that
+   contains a newline, carriage return, or NUL. This applies to the readability
+   probe, the `UNION ALL`, and the per-catalog drill-downs. Where a catalog name
+   is used as a string literal instead (for example a `table_catalog IN (...)`
+   batch filter), single-quote it and double any single quote inside it. The
+   App does the same with `quote_ident` / `quote_literal` in
+   `app/server/security.py`.
+
 Throughout `references/pillar-signals.md`, **`<TABLES>`**, **`<COLUMNS>`**,
 **`<SCHEMATA>`**, **`<TABLE_CONSTRAINTS>`**, **`<TABLE_TAGS>`**, **`<SCHEMA_TAGS>`**
 stand for the source you resolved (either `system.information_schema.<view>` with

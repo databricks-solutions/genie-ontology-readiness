@@ -228,8 +228,9 @@ record_check "Genie question content written to the log" \
 # 3e. Catalog/schema names interpolated into SQL inside bare backticks. Names come
 # from the metastore, so a name containing a backtick closes the quoting early
 # (CWE-89). Use security.quote_ident, which doubles embedded backticks.
+# A single backtick only: RST ``{literal}`` markup in a docstring is not SQL.
 record_check "unescaped backtick identifier interpolation in SQL" \
-  "$(scan_py '`\{' )"
+  "$(scan_py '(^|[^`])`\{' )"
 
 # 3f. Postgres connections that encrypt without verifying the peer. `require`
 # encrypts but authenticates nothing, so it gives no in-path protection.

@@ -98,6 +98,28 @@ staged source lives in `/Workspace/Users/<you>/.genie-ontology-readiness/<app_na
 The app name is a widget (default `genie-ontology-readiness`), so use a different name
 than any app you manage with `bundle deploy` to keep the two flows separate.
 
+### Run the assessment without the app (Genie Code skill)
+
+If your workspace can't install Databricks Apps (security review, deployment, or
+service-principal constraints), use the standalone skill in
+[`skills/genie-ontology-readiness/`](skills/genie-ontology-readiness/) instead. The
+Genie Code agent runs the same read-only `information_schema` and system-table SQL as
+the app, using **your own** Unity Catalog permissions. It produces the same seven-pillar
+scorecard, maturity level, readiness stage, and prioritized gaps, with no app, app
+service principal, or Lakebase.
+
+1. Publish the skill folder (`SKILL.md` + `references/`) as a Unity Catalog skill in a
+   catalog/schema you own, or copy it into your workspace skills folder.
+2. In Genie Code, ask *"Assess this workspace's Genie Ontology readiness"* (or invoke
+   `genie-ontology-readiness`).
+3. You need `USE CATALOG` + `SELECT` on the catalogs to assess. `SELECT` on
+   `system.information_schema`, `system.access.audit`, `system.query.history`, and
+   `system.access.table_lineage` makes the result richer. A pillar whose reads are
+   denied is reported as *unavailable*; it doesn't fail the run.
+
+The skill transcribes the app's scoring (`app/server/pillars.py`,
+`app/server/assessment/`). Scoring changes must update both together.
+
 ## Permissions required
 
 The app reads only **metadata** (`information_schema`, tags) and **system tables**
