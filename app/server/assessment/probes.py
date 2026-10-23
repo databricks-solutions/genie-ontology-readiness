@@ -46,6 +46,7 @@ from server.workspace_filter import (
     is_multi_workspace,
     get_workspace_filter,
     get_catalog_scope,
+    get_schema_scope,
 )
 from server.bindings import accessible_catalogs
 
@@ -230,7 +231,7 @@ async def _resolve_sources() -> dict:
 
     # A workspace/catalog scope makes the resolved catalog set request-specific, so
     # the process-wide SP cache (which is unscoped) must not be used or populated.
-    scoped = bool(get_catalog_scope()) or _has_workspace_scope()
+    scoped = bool(get_catalog_scope()) or bool(get_schema_scope()) or _has_workspace_scope()
     if scoped:
         return await _do_resolve_sources()
 
@@ -346,9 +347,44 @@ async def _do_resolve_sources() -> dict:
             catalogs = accessible
         logger.info(f"accessible catalogs: {len(catalogs)} of {len(checks)} discovered")
 
-    sources = {"system_ok": use_system, "catalogs": catalogs}
-    logger.info(f"assessment sources: system_ok={use_system}, catalogs={len(catalogs)}")
+    # Schema allowlist is only meaningful for a single catalog (the UI only
+    # offers it then). Ignore it otherwise so a leftover list can't silently
+    # drop objects from other catalogs.
+    schemas = get_schema_scope()
+    if schemas and len(catalogs) != 1:
+        schemas = None
+    sources = {"system_ok": use_system, "catalogs": catalogs, "schemas": schemas}
+    logger.info(
+        f"assessment sources: system_ok={use_system}, catalogs={len(catalogs)}, "
+        f"schemas={len(schemas) if schemas else 'all'}"
+    )
     return sources
+
+
+def schema_predicate(schemas: list[str] | None, column: str = "table_schema") -> str:
+    """SQL fragment restricting *column* to an optional schema allowlist.
+
+    With no allowlist, only ``information_schema`` is excluded (today's default).
+    With an allowlist, match those names exactly — ``information_schema`` cannot
+    appear unless the caller passed it.
+    """
+    if schemas:
+        in_list = ", ".join(quote_literal(schema) for schema in schemas)
+        return f"{column} IN ({in_list})"
+    return f"{column} <> {quote_literal('information_schema')}"
+
+
+def _schema_sql(sources: dict, column: str = "table_schema") -> str:
+    """Predicate for the default information_schema exclusion, or a schema allowlist."""
+    return schema_predicate(sources.get("schemas"), column)
+
+
+def _schema_and(sources: dict, column: str = "table_schema") -> str:
+    """Optional ``AND …`` fragment used on queries that have no default schema clause."""
+    schemas = sources.get("schemas")
+    if not schemas:
+        return ""
+    return f"AND {schema_predicate(schemas, column)} "
 
 
 def _src(view: str, sources: dict) -> str | None:
@@ -387,11 +423,11 @@ async def probe_uc_foundation() -> dict:
     try:
         tbl = _src("tables", s)
         sch = _src("schemata", s)
-        n_schemas = await _scalar(f"SELECT COUNT(*) FROM {sch} WHERE schema_name <> 'information_schema'")
+        n_schemas = await _scalar(f"SELECT COUNT(*) FROM {sch} WHERE {_schema_sql(s, 'schema_name')}")
         rows = await execute_sql(
             f"""SELECT COUNT(*) AS total,
                        SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed
-                FROM {tbl} WHERE table_schema <> 'information_schema'"""
+                FROM {tbl} WHERE {_schema_sql(s)}"""
         )
         total = int(rows[0].get("total") or 0)
         managed = int(rows[0].get("managed") or 0)
@@ -401,14 +437,17 @@ async def probe_uc_foundation() -> dict:
         # information_schema in current runtimes; if it isn't readable we simply
         # omit the coverage signal rather than fail the pillar.
         non_uc = None
-        try:
-            non_uc = int(await _scalar(
-                "SELECT COUNT(*) FROM hive_metastore.information_schema.tables "
-                "WHERE table_schema <> 'information_schema'"
-            ) or 0)
-        except Exception as e:
-            logger.info(f"hive_metastore not readable for UC-coverage signal: {str(e)[:80]}")
-            non_uc = None
+        # A single-schema assessment is about that schema, not the workspace's
+        # leftover Hive footprint — skip the hive_metastore signal in that case.
+        if not s.get("schemas"):
+            try:
+                non_uc = int(await _scalar(
+                    "SELECT COUNT(*) FROM hive_metastore.information_schema.tables "
+                    "WHERE table_schema <> 'information_schema'"
+                ) or 0)
+            except Exception as e:
+                logger.info(f"hive_metastore not readable for UC-coverage signal: {str(e)[:80]}")
+                non_uc = None
         uc_coverage_pct = _pct(total, total + non_uc) if non_uc is not None else None
 
         score = 0.0
@@ -471,7 +510,7 @@ async def probe_uc_foundation() -> dict:
             crows = await execute_sql(
                 f"SELECT table_catalog AS catalog, table_schema AS schema, COUNT(*) AS tables, "
                 f"       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed "
-                f"FROM {tbl} WHERE table_schema <> 'information_schema' {_internal_catalog_filter(s)}"
+                f"FROM {tbl} WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}"
                 f"GROUP BY table_catalog, table_schema ORDER BY tables DESC LIMIT 500"
             )
             drill_rows = [
@@ -528,7 +567,12 @@ _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
 
 
-def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> str:
+def _coverage_query(
+    view: str,
+    catalogs_batch: list[str],
+    system_ok: bool,
+    schemas: list[str] | None = None,
+) -> str:
     """Per-catalog comment-coverage query for an information_schema ``view``
     (tables/columns) scoped to a batch of catalogs, grouped by ``table_catalog``.
 
@@ -539,17 +583,22 @@ def _coverage_query(view: str, catalogs_batch: list[str], system_ok: bool) -> st
     """
     cov = ("COUNT(*) AS total, "
            "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented")
+    schema_sql = schema_predicate(schemas)
     if system_ok:
         in_list = ", ".join(quote_literal(c) for c in catalogs_batch)
         return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM system.information_schema.{view} "
-                f"WHERE table_catalog IN ({in_list}) AND table_schema <> 'information_schema' "
+                f"WHERE table_catalog IN ({in_list}) AND {schema_sql} "
                 f"GROUP BY table_catalog, table_schema")
     union = " UNION ALL ".join(f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in catalogs_batch)
     return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM ({union}) AS _c "
-            f"WHERE table_schema <> 'information_schema' GROUP BY table_catalog, table_schema")
+            f"WHERE {schema_sql} GROUP BY table_catalog, table_schema")
 
 
-async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tuple[int, int, dict]:
+async def _column_coverage_chunked(
+    catalogs: list[str],
+    system_ok: bool,
+    schemas: list[str] | None = None,
+) -> tuple[int, int, dict]:
     """(columns, commented-columns, per_schema) computed in per-catalog batches with
     bounded concurrency, where per_schema maps (catalog, schema) -> (columns, commented).
     Emits pillar_progress as each batch lands and raises TimeoutError only if no
@@ -564,7 +613,7 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
         "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
         "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
         f"FROM {_cov_view} WHERE table_catalog IN (:catalogs) "
-        "AND table_schema <> 'information_schema' GROUP BY table_catalog, table_schema",
+        f"AND {schema_predicate(schemas)} GROUP BY table_catalog, table_schema",
         {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches"},
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
@@ -577,7 +626,7 @@ async def _column_coverage_chunked(catalogs: list[str], system_ok: bool) -> tupl
                 # record=False: the per-batch queries differ only in their catalog
                 # list, so we record ONE representative below instead of one row per
                 # batch in the "View SQL" disclosure.
-                rows = await execute_sql(_coverage_query("columns", batch, system_ok), record=False)
+                rows = await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False)
                 bt = sum(int(r.get("total") or 0) for r in rows)
                 bc = sum(int(r.get("commented") or 0) for r in rows)
                 return len(batch), bt, bc, True, rows
@@ -655,10 +704,10 @@ async def probe_metadata() -> dict:
         if system_ok:
             internal_list = ", ".join(quote_literal(c) for c in _INTERNAL_CATALOGS)
             tables_src, tables_where = ("system.information_schema.tables",
-                                        "WHERE table_schema <> 'information_schema' "
+                                        f"WHERE {_schema_sql(s)} "
                                         f"AND table_catalog NOT IN ({internal_list})")
         else:
-            tables_src, tables_where = tbl, "WHERE table_schema <> 'information_schema'"
+            tables_src, tables_where = tbl, f"WHERE {_schema_sql(s)}"
         trows = await execute_sql(
             "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
             "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
@@ -679,12 +728,14 @@ async def probe_metadata() -> dict:
         # Fall back to a single query only when there's no catalog list to chunk by.
         col_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
         if catalogs:
-            c_total, c_commented, col_per_schema = await _column_coverage_chunked(catalogs, system_ok)
+            c_total, c_commented, col_per_schema = await _column_coverage_chunked(
+                catalogs, system_ok, s.get("schemas")
+            )
         else:
             col = _src("columns", s)  # built lazily — only the no-catalog-list fallback needs it
             if col is not None:
                 crows = await execute_sql(
-                    _COV_SELECT + f"{col} WHERE table_schema <> 'information_schema'"
+                    _COV_SELECT + f"{col} WHERE {_schema_sql(s)}"
                 )
                 c_total = int(crows[0].get("total") or 0)
                 c_commented = int(crows[0].get("commented") or 0)
@@ -695,7 +746,9 @@ async def probe_metadata() -> dict:
         tt = _src("table_tags", s)
         if tt is not None:
             try:
-                tagged_tables = await _scalar(f"SELECT COUNT(DISTINCT table_name) FROM {tt}")
+                tagged_tables = await _scalar(
+                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
+                )
             except Exception:
                 tagged_tables = None
 
@@ -769,7 +822,9 @@ async def probe_relationships() -> dict:
         pk = fk = 0
         tc = _src("table_constraints", s)
         try:
-            rows = await execute_sql(f"SELECT constraint_type, COUNT(*) AS n FROM {tc} GROUP BY constraint_type")
+            rows = await execute_sql(
+                f"SELECT constraint_type, COUNT(*) AS n FROM {tc} WHERE {_schema_sql(s)} GROUP BY constraint_type"
+            )
             by_type = {r["constraint_type"]: int(r["n"] or 0) for r in rows}
             pk = by_type.get("PRIMARY KEY", 0)
             fk = by_type.get("FOREIGN KEY", 0)
@@ -778,8 +833,9 @@ async def probe_relationships() -> dict:
 
         gold_tables = await _scalar(
             f"""SELECT COUNT(*) FROM {tbl}
-                WHERE lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
-                   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)'"""
+                WHERE {_schema_sql(s)}
+                  AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
+                   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)')"""
         ) or 0
 
         score = 0.0
@@ -813,7 +869,8 @@ async def probe_relationships() -> dict:
         try:
             grows = await execute_sql(
                 f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS n FROM {tbl} "
-                f"WHERE (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)' "
+                f"WHERE {_schema_sql(s)} "
+                f"AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)' "
                 f"   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)') "
                 f"{_internal_catalog_filter(s)}GROUP BY table_catalog, table_schema"
             )
@@ -825,7 +882,7 @@ async def probe_relationships() -> dict:
             try:
                 crows = await execute_sql(
                     f"SELECT table_catalog AS cat, table_schema AS sch, constraint_type AS ct, COUNT(*) AS n "
-                    f"FROM {tc} GROUP BY table_catalog, table_schema, constraint_type"
+                    f"FROM {tc} WHERE {_schema_sql(s)} GROUP BY table_catalog, table_schema, constraint_type"
                 )
                 for r in crows:
                     cat, sch = r.get("cat"), r.get("sch")
@@ -871,7 +928,9 @@ async def probe_metrics() -> dict:
         type_value = None
         for tv in ("METRIC_VIEW", "METRIC VIEW"):
             try:
-                metric_views = await _scalar(f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{tv}'")
+                metric_views = await _scalar(
+                    f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{tv}' {_schema_and(s)}"
+                )
                 if metric_views is not None:
                     type_value = tv
                     break
@@ -896,7 +955,7 @@ async def probe_metrics() -> dict:
         commented = 0
         try:
             commented = await _scalar(
-                f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{type_value}' AND comment IS NOT NULL AND trim(comment) <> ''"
+                f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{type_value}' AND comment IS NOT NULL AND trim(comment) <> '' {_schema_and(s)}"
             ) or 0
         except Exception:
             commented = 0
@@ -940,7 +999,7 @@ async def probe_metrics() -> dict:
             mrows = await execute_sql(
                 f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS n, "
                 f"SUM(CASE WHEN comment IS NOT NULL AND trim(comment) <> '' THEN 1 ELSE 0 END) AS commented "
-                f"FROM {tbl} WHERE table_type = '{type_value}' {_internal_catalog_filter(s)}"
+                f"FROM {tbl} WHERE table_type = '{type_value}' {_schema_and(s)}{_internal_catalog_filter(s)}"
                 f"GROUP BY table_catalog, table_schema ORDER BY n DESC LIMIT 500"
             )
             drill_rows = [
@@ -1260,9 +1319,9 @@ async def probe_domains() -> dict:
         steward_keys = ", ".join(quote_literal(k) for k in _STEWARD_TAG_KEYS)
         cert_keys = ", ".join(quote_literal(k) for k in _CERT_TAG_KEYS)
 
-        parts = [f"SELECT tag_value FROM {tt} WHERE lower(tag_name) IN ({domain_keys})"]
+        parts = [f"SELECT tag_value FROM {tt} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}"]
         if st is not None:
-            parts.append(f"SELECT tag_value FROM {st} WHERE lower(tag_name) IN ({domain_keys})")
+            parts.append(f"SELECT tag_value FROM {st} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}")
         rows = await execute_sql(
             f"SELECT COUNT(DISTINCT tag_value) AS distinct_domains, COUNT(*) AS assignments FROM ({' UNION ALL '.join(parts)})"
         )
@@ -1271,7 +1330,9 @@ async def probe_domains() -> dict:
 
         stewarded = 0
         try:
-            stewarded = int(await _scalar(f"SELECT COUNT(*) FROM {tt} WHERE lower(tag_name) IN ({steward_keys})") or 0)
+            stewarded = int(await _scalar(
+                f"SELECT COUNT(*) FROM {tt} WHERE lower(tag_name) IN ({steward_keys}) {_schema_and(s, 'schema_name')}"
+            ) or 0)
         except Exception:
             stewarded = 0
 
@@ -1281,7 +1342,8 @@ async def probe_domains() -> dict:
         try:
             certified = int(await _scalar(
                 f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
-                f"FROM {tt} WHERE lower(tag_name) IN ({cert_keys}) AND lower(tag_value) = 'certified'"
+                f"FROM {tt} WHERE lower(tag_name) IN ({cert_keys}) AND lower(tag_value) = 'certified' "
+                f"{_schema_and(s, 'schema_name')}"
             ) or 0)
         except Exception:
             certified = 0
@@ -1292,19 +1354,20 @@ async def probe_domains() -> dict:
         tbl = _src("tables", s)
         total_tables = governed_tagged = domain_tagged = 0
         try:
-            total_tables = int(await _scalar(f"SELECT COUNT(*) FROM {tbl} WHERE table_schema <> 'information_schema'") or 0)
+            total_tables = int(await _scalar(f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)}") or 0)
         except Exception:
             total_tables = 0
         try:
             governed_tagged = int(await _scalar(
-                f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) FROM {tt}"
+                f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
+                f"FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
             ) or 0)
         except Exception:
             governed_tagged = 0
         try:
             domain_tagged = int(await _scalar(
                 f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
-                f"FROM {tt} WHERE lower(tag_name) IN ({domain_keys})"
+                f"FROM {tt} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}"
             ) or 0)
         except Exception:
             domain_tagged = 0
@@ -1320,15 +1383,21 @@ async def probe_domains() -> dict:
         top_accessed_list = []
         try:
             lineage_wsf, lineage_params = workspace_predicate()
+            lineage_scope = ""
+            if s.get("schemas") and s.get("catalogs"):
+                lineage_scope = (
+                    f"AND source_table_catalog = {quote_literal(s['catalogs'][0])} "
+                    f"AND {schema_predicate(s['schemas'], 'source_table_schema')} "
+                )
             rows = await execute_sql(
                 "WITH top AS ("
                 "  SELECT source_table_full_name AS name, COUNT(DISTINCT created_by) AS n "
                 "  FROM system.access.table_lineage "
                 "  WHERE source_table_full_name IS NOT NULL "
                 "    AND source_table_catalog NOT IN ('system','__databricks_internal','samples') "
-                "    AND source_table_schema <> 'information_schema' "
+                f"    AND {schema_predicate(s.get('schemas'), 'source_table_schema')} "
                 "    AND event_date >= current_date() - INTERVAL 90 DAYS "
-                f"    {lineage_wsf}"
+                f"    {lineage_scope}{lineage_wsf}"
                 "  GROUP BY source_table_full_name ORDER BY n DESC LIMIT 10 "
                 "), cert AS ("
                 "  SELECT concat_ws('.', catalog_name, schema_name, table_name) AS name "

@@ -20,7 +20,7 @@ from server.pdf import (
     pdf_export_unavailable_response,
     render_pdf_response,
 )
-from server.workspace_filter import set_workspace_filter, set_catalog_scope
+from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
 from server.security import safe_error
 from server import snapshots
 
@@ -50,6 +50,9 @@ class AssessRequest(BaseModel):
     # Which catalogs the metadata pillars should assess. Empty → derive from the
     # selected workspaces' bindings (or enumerate all visible catalogs).
     catalogs: list[str] = []
+    # Optional schema allowlist. Applied only when ``catalogs`` resolves to a
+    # single catalog (the UI only offers this after picking one catalog).
+    schemas: list[str] = []
 
 
 @router.get("/assess")
@@ -58,20 +61,24 @@ async def assess_get(
     workspace_ids: Optional[str] = None,
     workspace_mode: str = "include",
     catalogs: Optional[str] = None,
+    schemas: Optional[str] = None,
 ):
     """Quick technical-only assessment. Cached briefly. Not persisted.
 
     Optional ``?workspace_ids=<comma,sep>&workspace_mode=include|exclude`` scopes the
     activity signals and ``?catalogs=<comma,sep>`` scopes the metadata pillars (mainly
-    for headless/testing; the UI uses the stream body)."""
+    for headless/testing; the UI uses the stream body). ``?schemas=<comma,sep>``
+    further scopes those pillars when a single catalog is in scope."""
     set_user_token(x_forwarded_access_token)
     ids = [w.strip() for w in (workspace_ids or "").split(",") if w.strip()]
     cat_scope = [c.strip() for c in (catalogs or "").split(",") if c.strip()]
+    sch_scope = [s.strip() for s in (schemas or "").split(",") if s.strip()]
     set_workspace_filter({"mode": workspace_mode, "workspace_ids": ids} if ids else None)
     set_catalog_scope(cat_scope or None)
+    set_schema_scope(sch_scope or None)
     # Only cache the SP-run result with no filter; a per-user (OBO) or filtered/scoped
     # run is scoped and must not be shared from the cache.
-    cacheable = not x_forwarded_access_token and not ids and not cat_scope
+    cacheable = not x_forwarded_access_token and not ids and not cat_scope and not sch_scope
     if cacheable:
         cached = _cache_get("assess:technical")
         if cached is not None:
@@ -97,14 +104,16 @@ async def assess_stream(
 
     wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
     cat_scope = list(req.catalogs) if req and req.catalogs else None
+    sch_scope = list(req.schemas) if req and req.schemas else None
 
     async def gen():
         # Set inside the generator too: the streaming body may run in a fresh
-        # context, so re-establish the OBO token + workspace/catalog scope here
-        # (contextvars set here propagate to the probe tasks created downstream).
+        # context, so re-establish the OBO token + workspace/catalog/schema scope
+        # here (contextvars set here propagate to the probe tasks created downstream).
         set_user_token(x_forwarded_access_token)
         set_workspace_filter(wsf)
         set_catalog_scope(cat_scope)
+        set_schema_scope(sch_scope)
         try:
             async for event in run_assessment_stream():
                 if event.get("type") == "complete":
