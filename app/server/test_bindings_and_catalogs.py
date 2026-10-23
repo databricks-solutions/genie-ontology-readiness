@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 from server.bindings import _select_accessible
 from server.routes import catalogs as cat_route
 from server.assessment import probes
-from server.workspace_filter import set_workspace_filter, set_catalog_scope
+from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
 
 
 CATS = [
@@ -88,6 +88,69 @@ class ScopedCatalogsPrecedenceTest(unittest.IsolatedAsyncioTestCase):
         set_workspace_filter(None)
         with patch.object(probes, "ASSESS_CATALOGS", []):
             self.assertIsNone(await probes._scoped_catalogs())
+
+
+class SchemaPredicateTest(unittest.TestCase):
+    def test_default_excludes_information_schema(self):
+        self.assertEqual(probes.schema_predicate(None), "table_schema <> 'information_schema'")
+
+    def test_allowlist_is_quoted(self):
+        self.assertEqual(
+            probes.schema_predicate(["gold", "o'brien"], "schema_name"),
+            "schema_name IN ('gold', 'o''brien')",
+        )
+
+
+class ListSchemasRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_lists_schemas_for_catalog(self):
+        sql = AsyncMock(return_value=[{"name": "gold"}, {"name": "silver"}])
+        with patch.object(cat_route, "execute_sql", sql):
+            resp = await cat_route.list_schemas(catalog="sales")
+        self.assertTrue(resp["available"])
+        self.assertEqual([s["name"] for s in resp["schemas"]], ["gold", "silver"])
+        self.assertIn("sales", sql.await_args.args[0])
+        self.assertIn("information_schema.schemata", sql.await_args.args[0])
+
+    async def test_empty_catalog_is_unavailable(self):
+        resp = await cat_route.list_schemas(catalog="  ")
+        self.assertFalse(resp["available"])
+        self.assertEqual(resp["schemas"], [])
+
+    async def test_sql_failure_degrades(self):
+        with patch.object(cat_route, "execute_sql", AsyncMock(side_effect=RuntimeError("denied"))):
+            resp = await cat_route.list_schemas(catalog="sales")
+        self.assertFalse(resp["available"])
+        self.assertEqual(resp["schemas"], [])
+
+
+class SchemaScopeResolveTest(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        set_workspace_filter(None)
+        set_catalog_scope(None)
+        set_schema_scope(None)
+
+    async def _resolve(self, catalogs: list[str]):
+        async def fake_sql(q, *args, **kwargs):
+            if "system.information_schema.tables LIMIT 1" in q:
+                raise RuntimeError("no system")
+            if "information_schema.tables LIMIT 1" in q:
+                return [{"ok": 1}]
+            return []
+
+        set_catalog_scope(catalogs)
+        set_schema_scope(["gold"])
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake_sql)):
+            return await probes._do_resolve_sources()
+
+    async def test_schema_kept_for_one_catalog(self):
+        sources = await self._resolve(["sales"])
+        self.assertEqual(sources["catalogs"], ["sales"])
+        self.assertEqual(sources["schemas"], ["gold"])
+
+    async def test_schema_dropped_for_two_catalogs(self):
+        sources = await self._resolve(["sales", "finance"])
+        self.assertEqual(sources["catalogs"], ["sales", "finance"])
+        self.assertIsNone(sources["schemas"])
 
 
 if __name__ == "__main__":

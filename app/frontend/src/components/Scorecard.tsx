@@ -29,11 +29,14 @@ import type {
   WorkspacesResponse,
   CatalogInfo,
   CatalogsResponse,
+  SchemaInfo,
+  SchemasResponse,
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
+import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
 
 type AssessEvent =
@@ -170,6 +173,11 @@ export default function Scorecard({
   const [catalogsAvailable, setCatalogsAvailable] = useState(true);
   const [catalogsLoading, setCatalogsLoading] = useState(false);
   const [catFilter, setCatFilter] = useState<string[]>([]);
+  const [schemas, setSchemas] = useState<SchemaInfo[]>([]);
+  const [schemasAvailable, setSchemasAvailable] = useState(true);
+  const [schemasLoading, setSchemasLoading] = useState(false);
+  const [schemaFilter, setSchemaFilter] = useState('');
+  const singleCatalog = catFilter.length === 1 ? catFilter[0] : null;
   const [zipBusy, setZipBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
@@ -279,6 +287,28 @@ export default function Scorecard({
       .finally(() => setCatalogsLoading(false));
   }, [wsFilter]);
 
+  // Schema picker lists schemas only after the user picks exactly one catalog.
+  useEffect(() => {
+    if (!singleCatalog) {
+      setSchemas([]);
+      setSchemasAvailable(true);
+      setSchemaFilter('');
+      return;
+    }
+    setSchemasLoading(true);
+    setSchemaFilter('');
+    apiGet<SchemasResponse>(`/schemas?catalog=${encodeURIComponent(singleCatalog)}`)
+      .then((r) => {
+        setSchemas(r.schemas || []);
+        setSchemasAvailable(r.available);
+      })
+      .catch(() => {
+        setSchemas([]);
+        setSchemasAvailable(false);
+      })
+      .finally(() => setSchemasLoading(false));
+  }, [singleCatalog]);
+
   // The workspace the assessment is scoped to (the deployed workspace). Shown as a
   // read-only label in place of a picker.
   const scopedWorkspaceName = useMemo(() => {
@@ -336,7 +366,11 @@ export default function Scorecard({
     try {
       for await (const ev of streamPostEvents<AssessEvent>(
         '/assess/stream',
-        { workspace_filter: wsFilter, catalogs: catFilter },
+        {
+          workspace_filter: wsFilter,
+          catalogs: catFilter,
+          schemas: schemaFilter ? [schemaFilter] : [],
+        },
         undefined,
         controller.signal
       )) {
@@ -523,6 +557,14 @@ export default function Scorecard({
             value={catFilter}
             onChange={setCatFilter}
           />
+          <SchemaFilter
+            schemas={schemas}
+            available={schemasAvailable}
+            loading={schemasLoading}
+            value={schemaFilter}
+            onChange={setSchemaFilter}
+            locked={!singleCatalog}
+          />
         </div>
       </div>
 
@@ -612,6 +654,15 @@ export default function Scorecard({
                   value={catFilter}
                   onChange={setCatFilter}
                   disabled={running}
+                />
+                <SchemaFilter
+                  schemas={schemas}
+                  available={schemasAvailable}
+                  loading={schemasLoading}
+                  value={schemaFilter}
+                  onChange={setSchemaFilter}
+                  disabled={running}
+                  locked={!singleCatalog}
                 />
               </div>
             </div>

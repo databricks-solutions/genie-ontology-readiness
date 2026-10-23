@@ -75,6 +75,14 @@ export interface CatalogsResponse {
   available: boolean;
 }
 
+export interface SchemaInfo {
+  name: string;
+}
+export interface SchemasResponse {
+  schemas: SchemaInfo[];
+  available: boolean;
+}
+
 // One SQL statement a pillar ran, for the "view the query" disclosure (#22).
 export interface SourceQuery {
   sql: string;

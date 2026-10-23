@@ -43,6 +43,25 @@ def get_catalog_scope() -> list | None:
     return _catalog_scope.get()
 
 
+# Optional schema allowlist. Only applied when the catalog scope is a single
+# catalog (the UI only offers the picker in that case). None → all schemas.
+_schema_scope: contextvars.ContextVar = contextvars.ContextVar("schema_scope", default=None)
+
+
+def set_schema_scope(schemas: list | None) -> None:
+    """Record a per-request schema allowlist, or None to assess every schema."""
+    if not schemas:
+        _schema_scope.set(None)
+        return
+    names = [str(s).strip() for s in schemas if str(s).strip()]
+    _schema_scope.set(names or None)
+
+
+def get_schema_scope() -> list | None:
+    """The active per-request schema allowlist, or None."""
+    return _schema_scope.get()
+
+
 def set_workspace_filter(f: dict | None) -> None:
     """Record the workspace filter for the current request context.
 

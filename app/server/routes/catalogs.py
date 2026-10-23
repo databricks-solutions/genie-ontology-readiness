@@ -19,6 +19,8 @@ from fastapi import APIRouter, Header
 
 from server.config import set_user_token
 from server.bindings import accessible_catalogs, all_catalogs, sql_enumerate_catalogs
+from server.security import quote_ident
+from server.sql_client import execute_sql
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -43,3 +45,28 @@ async def list_catalogs(
     fallback = await sql_enumerate_catalogs()
     fallback.sort(key=lambda c: c["name"])
     return {"catalogs": fallback, "available": False}
+
+
+@router.get("/schemas")
+async def list_schemas(
+    catalog: str,
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+):
+    """Schemas in ``catalog`` for the optional single-schema assessment picker.
+
+    Excludes ``information_schema``. Returns ``{schemas: [{name}], available}``.
+    """
+    set_user_token(x_forwarded_access_token)
+    name = (catalog or "").strip()
+    if not name:
+        return {"schemas": [], "available": False}
+    try:
+        rows = await execute_sql(
+            f"SELECT schema_name AS name FROM {quote_ident(name)}.information_schema.schemata "
+            "WHERE schema_name <> 'information_schema' ORDER BY schema_name"
+        )
+        schemas = [{"name": r.get("name")} for r in rows if r.get("name")]
+        return {"schemas": schemas, "available": True}
+    except Exception as e:
+        logger.warning(f"schema listing failed for catalog {name!r}: {e}")
+        return {"schemas": [], "available": False}
