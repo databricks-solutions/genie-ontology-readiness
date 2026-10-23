@@ -78,6 +78,26 @@ per target so a deploy can never rename or delete another environment's app. Kee
 See **[CLAUDE.md](./CLAUDE.md)** for prerequisites, the service-principal grants the
 assessment needs, local development, optional Lakebase history, and branding.
 
+### Install from a notebook (no local tooling)
+
+If you'd rather not install Node.js or the Databricks CLI, install the app from a
+notebook inside the workspace:
+
+1. In the workspace, **Create → Git folder** and paste this repo's URL (pick the
+   latest release tag as the branch for a stable build).
+2. Open [`notebooks/install.py`](notebooks/install.py) from the Git folder and attach
+   it to **Serverless** compute.
+3. Set the widgets (`warehouse_id` defaults to the first warehouse you can see; set
+   `lakebase_instance_name` to an existing Lakebase instance for per-user history)
+   and click **Run all**.
+
+The notebook creates or reuses the app, applies the same service-principal grants as
+`setup_app_permissions.py`, renders `app.yml`, and deploys. The frontend is built by the
+Databricks Apps runtime during deployment, so nothing is built on your machine. The
+staged source lives in `/Workspace/Users/<you>/.genie-ontology-readiness/<app_name>`.
+The app name is a widget (default `genie-ontology-readiness`), so use a different name
+than any app you manage with `bundle deploy` to keep the two flows separate.
+
 ## Permissions required
 
 The app reads only **metadata** (`information_schema`, tags) and **system tables**

@@ -25,6 +25,10 @@ Bundles** + `post_deploy.py`.
 
 ## Deployment (3 commands)
 
+No local tooling? Run [`notebooks/install.py`](notebooks/install.py) from a workspace
+Git folder on serverless instead: it does the same create/grant/render/deploy steps
+with the SDK, and the Databricks Apps runtime builds the frontend. See the README.
+
 All commands run from the repository root.
 
 ### 1. Build the frontend
@@ -169,6 +173,8 @@ app/
     routes/
       config.py  assess.py  content.py  plan.py  chat.py  genie.py  _shared.py
   frontend/                  — React + Vite + Tailwind (4 tabs: Assess/Learn/Plan/Assistant)
+notebooks/
+  install.py                 — workspace notebook installer (no CLI / Node.js needed)
 scripts/
   post_deploy.py             — render app.yml, grant SP, publish
   setup_app_permissions.py   — UC read grants for the app SP
