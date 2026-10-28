@@ -307,7 +307,7 @@ export default function PlanWizard({
               <select
                 value={selectedSnapshotId ?? ''}
                 onChange={(e) => setSelectedSnapshotId(Number(e.target.value))}
-                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-databricks-300"
+                className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-databricks-300"
               >
                 {assessments.map((a) => (
                   <option key={a.id} value={Number(a.id)}>

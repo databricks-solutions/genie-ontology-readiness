@@ -33,7 +33,7 @@ export default function SqlModal({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+      className="fixed inset-0 z-60 flex items-center justify-center bg-black/40 p-4"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
@@ -55,7 +55,7 @@ export default function SqlModal({
                   <span className="text-[11px] font-medium text-ink-600">{q.label || `Query ${i + 1}`}</span>
                   <button
                     onClick={() => copy(q.sql, i)}
-                    className="inline-flex items-center gap-1 rounded bg-white border border-gray-200 hover:bg-databricks-50 hover:text-databricks-700 px-1.5 py-0.5 text-[11px] text-ink-600 transition-colors"
+                    className="inline-flex items-center gap-1 rounded-sm bg-white border border-gray-200 hover:bg-databricks-50 hover:text-databricks-700 px-1.5 py-0.5 text-[11px] text-ink-600 transition-colors"
                     title="Copy query"
                   >
                     {copied === i ? <Check size={12} /> : <Copy size={12} />}

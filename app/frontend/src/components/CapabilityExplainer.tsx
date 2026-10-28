@@ -65,7 +65,7 @@ function QueriesBlock({ queries }: { queries: ContentQuery[] }) {
               <span className="text-xs font-medium text-ink-700">{q.title}</span>
               <button
                 onClick={() => copy(q.sql, i)}
-                className="inline-flex items-center gap-1 rounded bg-white border border-gray-200 hover:bg-databricks-50 hover:text-databricks-700 px-1.5 py-0.5 text-[11px] text-ink-600 transition-colors"
+                className="inline-flex items-center gap-1 rounded-sm bg-white border border-gray-200 hover:bg-databricks-50 hover:text-databricks-700 px-1.5 py-0.5 text-[11px] text-ink-600 transition-colors"
                 title="Copy query"
               >
                 {copied === i ? <Check size={12} /> : <Copy size={12} />}
@@ -181,7 +181,7 @@ function AcceleratorCard({ accelerator: a }: { accelerator: Accelerator }) {
                 <pre className="bg-ink-900 text-gray-100 text-[11px] rounded-md p-3 overflow-x-auto whitespace-pre">{importCommand(a)}</pre>
                 <button
                   onClick={copyCmd}
-                  className="absolute top-2 right-2 rounded bg-white/10 hover:bg-white/20 text-white px-1.5 py-1"
+                  className="absolute top-2 right-2 rounded-sm bg-white/10 hover:bg-white/20 text-white px-1.5 py-1"
                   title="Copy command"
                 >
                   {copied ? <Check size={13} /> : <Copy size={13} />}

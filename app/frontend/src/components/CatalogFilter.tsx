@@ -82,7 +82,7 @@ export default function CatalogFilter({
       {open && (
         <div className="absolute z-20 mt-1 w-72 rounded-lg border border-gray-200 bg-white shadow-lg p-3 space-y-2">
           {!available && (
-            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-sm px-2 py-1.5">
               Couldn't resolve catalog bindings (needs privilege to read them). Showing all
               catalogs the app can see.
             </p>
@@ -106,7 +106,7 @@ export default function CatalogFilter({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search catalogs…"
-              className="w-full text-xs outline-none bg-transparent"
+              className="w-full text-xs outline-hidden bg-transparent"
             />
           </div>
           <div className="max-h-60 overflow-y-auto rounded-md border border-gray-100 divide-y divide-gray-50">
@@ -121,12 +121,12 @@ export default function CatalogFilter({
                     onClick={() => toggle(c.name)}
                     className="w-full flex items-center gap-2 px-2 py-1.5 text-left text-xs hover:bg-gray-50"
                   >
-                    <span className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 ${on ? 'bg-databricks-500 border-databricks-500' : 'border-gray-300'}`}>
+                    <span className={`w-4 h-4 rounded-sm border flex items-center justify-center shrink-0 ${on ? 'bg-databricks-500 border-databricks-500' : 'border-gray-300'}`}>
                       {on && <Check size={11} className="text-white" />}
                     </span>
                     <span className="flex-1 min-w-0 truncate text-ink-800">{c.name}</span>
                     {c.access && c.access !== 'ALL' && (
-                      <span className={`rounded border px-1 py-0.5 text-[10px] ${ACCESS_BADGE[c.access] || ACCESS_BADGE.OPEN}`}>
+                      <span className={`rounded-sm border px-1 py-0.5 text-[10px] ${ACCESS_BADGE[c.access] || ACCESS_BADGE.OPEN}`}>
                         {c.access === 'READ_WRITE' ? 'RW' : c.access === 'READ' ? 'R' : 'open'}
                       </span>
                     )}

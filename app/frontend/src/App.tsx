@@ -68,7 +68,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-lg bg-databricks-500 flex items-center justify-center shadow">
+              <div className="w-9 h-9 rounded-lg bg-databricks-500 flex items-center justify-center shadow-sm">
                 <Network size={20} className="text-white" />
               </div>
               <div>
@@ -83,7 +83,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setModelPickerOpen(true)}
-                className="flex items-center gap-2 bg-ink-800 border border-ink-700 text-white text-sm rounded-md pl-3 pr-2 py-1.5 hover:bg-ink-700 focus:outline-none focus:ring-2 focus:ring-databricks-400"
+                className="flex items-center gap-2 bg-ink-800 border border-ink-700 text-white text-sm rounded-md pl-3 pr-2 py-1.5 hover:bg-ink-700 focus:outline-hidden focus:ring-2 focus:ring-databricks-400"
                 title="AI model used to generate the plan"
               >
                 <span className="max-w-[180px] truncate">{activeModelLabel}</span>

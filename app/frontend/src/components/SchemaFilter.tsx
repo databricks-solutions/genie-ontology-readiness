@@ -109,7 +109,7 @@ export default function SchemaFilter({
       {open && !pickerDisabled && (
         <div className="absolute z-20 top-full left-0 mt-1 w-72 rounded-lg border border-gray-200 bg-white shadow-lg p-3 space-y-2">
           {!available && (
-            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-sm px-2 py-1.5">
               Couldn't list schemas in this catalog. The assessment will cover every schema it can read.
             </p>
           )}
@@ -131,7 +131,7 @@ export default function SchemaFilter({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search schemas…"
-              className="w-full text-xs outline-none bg-transparent"
+              className="w-full text-xs outline-hidden bg-transparent"
             />
           </div>
           <div className="max-h-60 overflow-y-auto rounded-md border border-gray-100 divide-y divide-gray-50">

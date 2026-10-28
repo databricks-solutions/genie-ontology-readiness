@@ -44,7 +44,7 @@ export default function ModelPickerModal({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+      className="fixed inset-0 z-60 flex items-center justify-center bg-black/40 p-4"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col">

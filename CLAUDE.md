@@ -215,8 +215,8 @@ in `app.yml.template`. The app creates its snapshot table on startup.
 ## Branding for a customer
 
 Apply the customer's brand per the `customer-branding/` convention: set
-`BRAND_NAME`, and update the `databricks` color scale in
-`app/frontend/tailwind.config.js` to the customer's primary/secondary colors
+`BRAND_NAME`, and update the `--color-databricks-*` scale in the `@theme` block of
+`app/frontend/src/index.css` to the customer's primary/secondary colors
 before `npm run build`. Default is Databricks brand.
 
 ## Common issues

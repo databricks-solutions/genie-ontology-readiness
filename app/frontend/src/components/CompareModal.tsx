@@ -203,7 +203,7 @@ export default function CompareModal({
       value={value || ''}
       onChange={(e) => onChange(Number(e.target.value))}
       data-testid={testid}
-      className="w-full rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-ink-700 focus:border-databricks-400 focus:outline-none"
+      className="w-full rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-xs text-ink-700 focus:border-databricks-400 focus:outline-hidden"
     >
       {ordered.map((h) => (
         <option key={String(h.id)} value={Number(h.id)}>{label(h)}</option>
@@ -215,7 +215,7 @@ export default function CompareModal({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+      className="fixed inset-0 z-60 flex items-center justify-center bg-black/40 p-4"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col">
