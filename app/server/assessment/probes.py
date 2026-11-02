@@ -1266,7 +1266,15 @@ async def probe_genie_agents() -> dict:
 # ---------------------------------------------------------------------------
 # 6. Domains & stewardship (native API, else governed-tag proxy)
 # ---------------------------------------------------------------------------
+# Legacy convention: a tag key from this list, with the domain name as the tag *value*.
 _DOMAIN_TAG_KEYS = ("domain", "data_domain", "business_domain", "subject_area", "data_product")
+# Discover domains (UC semantics) are governed tags keyed by the domain name itself: a top-level
+# domain `Finance`, a subdomain `Finance/Tax` ({parentTag}/{subdomain}), usually with an empty value.
+# Tagging an asset with a subdomain does not also tag it with the parent.
+# Docs: https://docs.databricks.com/aws/en/uc-semantics/domains
+# API:  https://docs.databricks.com/api/domains/v1/list-domains (GET, needs MANAGE DISCOVER)
+_DOMAINS_API_PATHS = ("/api/2.0/domains", "/api/discover/v1/domains")
+_DOMAINS_MAX_PAGES = 50
 _STEWARD_TAG_KEYS = ("owner", "data_owner", "steward", "data_steward")
 # Certification is the governed tag `system.certification_status` with value
 # `certified` (or `deprecated`). Match both the namespaced and bare key forms.
@@ -1274,58 +1282,107 @@ _STEWARD_TAG_KEYS = ("owner", "data_owner", "steward", "data_steward")
 _CERT_TAG_KEYS = ("system.certification_status", "certification_status")
 
 
-async def _native_domains() -> int | None:
+async def _native_domains() -> dict:
+    """List Discover domains and subdomains via the Domains API.
+
+    Returns {"status": "ok", "domains": [...]} on success, {"status": "forbidden"} when the
+    caller lacks MANAGE DISCOVER (401/403), else {"status": "unavailable"}.
+    """
     host = get_workspace_host()
     headers = get_auth_headers()  # viewer token if present; the tag proxy is the user-scoped fallback
     if not host or not headers:
-        return None
-    for url in (
-        f"{host}/api/2.1/unity-catalog/data-domains",
-        f"{host}/api/2.0/data-domains",
-    ):
+        return {"status": "unavailable"}
+    status = "unavailable"
+    for path in _DOMAINS_API_PATHS:
+        domains, token = [], None
         try:
             async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers=with_ua()) as session:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
+                for _ in range(_DOMAINS_MAX_PAGES):
+                    params = {"page_size": "100", **({"page_token": token} if token else {})}
+                    async with session.get(f"{host}{path}", headers=headers, params=params) as resp:
+                        if resp.status in (401, 403):
+                            status = "forbidden"
+                            break
+                        if resp.status != 200:
+                            break
                         data = await resp.json()
-                        domains = data.get("data_domains") or data.get("domains") or data.get("data") or []
+                    domains += data.get("domains") or []
+                    token = data.get("next_page_token")
+                    if not token:
                         # This REST read doesn't go through execute_sql, so record its
                         # identity via the shared helper (mirrors execute_sql's base
                         # OBO-vs-SP decision, keeping the mode vocabulary in one place).
                         record_rest_identity()
-                        return len(domains)
+                        return {"status": "ok", "domains": domains}
         except Exception:
             continue
-    return None
+    return {"status": status}
+
+
+def _domain_tag_sql(domain_keys: list[str]) -> tuple[str, str]:
+    """(predicate, label) over a *_tags view: which tag rows place an asset in a domain, and the
+    top-level domain each rolls up to. Legacy `domain`-style keys always count (domain = the value);
+    `domain_keys` are Discover domain tag keys, and `Parent/Sub` rolls up to `Parent`."""
+    legacy = ", ".join(quote_literal(k) for k in _DOMAIN_TAG_KEYS)
+    pred = f"lower(tag_name) IN ({legacy})"
+    if domain_keys:
+        pred = f"({pred} OR lower(tag_name) IN ({', '.join(quote_literal(k.lower()) for k in domain_keys)}))"
+    return pred, f"CASE WHEN lower(tag_name) IN ({legacy}) THEN tag_value ELSE split(tag_name, '/')[0] END"
+
+
+async def _discover_style_keys(views: list[str], s: dict) -> list[str]:
+    """Without the Domains API: tag keys that look like Discover domains, i.e. `Parent/Sub` keys and
+    any key that is the parent of one. A top-level domain with no subdomain tags can't be told apart
+    from other governed tags this way, so the probe note asks for MANAGE DISCOVER."""
+    slash = f"instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system%' {_schema_and(s, 'schema_name')}"
+    rows = await execute_sql(" UNION ".join(f"SELECT DISTINCT tag_name FROM {v} WHERE {slash}" for v in views) + " LIMIT 1000")
+    subs = {r.get("tag_name") for r in rows if r.get("tag_name")}
+    return sorted(subs | {k.split("/", 1)[0] for k in subs})
 
 
 async def probe_domains() -> dict:
-    native = await _native_domains()
-    if native is not None:
-        score = min(100.0, 40 + 60 * min(native, 5) / 5) if native else 0.0
-        gaps = [] if native else ["No domains defined; organize assets into business-aligned domains with stewards."]
-        return {"available": True, "score": score,
-                "signals": [{"label": "Domains (native)", "value": native, "detail": "Business/data domains defined in Unity Catalog"}],
-                "gaps": gaps, "note": None, "metrics": {"domains": native, "source": "native_api"}}
+    api = await _native_domains()
+    api_domains = api.get("domains") if api["status"] == "ok" else None
+    top_level = [d for d in api_domains or [] if not d.get("parent_domain_id")]
+    subdomains = len(api_domains or []) - len(top_level)
 
     s = await _resolve_sources()
     tt = _src("table_tags", s)
     st = _src("schema_tags", s)
     if tt is None:
+        if api_domains is not None:  # domains are readable, asset coverage is not
+            n = len(top_level)
+            return {"available": True, "score": min(100.0, 40 + 40 * min(n, 5) / 5) if n else 0.0,
+                    "signals": [{"label": "Domains (Discover)", "value": n,
+                                 "detail": f"Top-level domains in Discover ({subdomains} subdomains)"}],
+                    "gaps": [] if n else ["No domains defined; create business-aligned domains in Discover."],
+                    "note": "No readable catalogs for tag coverage; domain count only.",
+                    "metrics": {"domains": n, "subdomains": subdomains, "source": "native_api"}}
         return _empty("Domains API unavailable and no readable catalogs for the tag proxy; use the self-assessment.",
                       reason="insufficient_permission")
     try:
-        domain_keys = ", ".join(quote_literal(k) for k in _DOMAIN_TAG_KEYS)
         steward_keys = ", ".join(quote_literal(k) for k in _STEWARD_TAG_KEYS)
         cert_keys = ", ".join(quote_literal(k) for k in _CERT_TAG_KEYS)
+        views = [tt] + ([st] if st is not None else [])
+        if api_domains is not None:
+            discover_keys = [d["tag_key"] for d in api_domains if d.get("tag_key")]
+        else:
+            try:
+                discover_keys = await _discover_style_keys(views, s)
+            except Exception as e:
+                logger.info(f"discover-style domain keys unavailable: {str(e)[:80]}")
+                discover_keys = []
+        domain_pred, domain_label = _domain_tag_sql(discover_keys)
 
-        parts = [f"SELECT tag_value FROM {tt} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}"]
-        if st is not None:
-            parts.append(f"SELECT tag_value FROM {st} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}")
+        parts = [f"SELECT {domain_label} AS domain FROM {v} WHERE {domain_pred} {_schema_and(s, 'schema_name')}"
+                 for v in views]
         rows = await execute_sql(
-            f"SELECT COUNT(DISTINCT tag_value) AS distinct_domains, COUNT(*) AS assignments FROM ({' UNION ALL '.join(parts)})"
+            f"SELECT COUNT(DISTINCT lower(domain)) AS distinct_domains, COUNT(*) AS assignments "
+            f"FROM ({' UNION ALL '.join(parts)})"
         )
         distinct_domains = int(rows[0].get("distinct_domains") or 0)
+        if api_domains is not None:  # domains defined in Discover count even before assets are tagged
+            distinct_domains = max(distinct_domains, len(top_level))
         assignments = int(rows[0].get("assignments") or 0)
 
         stewarded = 0
@@ -1367,7 +1424,7 @@ async def probe_domains() -> dict:
         try:
             domain_tagged = int(await _scalar(
                 f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
-                f"FROM {tt} WHERE lower(tag_name) IN ({domain_keys}) {_schema_and(s, 'schema_name')}"
+                f"FROM {tt} WHERE {domain_pred} {_schema_and(s, 'schema_name')}"
             ) or 0)
         except Exception:
             domain_tagged = 0
@@ -1430,7 +1487,10 @@ async def probe_domains() -> dict:
 
         gaps = []
         if distinct_domains == 0:
-            gaps.append("No domain-style governed tags found (e.g. a `domain` tag). Organize assets into business-aligned domains.")
+            gaps.append("No domains found. Create business-aligned domains and subdomains in Discover and add their assets.")
+        if api["status"] == "forbidden":
+            gaps.append("Couldn't read Discover domains: the assessing identity needs MANAGE DISCOVER, so domains were "
+                        "inferred from governed tags and may be undercounted.")
         if stewarded == 0:
             gaps.append("No stewardship tags (owner/steward) found; assign a named steward per domain.")
         if certified == 0:
@@ -1443,7 +1503,10 @@ async def probe_domains() -> dict:
             gaps.append(f"Only {top_certified} of your top {top_accessed} most-accessed resources are certified — certify high-traffic tables so Genie/ontology can trust your busiest data.")
 
         signals = [
-            {"label": "Distinct domains (via tags)", "value": distinct_domains, "detail": "Distinct values of domain-style governed tags"},
+            {"label": "Domains (Discover)" if api_domains is not None else "Distinct domains (via tags)",
+             "value": distinct_domains,
+             "detail": (f"Top-level domains in Discover ({subdomains} subdomains)" if api_domains is not None
+                        else "Domains inferred from governed tags: Discover `Domain/Subdomain` keys and `domain`-style tags")},
             {"label": "Domain-tagged assets", "value": assignments, "detail": "Assets carrying a domain tag"},
             {"label": "Stewarded assets", "value": stewarded, "detail": "Assets with an owner/steward tag"},
             {"label": "Certified assets", "value": certified, "detail": "Tables tagged system.certification_status = certified"},
@@ -1463,7 +1526,7 @@ async def probe_domains() -> dict:
         try:
             drows = await execute_sql(
                 f"SELECT catalog_name AS catalog, schema_name AS schema, "
-                f"  COUNT(DISTINCT CASE WHEN lower(tag_name) IN ({domain_keys}) "
+                f"  COUNT(DISTINCT CASE WHEN {domain_pred} "
                 f"    THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS domain_tagged, "
                 f"  COUNT(DISTINCT CASE WHEN lower(tag_name) IN ({steward_keys}) "
                 f"    THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS stewarded, "
@@ -1485,16 +1548,23 @@ async def probe_domains() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
-            "note": "Assessed via governed tags (the native UC Domains feature is a gated preview). "
-                    "Use the self-assessment to capture domain design maturity the tags can't show.",
+            "note": ("Domains read from the Discover Domains API; asset coverage from their governed tags."
+                     if api_domains is not None else
+                     "Domains inferred from governed tags (Discover `Domain/Subdomain` keys and `domain`-style tags) "
+                     "because the Domains API "
+                     + ("needs MANAGE DISCOVER" if api["status"] == "forbidden" else "was unavailable")
+                     + ". A domain with no subdomain tags may be missed. "
+                     "Use the self-assessment to capture domain design maturity the tags can't show."),
             "metrics": {"distinct_domains": distinct_domains, "domain_tag_assignments": assignments,
+                        "subdomains": subdomains if api_domains is not None else None,
+                        "domains_api": api["status"],
                         "stewarded_assets": stewarded, "certified_assets": certified,
                         "total_tables": total_tables,
                         "governed_tagged_assets": governed_tagged, "pct_tagged": pct_tagged,
                         "domain_tagged_assets": domain_tagged, "pct_in_domain": pct_in_domain,
                         "top_accessed": top_accessed, "top_accessed_certified": top_certified,
                         "top_accessed_list": top_accessed_list,
-                        "source": "tag_proxy"},
+                        "source": "native_api" if api_domains is not None else "tag_proxy"},
             "drill_down": _drill(
                 "Governance tags by schema",
                 [{"key": "catalog", "label": "Catalog"},
