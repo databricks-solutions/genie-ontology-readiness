@@ -295,31 +295,52 @@ WHERE a.trashed = 0 ORDER BY a.events DESC LIMIT 200;
 
 ## 6. Domains & Stewardship — weight 10
 
-**Try the native UC Domains API first** (only if you can make an authenticated
-REST GET): `GET {host}/api/2.1/unity-catalog/data-domains` (fall back to
-`/api/2.0/data-domains`). Count `data_domains` / `domains` / `data`. Native UC
-Domains is a gated preview, so this endpoint is usually **absent (404)** — that's
-expected; drop to the governed-tag proxy below, which is the normal path.
+**Domains live in Discover.** A Discover domain is a governed tag keyed by the
+domain name (`Finance`); a subdomain is keyed `{parentTag}/{subdomain}`
+(`Finance/Tax`), usually with an empty value. Tagging an asset with a subdomain
+does **not** also tag it with the parent. Docs:
+[Domains and subdomains](https://docs.databricks.com/aws/en/uc-semantics/domains).
 
-- If it returns a count `native`:
-  **Score** = `40 + 60 * min(native, 5)/5` when `native > 0`, else `0`.
-  Signal: Domains (native) = `native`.
-  Gap when `native == 0`: "No domains defined; organize assets into business-aligned domains with stewards."
-  (Skip the tag proxy — you're done.)
+**Step 1: list domains with the Domains API** (only if you can make an
+authenticated REST GET): `GET {host}/api/2.0/domains?page_size=100` (alternate
+path `/api/discover/v1/domains`), following `next_page_token`. Each item has
+`tag_key` and `parent_domain_id` (empty for a top-level domain). The caller needs
+**MANAGE DISCOVER** (workspace / account admins have it by default); a 401/403
+means it's missing, so say so in a gap and continue with step 2b.
+- `top_level` = domains with no `parent_domain_id`; `subdomains` = the rest.
+- `discover_keys` = every domain's `tag_key`.
 
-**Otherwise use the governed-tag proxy** (pure SQL). Tag-name key sets
-(match case-insensitively):
-- domain keys: `domain, data_domain, business_domain, subject_area, data_product`
+**Step 2b (no API): infer Discover keys from the tags** (`<VIEW>` = table and
+schema tags):
+
+```sql
+SELECT DISTINCT tag_name FROM <VIEW>
+WHERE instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system%';
+-- discover_keys = these `Parent/Sub` keys plus each one's `Parent` prefix
+```
+
+A top-level domain that has no subdomain tags can't be told apart from other
+governed tags this way; the note says so.
+
+**Step 3: the governed-tag queries.** Key sets (match case-insensitively):
+- legacy domain keys (domain name in the **value**): `domain, data_domain, business_domain, subject_area, data_product`
+- Discover domain keys: `discover_keys` from step 1 or 2b (domain name in the **key**)
 - steward keys: `owner, data_owner, steward, data_steward`
 - cert keys: `system.certification_status, certification_status` (value `certified`)
 
+`<domain_pred>` = `lower(tag_name) IN (<legacy keys>) OR lower(tag_name) IN (<discover_keys>)`;
+`<domain_label>` = `CASE WHEN lower(tag_name) IN (<legacy keys>) THEN tag_value ELSE split(tag_name, '/')[0] END`
+(a subdomain rolls up to its top-level domain).
+
 ```sql
 -- distinct domains + domain-tag assignments (union table + schema tags)
-SELECT COUNT(DISTINCT tag_value) AS distinct_domains, COUNT(*) AS assignments FROM (
-  SELECT tag_value FROM <TABLE_TAGS>  WHERE lower(tag_name) IN (<domain_keys>)
+SELECT COUNT(DISTINCT lower(domain)) AS distinct_domains, COUNT(*) AS assignments FROM (
+  SELECT <domain_label> AS domain FROM <TABLE_TAGS>  WHERE <domain_pred>
   UNION ALL
-  SELECT tag_value FROM <SCHEMA_TAGS> WHERE lower(tag_name) IN (<domain_keys>)
+  SELECT <domain_label> AS domain FROM <SCHEMA_TAGS> WHERE <domain_pred>
 );
+-- with the API: distinct_domains = max(distinct_domains, len(top_level)),
+-- so domains defined in Discover count before their assets are tagged
 
 -- stewarded assets
 SELECT COUNT(*) AS stewarded FROM <TABLE_TAGS> WHERE lower(tag_name) IN (<steward_keys>);
@@ -333,7 +354,7 @@ WHERE lower(tag_name) IN (<cert_keys>) AND lower(tag_value) = 'certified';
 SELECT COUNT(*) AS total_tables FROM <TABLES> WHERE table_schema <> 'information_schema';
 SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS governed_tagged FROM <TABLE_TAGS>;
 SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS domain_tagged
-FROM <TABLE_TAGS> WHERE lower(tag_name) IN (<domain_keys>);
+FROM <TABLE_TAGS> WHERE <domain_pred>;
 ```
 
 `pct_tagged = pct(governed_tagged, total_tables)`;
@@ -363,32 +384,32 @@ FROM top t LEFT JOIN cert c ON t.name = c.name ORDER BY t.n DESC;
 -- top_accessed = row count; top_certified = rows where certified = 1
 ```
 
-**Score (tag proxy)** (start at 0):
+**Score** (start at 0):
 - if `distinct_domains > 0`: `+ 40 + 40 * min(distinct_domains, 5)/5`
 - `+20` if `stewarded > 0`
 
-**Signals to display:** Distinct domains (via tags) (`distinct_domains`),
+**Signals to display:** Domains (Discover) with the subdomain count when the API answered, else Distinct domains (via tags) (`distinct_domains`),
 Domain-tagged assets (`assignments`), Stewarded assets (`stewarded`), Certified
 assets (`certified`); plus Tables tagged (`pct_tagged`%), Tables in a domain
 (`pct_in_domain`%) when `total_tables > 0`; and Top accessed certified
 (`top_certified` / `top_accessed`) when available.
 
-**Note to include:** assessed via governed tags because native UC Domains is a
-gated preview; a self-assessment can capture domain-design maturity tags can't show.
+**Note to include:** with the API, "Domains read from the Discover Domains API; asset coverage from their governed tags." Without it, domains were inferred from governed tags because the API needs MANAGE DISCOVER (403) or was unavailable, a domain with no subdomain tags may be missed, and a self-assessment can capture domain-design maturity tags can't show.
 
 **Gaps:**
-- `distinct_domains == 0` → "No domain-style governed tags found (e.g. a `domain` tag). Organize assets into business-aligned domains."
+- `distinct_domains == 0` → "No domains found. Create business-aligned domains and subdomains in Discover and add their assets."
+- Domains API returned 401/403 → "Couldn't read Discover domains: the assessing identity needs MANAGE DISCOVER, so domains were inferred from governed tags and may be undercounted."
 - `stewarded == 0` → "No stewardship tags (owner/steward) found; assign a named steward per domain."
 - `certified == 0` → "No certified assets found — certify canonical gold tables so users (and Genie) know which to trust."
 - `total_tables > 0 AND pct_tagged < 50` → "Only `{pct_tagged}`% of tables carry any UC governed tag — tag eligible assets (PII, domain, certification) to power governed discovery."
 - `total_tables > 0 AND pct_in_domain < 50` → "Only `{pct_in_domain}`% of tables are assigned to a domain — apply domain tags so assets roll up to business-aligned domains."
 - `top_accessed > 0 AND top_certified < top_accessed` → "Only `{top_certified}` of your top `{top_accessed}` most-accessed resources are certified — certify high-traffic tables so Genie/ontology can trust your busiest data."
 
-**Drill-down — Governance tags by schema** (which schemas lack domain / steward / certification tags; most-covered first). Tag-proxy path only — the native-API path returns just a count, no breakdown:
+**Drill-down — Governance tags by schema** (which schemas lack domain / steward / certification tags; most-covered first). Uses `<domain_pred>` for the domain column:
 
 ```sql
 SELECT catalog_name AS catalog, schema_name AS schema,
-  COUNT(DISTINCT CASE WHEN lower(tag_name) IN (<domain_keys>)
+  COUNT(DISTINCT CASE WHEN <domain_pred>
         THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS domain_tagged,
   COUNT(DISTINCT CASE WHEN lower(tag_name) IN (<steward_keys>)
         THEN concat_ws('.', catalog_name, schema_name, table_name) END) AS stewarded,
