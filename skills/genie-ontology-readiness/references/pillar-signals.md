@@ -88,8 +88,11 @@ SELECT COUNT(*) AS total,
        SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
 FROM <COLUMNS> WHERE table_schema <> 'information_schema';
 
--- governed-tag reach (best-effort; treat failure as unknown)
-SELECT COUNT(DISTINCT table_name) AS tagged_tables FROM <TABLE_TAGS>;
+-- governed-tag reach (best-effort; treat failure as unknown). Count by
+-- fully-qualified name so same-named tables in different schemas/catalogs
+-- are counted separately (matches the Domains pillar).
+SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS tagged_tables
+FROM <TABLE_TAGS> WHERE schema_name <> 'information_schema';
 ```
 
 `table_pct = pct(table_commented, table_total)`;
