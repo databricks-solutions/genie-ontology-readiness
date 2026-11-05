@@ -15,7 +15,7 @@
 #      by default to keep this gate hermetic/offline; enable when cutting a release)
 #
 # Usage:  bash scripts/check.sh
-#         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 7 (needs network)
+#         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 8 (needs network)
 # Exits non-zero on the first failing gate.
 set -euo pipefail
 
