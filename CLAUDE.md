@@ -164,6 +164,7 @@ app/
     lakebase_client.py       — optional snapshot persistence pool
     snapshots.py             — optional assessment history (Lakebase)
     pillars.py               — canonical 7 readiness pillars + maturity model
+    signal_spec.py           — per-pillar signal SQL/thresholds/gap text shared with the skill
     assessment/
       probes.py              — read-only SQL/REST probes (graceful degradation)
       scoring.py             — combine technical + self-assessment → scorecard
@@ -178,6 +179,8 @@ notebooks/
 scripts/
   post_deploy.py             — render app.yml, grant SP, publish
   setup_app_permissions.py   — UC read grants for the app SP
+  render_skill.py            — render skills/…/references from the App spec (--check in CI)
+skills/genie-ontology-readiness/ — app-free Genie Code skill (generated regions: don't hand-edit)
 databricks.yml               — DABs: app + sql-warehouse resource
 ```
 
