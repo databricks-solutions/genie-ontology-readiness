@@ -108,17 +108,26 @@ PILLAR_KEYS = [p["key"] for p in PILLARS]
 PILLARS_BY_KEY = {p["key"]: p for p in PILLARS}
 
 
+# Maturity bands (highest first): a score at or above ``min_score`` earns ``level``.
+# Any positive score below the lowest band is level 1; exactly 0 is level 0.
+LEVEL_BANDS = [
+    {"min_score": 85, "level": 4},
+    {"min_score": 65, "level": 3},
+    {"min_score": 40, "level": 2},
+]
+
+# Overall roll-up constants (also rendered into the skill, see scripts/render_skill.py).
+TOP_GAPS_LIMIT = 6
+GUIDANCE_MAX_PILLARS = 3
+GUIDANCE_TEMPLATE = "Focus next on {names}: your lowest-scoring, highest-impact areas."
+
+
 def level_from_score(score: float) -> int:
     """Map a 0-100 pillar score to a 0-4 maturity level."""
-    if score >= 85:
-        return 4
-    if score >= 65:
-        return 3
-    if score >= 40:
-        return 2
-    if score > 0:
-        return 1
-    return 0
+    for band in LEVEL_BANDS:
+        if score >= band["min_score"]:
+            return band["level"]
+    return 1 if score > 0 else 0
 
 
 def readiness_stage(overall_score: float) -> dict:
@@ -154,8 +163,8 @@ def readiness_guidance(ranked_pillars: list[dict], fallback: str) -> str:
     for pil in ranked_pillars:
         if pil.get("gaps") and pil["name"] not in gap_pillars:
             gap_pillars.append(pil["name"])
-        if len(gap_pillars) == 3:
+        if len(gap_pillars) == GUIDANCE_MAX_PILLARS:
             break
     if not gap_pillars:
         return fallback
-    return f"Focus next on {_join_names(gap_pillars)}: your lowest-scoring, highest-impact areas."
+    return GUIDANCE_TEMPLATE.format(names=_join_names(gap_pillars))

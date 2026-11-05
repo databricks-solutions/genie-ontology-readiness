@@ -32,6 +32,15 @@ import json
 import logging
 import aiohttp
 
+from server.signal_spec import (
+    METADATA as METADATA_SPEC,
+    TABLE_COMMENT_TARGET_PCT,
+    COLUMN_COMMENT_TARGET_PCT,
+    METADATA_TABLE_WEIGHT,
+    METADATA_COLUMN_WEIGHT,
+    gap_text,
+    render_sql,
+)
 from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
 from server.user_agent import with_ua
@@ -687,15 +696,11 @@ async def _column_coverage_chunked(
 def tagged_tables_sql(source: str, where: str) -> str:
     """Distinct tables carrying >=1 governed tag, counted by fully-qualified name (#92).
 
-    Counting bare ``table_name`` collapses same-named tables in different schemas or
-    catalogs (``sales.dim_customer`` vs ``finance.dim_customer``) into one. The FQN
-    form matches the Domains pillar's tagged counts and the skill's
-    ``references/pillar-signals.md`` (keep the two in lockstep).
+    The SQL is the shared spec query (``signal_spec.METADATA``), so the skill renders
+    the identical statement.
     """
-    return (
-        "SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
-        f"FROM {source} WHERE {where}"
-    )
+    q = METADATA_SPEC["queries_by_id"]["tagged_tables"]
+    return render_sql(q["sql"], {"<TABLE_TAGS>": source}, schema_filter=where).rstrip(";")
 
 
 async def probe_metadata() -> dict:
@@ -770,22 +775,26 @@ async def probe_metadata() -> dict:
 
         table_pct = _pct(t_commented, t_total)
         col_pct = _pct(c_commented, c_total)
-        score = round(0.5 * table_pct + 0.5 * col_pct, 1)
+        score = round(METADATA_TABLE_WEIGHT * table_pct + METADATA_COLUMN_WEIGHT * col_pct, 1)
 
         gaps = []
-        if table_pct < 80:
-            gaps.append(f"Only {table_pct}% of tables have descriptions — Genie relies on these to understand data.")
-        if col_pct < 60:
-            gaps.append(f"Only {col_pct}% of columns are commented; aim for high coverage on gold-layer columns.")
+        if table_pct < TABLE_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "table_comments_low", table_pct=table_pct))
+        if col_pct < COLUMN_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "column_comments_low", col_pct=col_pct))
         if tagged_tables is not None and t_total and tagged_tables == 0:
-            gaps.append("No governed tags found; tags aid discovery and domain organization.")
+            gaps.append(gap_text(METADATA_SPEC, "no_tagged_tables"))
 
+        label = METADATA_SPEC["signal_labels"]
         signals = [
-            {"label": "Tables commented", "value": table_pct, "unit": "%", "detail": f"{t_commented} of {t_total} tables"},
-            {"label": "Columns commented", "value": col_pct, "unit": "%", "detail": f"{c_commented} of {c_total} columns"},
+            {"label": label["table_comments"], "value": table_pct, "unit": "%",
+             "detail": f"{t_commented} of {t_total} tables"},
+            {"label": label["column_comments"], "value": col_pct, "unit": "%",
+             "detail": f"{c_commented} of {c_total} columns"},
         ]
         if tagged_tables is not None:
-            signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
+            signals.append({"label": label["tagged_tables"], "value": tagged_tables,
+                            "detail": "Tables with ≥1 governed tag"})
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
