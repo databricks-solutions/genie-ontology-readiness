@@ -186,6 +186,10 @@ def _pillar_block(spec: dict) -> str:
         out += [f"-- {line}" for line in q["comment"].split("\n")]
         out.append(S.render_sql(q["sql"], schema_column=q.get("schema_column", "table_schema")))
     out += ["```", ""]
+    for q in spec["queries"]:
+        if q.get("procedure"):
+            out += [f"**Running {_code(q['id'])}:**", ""]
+            out += [f"{n}. {step}" for n, step in enumerate(q["procedure"], 1)] + [""]
     out += spec["derived"] + [""]
     out += [f"**Score:** {_code(spec['score'])}", ""]
     shown = [f"{s['label']} ({s['value']})" + (f" {s['when']}" if s.get("when") else "") for s in spec["signals"]]

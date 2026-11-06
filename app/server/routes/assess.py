@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from server.assessment.compare import compare_snapshots
 from server.assessment.scoring import run_assessment, run_assessment_stream
 from server.routes._shared import _cache_get, _cache_set, current_principal
-from server.config import set_user_token
+from server.config import ASSESS_CATALOGS, set_user_token
 from server.pdf import (
     build_pdf_document,
     markdown_to_safe_html,
@@ -22,6 +22,7 @@ from server.pdf import (
 )
 from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
 from server.security import safe_error
+from server.scope import normalize_scope, scope_hash
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,11 @@ async def assess_stream(
     wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
     cat_scope = list(req.catalogs) if req and req.catalogs else None
     sch_scope = list(req.schemas) if req and req.schemas else None
+    # Saved with the snapshot so the trend and Compare line up like-for-like runs (#89).
+    # The scope as requested and resolved by config (request catalogs > workspace
+    # bindings, captured by the workspace ids > ASSESS_CATALOGS > all), not the final
+    # readable-catalog list, which would change whenever a catalog is created.
+    run_scope = normalize_scope(cat_scope, sch_scope, wsf, env_catalogs=ASSESS_CATALOGS)
 
     async def gen():
         # Set inside the generator too: the streaming body may run in a fresh
@@ -122,8 +128,11 @@ async def assess_stream(
                         "pillars": event["pillars"],
                         "top_gaps": event["top_gaps"],
                     }
+                    event["scope"] = run_scope
+                    event["scope_hash"] = scope_hash(run_scope)
                     try:
-                        sid = await snapshots.save_snapshot(scorecard, created_by=principal)
+                        sid = await snapshots.save_snapshot(scorecard, created_by=principal,
+                                                            scope=run_scope)
                         event["snapshot_id"] = sid
                         event["snapshot_saved"] = sid is not None
                     except Exception as e:

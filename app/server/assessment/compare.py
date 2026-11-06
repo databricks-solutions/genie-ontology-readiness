@@ -18,6 +18,7 @@ import re
 from typing import Optional
 
 from server.pillars import PILLAR_KEYS
+from server.scope import same_scope
 
 
 def _numeric(value) -> Optional[float]:
@@ -224,13 +225,18 @@ def compare_snapshots(baseline: dict, current: dict) -> dict:
             "id": baseline.get("id"),
             "created_at": baseline.get("created_at"),
             "overall": base_sc.get("overall") or {},
+            "scope": baseline.get("scope"),
         },
         "current": {
             "id": current.get("id"),
             "created_at": current.get("created_at"),
             "overall": cur_sc.get("overall") or {},
+            "scope": current.get("scope"),
         },
         "overall": _overall_diff(base_sc.get("overall") or {}, cur_sc.get("overall") or {}),
         "pillars": pillars,
         "summary": summary,
+        # #89: True / False, or None when either run predates saved scopes. The UI
+        # warns on False: a delta between different scopes isn't a trend.
+        "same_scope": same_scope(baseline.get("scope_hash"), current.get("scope_hash")),
     }
