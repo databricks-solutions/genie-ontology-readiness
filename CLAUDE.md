@@ -82,7 +82,9 @@ connection env. Assessment history and generated plans are then persisted
 **per user** (keyed by the `X-Forwarded-Email` identity Databricks Apps inject)
 and survive across sessions. Scores are a deterministic function of the technical
 findings, so repeated runs on the same workspace are directly comparable **for a
-given identity**. Under OBO the findings reflect the viewing user's grants, so
+given identity and scope**. Each snapshot records its scope (catalogs, schemas,
+workspace filter); the "Readiness over time" trend plots only runs with the same
+scope, and Compare warns when two runs differ. Under OBO the findings reflect the viewing user's grants, so
 signals gated behind grants a viewer lacks (notably the workspace-wide Adoption
 system tables) can read lower for a restricted viewer than for the SP — use
 `FORCE_SP=true` when you need a single, viewer-independent workspace-wide score.

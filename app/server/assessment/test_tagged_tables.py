@@ -68,6 +68,40 @@ class TaggedTablesByFqnTest(unittest.TestCase):
         )
 
 
+class TableScanExcludesInternalCatalogsTest(unittest.TestCase):
+    """System mode: the table-comment scan drops __-prefixed internal catalogs (#109)."""
+
+    _TABLES = [
+        ("main", "sales", "t1", "described"),
+        ("main", "sales", "t2", None),
+        ("other", "fin", "t3", ""),
+        ("main", "information_schema", "tables", None),        # default schema predicate
+        ("system", "access", "audit", None),                    # named internal catalog
+        ("__databricks_internal_catalog_ab12", "x", "y", None),  # __-prefixed (#109)
+        ("__databricks_internal", "x", "z", None),
+    ]
+
+    def _table_scan_sql(self):
+        sources = {"system_ok": True, "catalogs": ["main", "other"], "schemas": None}
+        with patch.object(probes, "_resolve_sources", AsyncMock(return_value=sources)), \
+             patch.object(probes, "execute_sql", AsyncMock(return_value=[])) as ex, \
+             patch.object(probes, "_column_coverage_chunked", AsyncMock(return_value=(0, 0, {}, 0))), \
+             patch.object(probes, "_scalar", AsyncMock(return_value=None)):
+            asyncio.run(probes.probe_metadata())
+        return ex.call_args_list[0].args[0]
+
+    def test_internal_catalogs_are_not_counted(self):
+        sql = self._table_scan_sql()
+        self.assertIn("table_catalog NOT RLIKE '^__'", sql)
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE tables (table_catalog, table_schema, table_name, comment)")
+        con.executemany("INSERT INTO tables VALUES (?, ?, ?, ?)", self._TABLES)
+        sql = (sql.replace("system.information_schema.tables", "tables")
+                  .replace("table_catalog NOT RLIKE '^__'", "table_catalog NOT LIKE '\\_\\_%' ESCAPE '\\'"))
+        rows = con.execute(sql).fetchall()
+        self.assertEqual(sorted((r[0], r[2]) for r in rows), [("main", 2), ("other", 1)])
+
+
 class RenderSqlTest(unittest.TestCase):
     def test_substituted_values_are_not_rescanned(self):
         from server.signal_spec import render_sql
@@ -87,7 +121,7 @@ class MetadataProbeGoldenTest(unittest.TestCase):
         trows = [{"cat": "main", "sch": "sales", "total": str(t_total), "commented": str(t_com)}] if t_total else []
         with patch.object(probes, "_resolve_sources", AsyncMock(return_value=sources)), \
              patch.object(probes, "execute_sql", AsyncMock(return_value=trows)), \
-             patch.object(probes, "_column_coverage_chunked", AsyncMock(return_value=(100, c_com, {}))), \
+             patch.object(probes, "_column_coverage_chunked", AsyncMock(return_value=(100, c_com, {}, 0))), \
              patch.object(probes, "_scalar", AsyncMock(return_value=tagged)) as scalar:
             out = asyncio.run(probes.probe_metadata())
         return out, scalar

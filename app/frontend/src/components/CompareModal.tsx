@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from 'react';
 import { X, GitCompareArrows, ArrowUp, ArrowDown, Minus, Loader2, AlertTriangle, ChevronDown, CheckCircle2, AlertCircle } from 'lucide-react';
 import { apiGet, ApiError } from '../hooks/useApi';
 import type { CompareResult, HistorySnapshot, PillarDiff, SignalDiff } from '../types';
+import { scopeDifference, scopeLabel } from '../utils/scope';
 
 function fmtWhen(iso: string | null): string {
   if (!iso) return '—';
@@ -196,7 +197,8 @@ export default function CompareModal({
     return () => { cancelled = true; };
   }, [baselineId, currentId]);
 
-  const label = (h: HistorySnapshot) => `${fmtWhen(h.created_at)} · ${Math.round(h.overall_score)}`;
+  const label = (h: HistorySnapshot) =>
+    `${fmtWhen(h.created_at)} · ${Math.round(h.overall_score)} · ${scopeLabel(h.scope)}`;
 
   const picker = (value: number, onChange: (v: number) => void, testid: string) => (
     <select
@@ -250,6 +252,24 @@ export default function CompareModal({
             <p className="text-sm text-red-600 flex items-center gap-1.5"><AlertTriangle size={14} /> {error}</p>
           ) : o && result ? (
             <>
+              {/* #89: a delta between different scopes measures different data. */}
+              {result.same_scope === false && (
+                <div
+                  data-testid="compare-scope-warning"
+                  className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 mb-3 text-xs text-amber-800 flex items-start gap-1.5"
+                >
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  <span>
+                    These runs covered different scopes ({scopeDifference(result.baseline.scope, result.current.scope)}),
+                    so the change reflects what was assessed as well as real progress.
+                  </span>
+                </div>
+              )}
+              {result.same_scope == null && (
+                <p data-testid="compare-scope-unknown" className="text-[11px] text-ink-400 mb-3">
+                  One of these runs was saved before scopes were recorded, so it can't be checked for the same scope.
+                </p>
+              )}
               {/* Overall banner */}
               <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 mb-4">
                 <div className="flex items-center justify-between gap-3 flex-wrap">
