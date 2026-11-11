@@ -25,6 +25,8 @@ export interface AppConfig {
   ai_models: AIModel[];
   default_model: string;
   lakebase_enabled: boolean;
+  warehouse_configured?: boolean;
+  history_ready?: boolean;
   genie_space_configured: boolean;
   assess_catalogs: string[];
 }

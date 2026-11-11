@@ -10,6 +10,7 @@ import aiohttp
 from typing import Optional
 
 from server.user_agent import with_ua
+from server.history_schema import LEGACY_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,35 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
         return None
 
 
+_RESOURCE: dict | None = None
+
+
+def _lakebase_resource() -> dict:
+    """The instance and database of this app's own ``lakebase-db`` resource (read once).
+
+    A Git deploy in the Apps UI sets no database or instance name, so they come from
+    the attached resource. Empty when not in a Databricks App or when the read fails.
+    Read as the app service principal. Holds no secret.
+    """
+    global _RESOURCE
+    if _RESOURCE is None:
+        found = {"instance": "", "database": ""}
+        app_name = os.environ.get("DATABRICKS_APP_NAME", "")
+        if app_name:
+            try:
+                from server.config import _get_workspace_client
+                app = _get_workspace_client().apps.get(app_name)
+                for resource in (app.resources or []):
+                    if resource.name == "lakebase-db" and resource.database:
+                        found = {"instance": resource.database.instance_name or "",
+                                 "database": resource.database.database_name or ""}
+            except Exception as e:
+                logger.warning(f"Could not read the lakebase-db resource ({type(e).__name__}); "
+                               "using the app settings and defaults")
+        _RESOURCE = found
+    return _RESOURCE
+
+
 def _get_connection_config() -> dict:
     """Read Lakebase connection config from environment variables.
 
@@ -107,8 +137,24 @@ def _get_connection_config() -> dict:
     """
     host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "localhost")
     port = int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432"))
-    database = os.environ.get("LAKEBASE_DATABASE") or os.environ.get("PGDATABASE", "ontology_readiness")
-    user = os.environ.get("LAKEBASE_USER") or os.environ.get("PGUSER", "")
+    from server.runtime_config import resolve_database, resolve_lakebase_user
+
+    # Labels say where a value came from. PGDATABASE and PGUSER are what Apps injects for
+    # an attached database resource, so they are labelled "database resource".
+    app_db, pg_db = os.environ.get("LAKEBASE_DATABASE", ""), os.environ.get("PGDATABASE", "")
+    database, database_source = resolve_database(
+        app_db or pg_db,
+        "" if (app_db or pg_db) else _lakebase_resource()["database"],
+        env_label="app setting" if app_db else "database resource",
+        injected_label="lakebase-db resource lookup",
+    )
+    app_user, pg_user = os.environ.get("LAKEBASE_USER", ""), os.environ.get("PGUSER", "")
+    user, user_source = resolve_lakebase_user(
+        app_user or pg_user,
+        os.environ.get("DATABRICKS_CLIENT_ID", ""),
+        env_label="app setting" if app_user else "database resource",
+    )
+    logger.info(f"Lakebase database from {database_source}; Lakebase user from {user_source}")
 
     return {
         "host": host,
@@ -165,7 +211,12 @@ async def init_pool() -> None:
         # retain Provisioned instance credentials for existing deployments.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
             endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
-            instance = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
+            from server.runtime_config import resolve_instance
+            instance, instance_source = resolve_instance(
+                os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
+                _lakebase_resource()["instance"] if not os.environ.get("LAKEBASE_INSTANCE_NAME") else "",
+            )
+            logger.info(f"Lakebase instance from {instance_source}")
             if endpoint or instance:
                 password = await _fetch_db_credential(
                     instance_name=instance,
@@ -244,6 +295,67 @@ async def get_pool():
     """Get the connection pool, refreshing the token if needed. Returns None if unavailable."""
     await _refresh_pool_if_needed()
     return _pool
+
+
+# The schema the history tables live in. Chosen once at startup (see prepare_history_schema).
+_HISTORY_SCHEMA = LEGACY_SCHEMA
+
+
+def history_table(table: str) -> str:
+    """The schema-qualified name of a history table, in the schema chosen at startup."""
+    from server.history_schema import qualified_table
+    return qualified_table(_HISTORY_SCHEMA, table)
+
+
+async def prepare_history_schema() -> str:
+    """Choose the history schema and create it if it is new. Returns the schema name.
+
+    Existing tables in public are kept (their history is already there). A new database
+    gets its own schema, because the app's service principal may lack CREATE on public."""
+    global _HISTORY_SCHEMA
+    from server.history_schema import (HISTORY_SCHEMA, HISTORY_TABLES, choose_history_schema,
+                                       legacy_probe_sql, quote_ident)
+    pool = await get_pool()
+    if pool is None:
+        raise RuntimeError("Lakebase pool is not available")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(legacy_probe_sql())
+        schema, reason = choose_history_schema(HISTORY_TABLES if (row and row["legacy_present"]) else [])
+        if schema != LEGACY_SCHEMA:
+            await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(HISTORY_SCHEMA)}")
+    _HISTORY_SCHEMA = schema
+    logger.info(f"Lakebase history schema: {schema} ({reason})")
+    return schema
+
+
+async def start_history() -> bool:
+    """Start Lakebase history. Never raises: any failure leaves history off and the app running.
+
+    Returns True when history is ready. Called at startup, so an error here must not stop
+    the app from starting (the UI must still load)."""
+    from server.config import USE_LAKEBASE
+    if not USE_LAKEBASE:
+        return False
+    try:
+        await init_pool()
+        if not is_available():
+            logger.warning("Lakebase pool unavailable — history/plans disabled")
+            return False
+        await prepare_history_schema()
+        from server.snapshots import ensure_table as ensure_snapshots
+        from server.plans import ensure_table as ensure_plans
+        await ensure_snapshots()
+        await ensure_plans()
+        logger.info("Lakebase pool ready — assessment history + plans enabled")
+        return True
+    except Exception as e:
+        logger.warning(f"Lakebase history is off: startup failed ({type(e).__name__}). "
+                       "The app runs without history. Check the grants and the database.")
+        try:
+            await close_pool()
+        except Exception:
+            pass
+        return False
 
 
 async def execute_query(query: str, params: Optional[list] = None) -> list[dict]:

@@ -39,7 +39,7 @@ _FALLBACK_VERSION = "0.0.0+unknown"
 
 # Env var carrying the version into the deployed Databricks App, where there is
 # no .git (the bundle syncs only ./app). scripts/post_deploy.py bakes
-# ``git describe`` into app.yml as this var at deploy time.
+# ``git describe`` into app.yaml as this var at deploy time.
 _VERSION_ENV = "GOR_VERSION"
 
 
@@ -80,8 +80,22 @@ def git_version() -> str | None:
     return _normalize(described) if described else None
 
 
+def version_file_version(path: pathlib.Path | None = None) -> str | None:
+    """The version written into ``app/VERSION`` at release time, or None if absent.
+
+    A Git deploy in the Apps UI has no .git, so the release process writes this file
+    and commits it with the tag.
+    """
+    path = path or pathlib.Path(__file__).resolve().parent.parent / "VERSION"
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    return _normalize(text) if text else None
+
+
 def resolve_version() -> str:
-    """Version for the product tag: ``GOR_VERSION`` env -> git tag -> fallback.
+    """Version for the product tag: ``GOR_VERSION`` env -> app/VERSION -> git tag -> fallback.
 
     Always returns a semver-valid string (the SDK rejects non-semver). Resolved
     once at import; the deployed app hits the env branch and never shells out.
@@ -89,7 +103,7 @@ def resolve_version() -> str:
     env = os.environ.get(_VERSION_ENV, "").strip()
     if env:
         return _normalize(env)
-    return git_version() or _FALLBACK_VERSION
+    return version_file_version() or git_version() or _FALLBACK_VERSION
 
 
 PRODUCT_VERSION = resolve_version()
