@@ -35,11 +35,12 @@ popd >/dev/null
 
 step "Backend: install deps (app requirements + tooling)"
 # The backend test suite (tests/ + app/server/test_*.py) imports the app's
-# runtime deps (fastapi, aiohttp, databricks-sdk, ...), so the gate must
+# runtime deps (fastapi, aiohttp, databricks-sdk, ...) plus httpx for
+# starlette's TestClient, so the gate must
 # provision them before collecting — mirror the frontend's `npm ci`. Best-effort
 # so a machine without a writable pip env degrades to the skips below rather than
 # aborting; use a venv/uv if this warns (e.g. PEP 668 externally-managed).
-python3 -m pip install -q -r app/requirements.txt ruff pytest || \
+python3 -m pip install -q -r app/requirements.txt ruff pytest httpx || \
   echo "  (warning) backend dep install failed — ruff/pytest may be skipped below" >&2
 
 step "Backend: ruff lint"

@@ -1,11 +1,20 @@
 version: 2
 updates:
   # Python backend (app/requirements.txt).
+  # All version updates are grouped into ONE weekly PR per ecosystem (Monday),
+  # instead of one PR per package. This keeps the PR queue quiet and means the
+  # lockfile/requirements are regenerated once, so bumps don't conflict.
+  # Security updates are not grouped, so an advisory fix still opens its own PR.
   - package-ecosystem: pip
     directory: /app
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    groups:
+      pip-weekly:
+        applies-to: version-updates
+        patterns: ["*"]
     commit-message:
       prefix: "chore(deps)"
 
@@ -14,6 +23,11 @@ updates:
     directory: /app/frontend
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    groups:
+      npm-weekly:
+        applies-to: version-updates
+        patterns: ["*"]
     commit-message:
       prefix: "chore(deps)"
