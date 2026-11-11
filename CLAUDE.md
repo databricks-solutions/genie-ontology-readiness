@@ -28,6 +28,8 @@ Bundles** + `post_deploy.py`.
 The main path is **in the workspace**: a Git folder, then [`notebooks/install.py`](notebooks/install.py)
 on Serverless compute. The Databricks Apps runtime builds the frontend. The first install and
 the upgrade use the same notebook. The steps are in the [README](./README.md) (**Quick start**).
+The notebook picks the release with the `release` widget (default `latest`), moves the Git folder
+to it, and writes `.deployed_version` (git sha, release, UTC time) to the staging folder.
 
 Terminal and CI deploys are the advanced path. The README section **Advanced: deploy from a
 terminal or CI** has the commands: `bundle deploy` plus `scripts/post_deploy.py` for a first

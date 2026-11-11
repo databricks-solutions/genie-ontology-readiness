@@ -54,36 +54,36 @@ The steps use the Git folder UI. See Databricks docs:
 
 ### First install
 
-1. Find the latest release tag on the
-   [Releases page](https://github.com/databricks-solutions/genie-ontology-readiness/releases).
-2. In the workspace, click **Create** → **Git folder**. Paste this repo's URL:
-   `https://github.com/databricks-solutions/genie-ontology-readiness.git`. Select the latest
-   release tag in the branch field. Click **Create Git folder**.
-3. Open `notebooks/install.py` from the Git folder. Attach it to **Serverless** compute.
-4. Set the widgets at the top of the notebook:
+1. In the workspace, click **Create** → **Git folder**. Paste this repo's URL:
+   `https://github.com/databricks-solutions/genie-ontology-readiness.git`. The default branch is fine.
+   Click **Create Git folder**. See
+   [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
+2. Open `notebooks/install.py` from the Git folder. Attach it to **Serverless** compute.
+3. Set the widgets at the top of the notebook:
    - `warehouse_id`: empty uses the first SQL warehouse you can see. Or set your own id.
    - `lakebase_instance_name` and `lakebase_database`: optional. They turn on per-user history.
      Use an existing Lakebase instance. Leave them empty to run without history.
    - `assess_catalogs` and `brand_name`: optional.
-5. Click **Run all**.
+4. Click **Run all**. The notebook first moves the Git folder to the latest release. If it
+   moved, it stops and says so. Click **Run all** again.
 
-The notebook creates the app and its service principal first. Then it sets up history in the
-same run. The app is ready when the last cell shows the app link. You do not need a second run.
+The notebook creates the app and its service principal first, then sets up history in the same
+run. The last cell shows the app link and a JSON result. You do not need a second run.
 
 ### Upgrade to a new release
 
-An upgrade keeps your settings and your history. Use the same Git folder you created for the
-first install.
+An upgrade keeps your settings and your history.
 
-1. Open the Git folder. Click the **Git** button beside the repo name, or the button next to
-   the notebook name that shows the current branch.
-2. In the branch dropdown, select the new release tag. Then click **Pull**. See
-   [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
-3. Open `notebooks/install.py`. Leave **all widgets empty**. Click **Run all**.
+1. Open `notebooks/install.py` from the same Git folder you created for the first install.
+2. Leave **all widgets empty**. Click **Run all**.
+3. If the notebook says the Git folder moved, click **Run all** again.
 
-The notebook reads the deployed app. It prints a table of each setting and its source
-(`you set`, `deployed app`, `new release`, `live`, or `default`). Then it deploys the new
-release from the same folder.
+The notebook finds the latest release, moves the Git folder there, and deploys it. It prints a table
+of each setting and its source (`you set`, `deployed app`, `new release`, `live`, or `default`).
+
+**Choose a version.** Set the `release` widget to a tag, for example `v1.3.0`. Use `current` to
+deploy the Git folder as it is, with no GitHub call. The default is `latest`. For a rollback, set
+`release` to the old tag, for example `v1.2.0`, and click **Run all** twice if the Git folder moves.
 
 **What is kept**
 
@@ -107,9 +107,8 @@ widgets, the app stops using its history. The old history stays in Lakebase.
 - This run would turn Lakebase history off.
 - This run would point the app at another Lakebase instance or database.
 
-**Roll back.** Select the previous release tag in the Git folder, click **Pull**, then
-**Run all** on `notebooks/install.py` with empty widgets. A schema change only adds columns, so
-the previous release can still read the history.
+If the Git folder cannot move (the notebook prints how), switch it by hand: open the Git folder,
+use the branch dropdown to select the tag, and click **Pull**.
 
 **Do not:**
 

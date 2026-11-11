@@ -13,15 +13,25 @@
 # MAGIC 4. Stages the `app/` source into your workspace folder and renders `app.yml`.
 # MAGIC 5. Deploys the app. The **frontend is built by the Databricks Apps runtime** (`npm ci && npm run build`), so nothing is built locally.
 # MAGIC
-# MAGIC **How to use: first install**
-# MAGIC 1. Clone this repo into the workspace as a **Git folder** (Workspace → Create → Git folder), at the latest [release tag](https://github.com/databricks-solutions/genie-ontology-readiness/releases).
-# MAGIC 2. Open this notebook from the Git folder and attach it to **Serverless** compute.
-# MAGIC 3. Fill in the widgets at the top (`warehouse_id` defaults to the first warehouse you can see) and click **Run all**.
+# MAGIC **First install**
+# MAGIC 1. In the workspace, **Create → Git folder**. Paste this repo's URL. The default branch is fine.
+# MAGIC 2. Open `notebooks/install.py` from that Git folder. Attach it to **Serverless** compute.
+# MAGIC 3. Set the widgets at the top (see below) and click **Run all**. The notebook first moves the Git folder to the latest release. If it moved, click **Run all** again.
 # MAGIC
-# MAGIC **How to use: upgrade to a new release**
-# MAGIC 1. In the Git folder, pull the new release tag (Git folder → **Pull** / switch to the new tag).
-# MAGIC 2. Open this notebook, leave the widgets **empty**, and click **Run all**. Your settings and the Lakebase history are kept.
-# MAGIC 3. To change one setting, fill in only its widget. To start fresh, set `reset_settings` to `true`.
+# MAGIC **Upgrade**
+# MAGIC 1. Open `notebooks/install.py` from the same Git folder. Leave the widgets **empty**.
+# MAGIC 2. Click **Run all**. If it says the Git folder moved, click **Run all** again.
+# MAGIC
+# MAGIC **Widgets**
+# MAGIC - `release`: `latest` (default), a tag such as `v1.2.0` (for a specific version or a rollback), or `current` (deploy this Git folder as it is).
+# MAGIC - `warehouse_id`, `lakebase_instance_name`, `lakebase_database`, `assess_catalogs`, `brand_name`: optional. Empty reuses the deployed value.
+# MAGIC - `reset_settings`: `true` only to start fresh. `staging_folder`: leave empty.
+# MAGIC
+# MAGIC The Databricks Apps runtime builds the frontend during the deploy. Nothing is built on your machine.
+# MAGIC
+# MAGIC **Run as a job (optional).** Run this notebook as a job task with the same widgets as
+# MAGIC parameters. The job fails on any stop, and it exits with a JSON result (app name, URL,
+# MAGIC release, Git sha, staging folder, settings).
 # MAGIC
 # MAGIC **Prerequisites**
 # MAGIC - [ ] **Databricks Apps** is enabled in this workspace.
@@ -45,6 +55,8 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 dbutils.widgets.text("app_name", "genie-ontology-readiness", "App name")
+dbutils.widgets.text("release", "latest", "Release: latest, current, or a tag such as v1.3.0")
+dbutils.widgets.text("staging_folder", "", "Staging folder (empty = default under your home)")
 dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID (empty = reuse, or first available)")
 dbutils.widgets.text("assess_catalogs", "", "Catalogs to assess (comma-separated, empty = reuse)")
 dbutils.widgets.text("genie_space_id", "", "Genie Agent ID for the answer test (empty = reuse)")
@@ -57,6 +69,7 @@ dbutils.widgets.dropdown("reset_settings", "false", ["false", "true"],
 
 # COMMAND ----------
 
+import json
 import re
 import shutil
 import sys
@@ -67,7 +80,7 @@ from pathlib import Path
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import apps as apps_svc
-from databricks.sdk.service.workspace import ExportFormat
+from databricks.sdk.service.workspace import ExportFormat, ImportFormat
 
 
 def find_repo_root(start: Path) -> Path:
@@ -101,7 +114,7 @@ if _widget_problems:
 
 w = WorkspaceClient(product=PRODUCT_NAME, product_version=resolve_version())
 me = w.current_user.me().user_name
-STAGE_DIR = f"/Workspace/Users/{me}/.genie-ontology-readiness/{cfg['app_name']}"
+STAGE_DIR = cfg["staging_folder"] or f"/Workspace/Users/{me}/.genie-ontology-readiness/{cfg['app_name']}"
 
 
 def step(message: str) -> None:
@@ -123,6 +136,58 @@ print(f"App name:     {cfg['app_name']}")
 print(f"Staging dir:  {STAGE_DIR}")
 
 # COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 0a. Choose the release and move the Git folder to it
+# MAGIC
+# MAGIC `release`: `latest` (the default) finds the latest GitHub release. A tag such as `v1.3.0`
+# MAGIC uses that tag. `current` deploys what this Git folder has now. If the Git folder is not at
+# MAGIC the wanted tag, it is moved there and this run stops. Click **Run all** again to deploy.
+
+# COMMAND ----------
+
+def find_git_folder():
+    """This notebook's Git folder (Repo), matched by its workspace path, or None."""
+    target = str(REPO_ROOT).rstrip("/")
+    for prefix in (target, None):  # the prefix filter first; the full list if it finds nothing
+        for repo in w.repos.list(path_prefix=prefix):
+            if repo.path and repo.path.rstrip("/") == target:
+                return repo
+    return None
+
+
+repo = find_git_folder()
+latest_tag, latest_error = (deploy_settings.latest_release_tag()
+                            if cfg["release"] == "latest" else (None, ""))
+decision = deploy_settings.decide_release(cfg["release"], latest_tag, latest_error)
+if decision["warning"]:
+    print(f"WARNING: {decision['warning']}")
+RELEASE = decision["release"]
+
+if repo is None:
+    if RELEASE != "current":
+        raise RuntimeError(
+            f"This notebook is not in a Git folder, so release {RELEASE} cannot be selected. "
+            "Use a Git folder, or set release to current."
+        )
+    GIT_SHA = "unknown"
+    print("Not in a Git folder: deploying the current files (release=current).")
+elif RELEASE == "current":
+    GIT_SHA = repo.head_commit_id
+else:
+    tag_sha = deploy_settings.tag_commit_sha(RELEASE)
+    if deploy_settings.needs_move(repo.branch, repo.head_commit_id, RELEASE, tag_sha):
+        try:
+            w.repos.update(repo_id=repo.id, tag=RELEASE)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not move the Git folder to {RELEASE} ({str(e)[:150]}). To switch by hand: open the "
+                f"Git folder, use the branch dropdown to select {RELEASE}, click Pull, then run this notebook again."
+            )
+        print(deploy_settings.moved_message(RELEASE))
+        dbutils.notebook.exit(json.dumps(deploy_settings.moved_payload(RELEASE)))
+    GIT_SHA = repo.head_commit_id
+print(f"Release: {RELEASE}   Git sha: {GIT_SHA}")
 
 # MAGIC %md
 # MAGIC ## 0. Read the deployed app and decide every setting
@@ -482,11 +547,39 @@ deployment = w.apps.deploy_and_wait(
     timeout=timedelta(minutes=20),
 )
 print(f"  deployment {deployment.deployment_id}: {deployment.status.state.value} — {deployment.status.message}")
+if not deploy_settings.deployment_succeeded(deployment.status.state.value):
+    raise RuntimeError(f"The app deployment did not succeed: {deployment.status.message}")
 
-app = w.apps.get(cfg["app_name"])
+
+def _enum_value(obj, field):
+    value = getattr(obj, field, None)
+    state = getattr(value, "state", None)
+    return state.value if state is not None else ""
+
+
+step("Waiting for the app to reach RUNNING")
+deadline = time.time() + 600
+while True:
+    app = w.apps.get(cfg["app_name"])
+    app_status, compute_status = _enum_value(app, "app_status"), _enum_value(app, "compute_status")
+    if deploy_settings.app_ready(app_status, compute_status):
+        break
+    if time.time() > deadline:
+        raise RuntimeError(f"The app did not reach RUNNING (app: {app_status or 'unknown'}, "
+                           f"compute: {compute_status or 'unknown'}). Check the app logs in the Apps page.")
+    time.sleep(10)
+
+step("Writing the version marker")
+marker_path = f"{STAGE_DIR}/.deployed_version"
+w.workspace.upload(marker_path, deploy_settings.version_marker(GIT_SHA, RELEASE).encode("utf-8"),
+                   format=ImportFormat.RAW, overwrite=True)
+print(f"  {marker_path}")
+
+payload = deploy_settings.exit_payload(cfg["app_name"], app.url, RELEASE, GIT_SHA, STAGE_DIR, values)
 displayHTML(
     f"<h3>Genie Ontology Readiness is deployed</h3>"
     f"<p>Open the app: <a href='{app.url}' target='_blank'>{app.url}</a></p>"
-    f"<p>Service principal grants: {len(grant_results) - failed_grants} applied, {failed_grants} failed. "
-    f"Per-user history: {'enabled' if cfg['use_lakebase'] else 'disabled'}.</p>"
+    f"<p>Release {RELEASE}. Service principal grants: {len(grant_results) - failed_grants} applied, "
+    f"{failed_grants} failed. Per-user history: {'enabled' if cfg['use_lakebase'] else 'disabled'}.</p>"
 )
+dbutils.notebook.exit(json.dumps(payload))

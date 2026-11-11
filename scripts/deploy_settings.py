@@ -20,8 +20,12 @@ Keys that the new template has but the deployed app.yml does not keep the
 template default. That is how new secure defaults reach an upgraded app.
 """
 
+import json
 import re
+import time
+import urllib.request
 from collections import namedtuple
+from datetime import datetime, timezone
 
 Setting = namedtuple("Setting", "value source")
 
@@ -268,9 +272,12 @@ def render(template_text, values):
 
 
 WIDGET_KEYS = (
-    "app_name", "warehouse_id", "assess_catalogs", "genie_space_id", "brand_name",
-    "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
+    "app_name", "release", "staging_folder", "warehouse_id", "assess_catalogs", "genie_space_id",
+    "brand_name", "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
 )
+REPO_OWNER_REPO = "databricks-solutions/genie-ontology-readiness"
+LATEST_RELEASE_URL = f"https://api.github.com/repos/{REPO_OWNER_REPO}/releases/latest"
+_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _IDENT = re.compile(r"[a-z_][a-z0-9_]*")
 
 
@@ -281,6 +288,12 @@ def validate_widgets(widgets):
         problems.append("app_name must be 2-30 characters: lowercase letters, numbers and dashes.")
     if widgets.get("force_sp", "") not in ("", "true", "false"):
         problems.append("force_sp must be true, false, or empty (reuse the deployed value).")
+    release = widgets.get("release", "latest")
+    if release not in ("latest", "current") and not _TAG.fullmatch(release):
+        problems.append("release must be latest, current, or a release tag such as v1.3.0.")
+    staging = widgets.get("staging_folder", "")
+    if staging and not staging.startswith("/Workspace/"):
+        problems.append("staging_folder must start with /Workspace/ (or be empty).")
     if widgets.get("reset_settings", "false") not in ("false", "true"):
         problems.append("reset_settings must be false or true.")
     database = widgets.get("lakebase_database", "")
@@ -311,3 +324,103 @@ def explicit_from_widgets(widgets):
     if out.get("LAKEBASE_INSTANCE_NAME"):
         out["USE_LAKEBASE"] = "true"
     return out
+
+
+# --- release choice, Git folder move, deploy check, marker, exit payload ------------
+
+def fetch_json(url, opener=urllib.request.urlopen, retries=3, timeout=10, sleep=time.sleep):
+    """GET a JSON document. Retries with backoff (1s, 2s, 4s). Raises the last error."""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with opener(urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"}),
+                        timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # network or HTTP error: retry, then report
+            last = e
+            if attempt < retries:
+                sleep(2 ** attempt)
+    raise last
+
+
+def latest_release_tag(fetch=fetch_json):
+    """Return (tag, error). tag is None when GitHub cannot be reached."""
+    try:
+        tag = (fetch(LATEST_RELEASE_URL) or {}).get("tag_name", "")
+        return (tag, "") if tag else (None, "GitHub returned no release tag")
+    except Exception as e:
+        return None, type(e).__name__  # class name only: no raw error text is shown
+
+
+def decide_release(choice, latest_tag, latest_error=""):
+    """Return {"release": "current" | <tag>, "warning": str | None}.
+
+    latest: the latest release tag. If GitHub cannot be reached, deploy the current
+    Git folder state and warn. current: deploy what the Git folder has now. Any
+    other value is a tag, used as given."""
+    if choice == "current":
+        return {"release": "current", "warning": None}
+    if choice == "latest":
+        if latest_tag:
+            return {"release": latest_tag, "warning": None}
+        return {"release": "current",
+                "warning": f"Could not reach GitHub to find the latest release ({latest_error}). "
+                           "Deploying the current Git folder state instead."}
+    return {"release": choice, "warning": None}
+
+
+def tag_commit_sha(tag, fetch=fetch_json):
+    """Return the commit sha a release tag points to (follows an annotated tag), or None."""
+    try:
+        ref = fetch(f"https://api.github.com/repos/{REPO_OWNER_REPO}/git/ref/tags/{tag}")
+        obj = ref.get("object", {})
+        if obj.get("type") == "tag":
+            obj = fetch(f"https://api.github.com/repos/{REPO_OWNER_REPO}/git/tags/{obj['sha']}").get("object", {})
+        return obj.get("sha") or None
+    except Exception:
+        return None
+
+
+def needs_move(branch, head_sha, tag, tag_sha):
+    """True when the Git folder is not at the wanted tag. Matches on the tag name or the commit."""
+    if branch == tag:
+        return False
+    if tag_sha and head_sha == tag_sha:
+        return False
+    return True
+
+
+def moved_payload(tag):
+    """The exit value when the Git folder was moved to `tag` and the notebook must run again."""
+    return {"status": "moved", "release": tag}
+
+
+def moved_message(tag):
+    return f"The Git folder is now at {tag}. Click Run all again to deploy it."
+
+
+def app_ready(app_status, compute_status):
+    """True when the app is RUNNING and its compute is ACTIVE (both as plain strings)."""
+    return app_status == "RUNNING" and compute_status == "ACTIVE"
+
+
+def deployment_succeeded(state):
+    return state == "SUCCEEDED"
+
+
+def version_marker(git_sha, release, now=None):
+    """The JSON text written to <staging_folder>/.deployed_version."""
+    when = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return json.dumps({"git_sha": git_sha, "release": release, "deployed_at": when}, sort_keys=True)
+
+
+def exit_payload(app_name, url, release, git_sha, staging_folder, values):
+    """The notebook exit value for a finished deploy. Holds no secrets."""
+    return {
+        "app_name": app_name,
+        "url": url,
+        "release": release,
+        "git_sha": git_sha,
+        "staging_folder": staging_folder,
+        "settings": {key: {"value": values[key].value, "source": values[key].source} for key in KEYS},
+    }

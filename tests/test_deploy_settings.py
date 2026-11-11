@@ -484,3 +484,146 @@ def test_validate_widgets_reports_each_bad_value():
 def test_unreadable_folder_message_names_the_path():
     _, problems = _values(live=_live(readable=False))
     assert "/Workspace/Users/a@x/.genie/app" in problems[0]
+
+
+# --- release choice, Git folder move, deploy check, marker, exit payload -----------
+
+import json as _json  # noqa: E402
+import urllib.error  # noqa: E402
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+
+
+def _fake_fetch(table):
+    """Return a fetch(url) that serves `table` (url -> dict or Exception) and records calls."""
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        value = table[url]
+        if isinstance(value, Exception):
+            raise value
+        return value
+    fetch.calls = calls
+    return fetch
+
+
+def test_latest_release_tag_reads_tag_name():
+    fetch = _fake_fetch({ds.LATEST_RELEASE_URL: {"tag_name": "v1.3.0"}})
+    assert ds.latest_release_tag(fetch) == ("v1.3.0", "")
+
+
+def test_latest_release_tag_reports_unreachable_github():
+    fetch = _fake_fetch({ds.LATEST_RELEASE_URL: urllib.error.URLError("no route")})
+    tag, err = ds.latest_release_tag(fetch)
+    assert tag is None and err == "URLError"
+
+
+def test_fetch_json_retries_then_succeeds():
+    attempts = []
+    sleeps = []
+
+    def opener(req, timeout):
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise urllib.error.URLError("temporary")
+        return _Resp(b'{"tag_name": "v2"}')
+    out = ds.fetch_json("https://x", opener=opener, retries=3, timeout=5, sleep=sleeps.append)
+    assert out == {"tag_name": "v2"}
+    assert len(attempts) == 3 and sleeps == [1, 2]
+
+
+def test_fetch_json_gives_up_after_retries():
+    def opener(req, timeout):
+        raise urllib.error.URLError("down")
+    with pytest.raises(urllib.error.URLError):
+        ds.fetch_json("https://x", opener=opener, retries=2, sleep=lambda s: None)
+
+
+class _Resp:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_decide_release_latest_uses_tag():
+    assert ds.decide_release("latest", "v1.3.0") == {"release": "v1.3.0", "warning": None}
+
+
+def test_decide_release_latest_without_github_warns_and_uses_current():
+    out = ds.decide_release("latest", None, "URLError: down")
+    assert out["release"] == "current" and "Could not reach GitHub" in out["warning"]
+
+
+def test_decide_release_current_and_explicit_tag():
+    assert ds.decide_release("current", None) == {"release": "current", "warning": None}
+    assert ds.decide_release("v1.2.0", None) == {"release": "v1.2.0", "warning": None}
+
+
+def test_tag_commit_sha_follows_annotated_tag():
+    base = "https://api.github.com/repos/databricks-solutions/genie-ontology-readiness/git"
+    fetch = _fake_fetch({
+        f"{base}/ref/tags/v1.3.0": {"object": {"type": "tag", "sha": "tagobj"}},
+        f"{base}/tags/tagobj": {"object": {"type": "commit", "sha": "c0ffee"}},
+    })
+    assert ds.tag_commit_sha("v1.3.0", fetch) == "c0ffee"
+
+
+def test_tag_commit_sha_lightweight_and_failure():
+    base = "https://api.github.com/repos/databricks-solutions/genie-ontology-readiness/git"
+    light = _fake_fetch({f"{base}/ref/tags/v1": {"object": {"type": "commit", "sha": "abc"}}})
+    assert ds.tag_commit_sha("v1", light) == "abc"
+    down = _fake_fetch({f"{base}/ref/tags/v2": OSError("down")})
+    assert ds.tag_commit_sha("v2", down) is None
+
+
+def test_needs_move_by_branch_or_commit():
+    assert ds.needs_move("v1.3.0", "x", "v1.3.0", None) is False
+    assert ds.needs_move("main", "abc", "v1.3.0", "abc") is False
+    assert ds.needs_move("main", "abc", "v1.3.0", "def") is True
+    assert ds.needs_move("main", "abc", "v1.3.0", None) is True
+
+
+def test_moved_payload_and_message():
+    assert ds.moved_payload("v1.3.0") == {"status": "moved", "release": "v1.3.0"}
+    assert ds.moved_message("v1.3.0") == "The Git folder is now at v1.3.0. Click Run all again to deploy it."
+
+
+def test_app_ready_and_deployment_succeeded():
+    assert ds.app_ready("RUNNING", "ACTIVE") is True
+    assert ds.app_ready("DEPLOYING", "ACTIVE") is False
+    assert ds.app_ready("RUNNING", "STOPPED") is False
+    assert ds.deployment_succeeded("SUCCEEDED") is True
+    assert ds.deployment_succeeded("FAILED") is False
+
+
+def test_version_marker_shape():
+    now = _dt(2026, 11, 11, 15, 30, 0, tzinfo=_tz.utc)
+    data = _json.loads(ds.version_marker("abc123", "v1.3.0", now=now))
+    assert data == {"git_sha": "abc123", "release": "v1.3.0", "deployed_at": "2026-11-11T15:30:00Z"}
+
+
+def test_exit_payload_shape_and_no_secrets():
+    values, _ = _values(explicit={"WAREHOUSE_ID": "wh-1"})
+    out = ds.exit_payload("genie-ontology-readiness", "https://app", "v1.3.0", "abc",
+                          "/Workspace/Users/a/.genie-ontology-readiness/x", values)
+    assert set(out) == {"app_name", "url", "release", "git_sha", "staging_folder", "settings"}
+    assert set(out["settings"]) == set(ds.KEYS)
+    assert out["settings"]["WAREHOUSE_ID"] == {"value": "wh-1", "source": ds.SOURCE_YOU}
+    assert "token" not in _json.dumps(out).lower()
+
+
+def test_widgets_validate_release_and_staging():
+    assert ds.validate_widgets(_widgets(release="v1.3.0")) == []
+    assert ds.validate_widgets(_widgets(release="latest")) == []
+    assert ds.validate_widgets(_widgets(release="current")) == []
+    assert ds.validate_widgets(_widgets(release="v1; rm")) != []
+    assert ds.validate_widgets(_widgets(staging_folder="/tmp/x")) != []
+    assert ds.validate_widgets(_widgets(staging_folder="/Workspace/Users/a/x")) == []
