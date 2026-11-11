@@ -5,7 +5,8 @@ from fastapi import APIRouter
 
 from server.pillars import PILLARS, LEVEL_LABELS
 from server.routes._shared import list_available_models, resolve_default_model
-from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, ASSESS_CATALOGS, get_cloud_provider
+from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, WAREHOUSE_ID, ASSESS_CATALOGS, get_cloud_provider
+from server import lakebase_client
 
 router = APIRouter()
 
@@ -35,6 +36,10 @@ async def get_config():
         "ai_models": ai_models,
         "default_model": default_model,
         "lakebase_enabled": USE_LAKEBASE,
+        # Health facts for deploy checks: is a SQL warehouse bound, and did the
+        # history pool start (not only "is Lakebase configured").
+        "warehouse_configured": bool(WAREHOUSE_ID),
+        "history_ready": lakebase_client.is_available(),
         "genie_space_configured": bool(GENIE_SPACE_ID),
         "assess_catalogs": ASSESS_CATALOGS,
         # Cloud the app is deployed on (aws|azure|gcp); documentation links are
