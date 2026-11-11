@@ -98,13 +98,43 @@ Resources, history, and the app itself are not touched. Only the code changes. N
    path** as `app`.
 3. Click **Deploy**. Wait until the deployment finishes. Then check that the app status shows **Running**. A deployment can succeed while the app fails to start.
 
-**Rollback.** Follow the same steps, and enter the old tag, for example `v1.3.0`.
+**Rollback.** Follow the same steps, and enter an older tag. Only releases that contain
+`app/app.yaml` can be deployed from Git. For an older release, use the workspace source
+(see *Migrate from an older install* below).
 
 **Do not:**
 
 - Delete the app. Upgrade it instead.
 - Drop the Lakebase history database.
 - Change the `lakebase-db` resource to another database, unless you want a new, empty history.
+
+### Migrate from an older install
+
+Use this if you installed the app before deploy-from-Git was supported. In that case the app was
+installed with the notebook or with `bundle deploy` + `post_deploy.py`, and it runs from a
+workspace folder. You keep the same app, so you keep its history, its service principal and its
+grants.
+
+1. **Write down your settings.** Open the app's source folder. The app overview shows it as the
+   source code path. Open `app.yml` in that folder, and note any value you changed from the
+   default: `ASSESS_CATALOGS`, `BRAND_NAME`, `GENIE_SPACE_ID`, `FORCE_SP`, `GENIE_ALLOW_SP_FALLBACK`.
+   A deploy from Git uses the defaults in the release's `app/app.yaml`. It does not copy these values.
+2. **Check the resources.** On the app's configuration page, the app must have a `sql-warehouse`
+   resource. If it uses history, it must also have a `lakebase-db` resource that points to the
+   database named in `LAKEBASE_DATABASE` in that `app.yml`. Add a missing resource with
+   **+ Add resource**, with the same key.
+3. **Deploy from Git.** Do the steps in *Upgrade to a new release*. Enter the repo URL
+   `https://github.com/databricks-solutions/genie-ontology-readiness.git` if the app asks for it,
+   and use a release tag that contains `app/app.yaml`.
+4. **Check.** The status shows **Running**, and your saved runs are in the history. The app finds
+   its existing tables and keeps using them. You do not need to run the GRANT SQL again.
+5. **Settings.** If step 1 showed values that you changed, and you need them, use the
+   [notebook](#advanced-automated-install-notebook) or the [CLI](#advanced-terminal-or-ci) path.
+   These paths reuse the deployed values. Otherwise the defaults apply.
+
+**Rollback.** Click the arrow next to **Deploy**, then **Deploy using a different source**. Select
+the workspace source, and enter the old source folder from step 1. The old folder is not changed
+by a deploy from Git.
 
 ### Advanced: automated install (notebook)
 
