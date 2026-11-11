@@ -424,3 +424,63 @@ def test_upgrade_updates_warehouse_when_it_changed(monkeypatch):
     updates = [c[1] for c in calls if c[0] == "update"]
     assert updates == [{"warehouse_id": "wh-new",
                         "lakebase": {"instance": "shared-inst", "database": "history_db"}}]
+
+
+# --- notebook widgets ----------------------------------------------------------
+
+def _widgets(**over):
+    base = {"app_name": "genie-ontology-readiness", "warehouse_id": "", "assess_catalogs": "",
+            "genie_space_id": "", "brand_name": "", "force_sp": "", "lakebase_instance_name": "",
+            "lakebase_database": "", "reset_settings": "false"}
+    base.update(over)
+    return base
+
+
+def test_empty_widgets_are_not_explicit():
+    assert ds.explicit_from_widgets(_widgets()) == {}
+
+
+def test_non_empty_widgets_map_to_setting_keys_and_strip():
+    out = ds.explicit_from_widgets(_widgets(warehouse_id=" wh-1 ", brand_name="Acme", force_sp="false"))
+    assert out == {"WAREHOUSE_ID": "wh-1", "BRAND_NAME": "Acme", "FORCE_SP": "false"}
+
+
+def test_naming_a_lakebase_instance_turns_history_on():
+    out = ds.explicit_from_widgets(_widgets(lakebase_instance_name="inst", lakebase_database="db"))
+    assert out == {"LAKEBASE_INSTANCE_NAME": "inst", "LAKEBASE_DATABASE": "db", "USE_LAKEBASE": "true"}
+
+
+def test_widgets_plus_deployed_app_keep_settings_when_empty():
+    """Upgrade with empty widgets: every value comes from the deployed app, nothing is turned off."""
+    values, problems = ds.plan(ds.explicit_from_widgets(_widgets()), _live(), TEMPLATE,
+                               forced={"GOR_VERSION": "2.0.0"})
+    assert problems == []
+    assert values["USE_LAKEBASE"].value == "true"
+    assert values["LAKEBASE_INSTANCE_NAME"] == ("shared-inst", ds.SOURCE_DEPLOYED)
+    assert values["ASSESS_CATALOGS"] == ("sales,finance", ds.SOURCE_DEPLOYED)
+
+
+def test_widget_database_change_stops_with_no_change():
+    values, problems = ds.plan(ds.explicit_from_widgets(_widgets(lakebase_database="fresh")), _live(), TEMPLATE)
+    assert any("Lakebase database" in p for p in problems)
+
+
+def test_reset_widget_ignores_deployed_values():
+    values, problems = ds.plan(ds.explicit_from_widgets(_widgets()), _live(), TEMPLATE, reset=True)
+    assert problems == []
+    assert values["ASSESS_CATALOGS"].source == ds.SOURCE_DEFAULT
+
+
+def test_validate_widgets_accepts_defaults():
+    assert ds.validate_widgets(_widgets()) == []
+
+
+def test_validate_widgets_reports_each_bad_value():
+    bad = ds.validate_widgets(_widgets(app_name="A", force_sp="yes", reset_settings="ture",
+                                       lakebase_database="1db; drop"))
+    assert len(bad) == 4
+
+
+def test_unreadable_folder_message_names_the_path():
+    _, problems = _values(live=_live(readable=False))
+    assert "/Workspace/Users/a@x/.genie/app" in problems[0]

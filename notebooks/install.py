@@ -94,16 +94,10 @@ from server.user_agent import PRODUCT_NAME, git_version, resolve_version  # noqa
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import deploy_settings  # noqa: E402
 
-cfg = {name: dbutils.widgets.get(name).strip() for name in (
-    "app_name", "warehouse_id", "assess_catalogs", "genie_space_id", "brand_name",
-    "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
-)}
-if not re.fullmatch(r"[a-z0-9-]{2,30}", cfg["app_name"]):
-    raise ValueError("app_name must be 2-30 characters of lowercase letters, numbers and dashes.")
-if cfg["force_sp"] not in ("", "true", "false"):
-    raise ValueError("force_sp must be true, false, or empty (reuse the deployed value).")
-if cfg["reset_settings"] not in ("false", "true"):
-    raise ValueError("reset_settings must be false or true.")
+cfg = {name: dbutils.widgets.get(name).strip() for name in deploy_settings.WIDGET_KEYS}
+_widget_problems = deploy_settings.validate_widgets(cfg)
+if _widget_problems:
+    raise ValueError("\n".join(_widget_problems))
 
 w = WorkspaceClient(product=PRODUCT_NAME, product_version=resolve_version())
 me = w.current_user.me().user_name
@@ -156,17 +150,7 @@ live = deploy_settings.read_live(app_before.as_dict() if app_before else None, r
 
 # Widgets: a value that is not empty is "you set". force_sp, lakebase_instance_name etc.
 # are only passed when non-empty, because an empty widget means "reuse".
-explicit = {name: value for name, value in {
-    "WAREHOUSE_ID": cfg["warehouse_id"],
-    "ASSESS_CATALOGS": cfg["assess_catalogs"],
-    "GENIE_SPACE_ID": cfg["genie_space_id"],
-    "BRAND_NAME": cfg["brand_name"],
-    "FORCE_SP": cfg["force_sp"],
-    "LAKEBASE_INSTANCE_NAME": cfg["lakebase_instance_name"],
-    "LAKEBASE_DATABASE": cfg["lakebase_database"],
-}.items() if value}
-if cfg["lakebase_instance_name"]:
-    explicit["USE_LAKEBASE"] = "true"  # naming an instance turns history on, as before
+explicit = deploy_settings.explicit_from_widgets(cfg)
 
 TEMPLATE_TEXT = (APP_SRC / "app.yml.template").read_text()
 forced = {"GOR_VERSION": git_version() or "", "LAKEBASE_USER": live["sp"], "LAKEBASE_HOST": ""}
@@ -439,11 +423,12 @@ else:
 # COMMAND ----------
 
 step(f"Staging app source to {STAGE_DIR}")
-# The deployed app.yml was read in step 0, so this rewrite does not lose the settings.
-shutil.rmtree(STAGE_DIR, ignore_errors=True)
+# The same folder is used on every run. Files are overwritten, not deleted first, and
+# app.yml is written last. So a failed run never leaves the deployed settings unreadable.
 shutil.copytree(
     APP_SRC,
     STAGE_DIR,
+    dirs_exist_ok=True,
     ignore=shutil.ignore_patterns(
         "node_modules", "dist", "__pycache__", "__tests__", ".pytest_cache", "test_*.py", "app.yml",
     ),

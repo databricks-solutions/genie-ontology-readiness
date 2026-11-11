@@ -110,7 +110,7 @@ def read_live(app, read_text):
     read. It is called only when the app has an active deployment."""
     if not app:
         return {"exists": False, "has_deployment": False, "yml_readable": True,
-                "env": {}, "resources": {}, "sp": ""}
+                "env": {}, "resources": {}, "sp": "", "source_path": ""}
     deployment = app.get("active_deployment")
     has_deployment = bool(deployment)
     env, readable = {}, True
@@ -123,7 +123,8 @@ def read_live(app, read_text):
             env = parse_env(text)
     return {"exists": True, "has_deployment": has_deployment, "yml_readable": readable,
             "env": env, "resources": read_resources(app),
-            "sp": app.get("service_principal_client_id") or ""}
+            "sp": app.get("service_principal_client_id") or "",
+            "source_path": (deployment or {}).get("source_code_path") or ""}
 
 
 def choose_mode(app_exists, infra):
@@ -208,8 +209,8 @@ def find_problems(values, live, *, reset=False):
     if live.get("has_deployment") and not live.get("yml_readable"):
         # The deployed settings are unknown, so no comparison against them is meaningful.
         return [
-            "The app is deployed. Its app.yml cannot be read, so its settings are unknown. "
-            "Check that you can read the app source folder. Then run again. "
+            f"The app is deployed from '{live.get('source_path', '')}'. Its app.yml cannot be "
+            "read, so its settings are unknown. Check that you can read that folder, then run again. "
             "To ignore the deployed settings, set RESET_SETTINGS=true."
         ]
     return _lakebase_problems(values, live.get("env", {}), live.get("resources", {}))
@@ -264,3 +265,49 @@ def render(template_text, values):
         if n == 0:
             missing.append(name)
     return text, missing
+
+
+WIDGET_KEYS = (
+    "app_name", "warehouse_id", "assess_catalogs", "genie_space_id", "brand_name",
+    "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
+)
+_IDENT = re.compile(r"[a-z_][a-z0-9_]*")
+
+
+def validate_widgets(widgets):
+    """Return plain-text reasons why the notebook widgets are not valid. Empty = valid."""
+    problems = []
+    if not re.fullmatch(r"[a-z0-9-]{2,30}", widgets.get("app_name", "")):
+        problems.append("app_name must be 2-30 characters: lowercase letters, numbers and dashes.")
+    if widgets.get("force_sp", "") not in ("", "true", "false"):
+        problems.append("force_sp must be true, false, or empty (reuse the deployed value).")
+    if widgets.get("reset_settings", "false") not in ("false", "true"):
+        problems.append("reset_settings must be false or true.")
+    database = widgets.get("lakebase_database", "")
+    if database and not _IDENT.fullmatch(database):
+        problems.append("lakebase_database must be a lowercase Postgres name (letters, digits, underscore).")
+    return problems
+
+
+def explicit_from_widgets(widgets):
+    """Turn notebook widget values into the `explicit` settings for plan().
+
+    An empty widget is not explicit: it means "reuse the deployed value". So only
+    non-empty widgets are returned. Naming a Lakebase instance turns history on."""
+    mapping = {
+        "warehouse_id": "WAREHOUSE_ID",
+        "assess_catalogs": "ASSESS_CATALOGS",
+        "genie_space_id": "GENIE_SPACE_ID",
+        "brand_name": "BRAND_NAME",
+        "force_sp": "FORCE_SP",
+        "lakebase_instance_name": "LAKEBASE_INSTANCE_NAME",
+        "lakebase_database": "LAKEBASE_DATABASE",
+    }
+    out = {}
+    for widget, key in mapping.items():
+        value = (widgets.get(widget) or "").strip()
+        if value:
+            out[key] = value
+    if out.get("LAKEBASE_INSTANCE_NAME"):
+        out["USE_LAKEBASE"] = "true"
+    return out

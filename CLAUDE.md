@@ -25,31 +25,24 @@ Bundles** + `post_deploy.py`.
 
 ## Deployment
 
-Full steps are in the [README](./README.md): **First install**, **Upgrade to a new
-release**, and the notebook installer. In short, from the repository root:
+The main path is **in the workspace**: a Git folder, then [`notebooks/install.py`](notebooks/install.py)
+on Serverless compute. The Databricks Apps runtime builds the frontend. The first install and
+the upgrade use the same notebook. The steps are in the [README](./README.md) (**Quick start**).
 
-- **First install:** build the frontend, `databricks bundle deploy -t prod --profile <p>
-  --var="warehouse_id=<id>"`, then `DATABRICKS_PROFILE=<p> TARGET=prod WAREHOUSE_ID=<id>
-  python3 scripts/post_deploy.py`.
-- **Upgrade:** build the frontend, then `DATABRICKS_PROFILE=<p> TARGET=prod python3
-  scripts/post_deploy.py`. It reuses the deployed app's settings and Lakebase history.
-  It syncs `app/` to your own folder and runs `apps deploy`. It does not run `bundle deploy`.
-- **Infrastructure change** (`databricks.yml` changed): add `INFRA=true` to the upgrade
-  command. This runs `bundle deploy` with the reused warehouse id.
+Terminal and CI deploys are the advanced path. The README section **Advanced: deploy from a
+terminal or CI** has the commands: `bundle deploy` plus `scripts/post_deploy.py` for a first
+install, and `scripts/post_deploy.py` alone for an upgrade. `INFRA=true` runs `bundle deploy`
+for infrastructure changes. `RESET_SETTINGS=true` starts fresh.
 
-The environment is a bundle **target** (`-t dev` default, `stg`, `prod`). Each target has
-a **fixed app name**: `dev` → `genie-ontology-readiness-dev`, `stg` → `…-stg`, `prod` → the
-bare `genie-ontology-readiness`. It is pinned per target in `databricks.yml`. There is no
-`--var app_name`. Keep `TARGET` equal to the `-t` value of the first install.
+Both paths reuse the deployed app's settings. The order is: the value you set, then the deployed
+app's value, then the release default. The logic is in `scripts/deploy_settings.py`. Both paths
+print a table of settings and sources. Both stop before any change if the deployed `app.yml`
+cannot be read, or if the run would turn Lakebase history off or point it at another instance or
+database. Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps
+inject) and survives redeploys. Never run `bundle destroy`, and never drop the history database.
 
-`post_deploy.py` reads the deployed app first. Settings resolve in this order: the value you
-set (an env var that is set, even if empty) > the deployed app's value > the release default.
-It prints a table with each value and its source. It stops before any change if the
-deployed `app.yml` cannot be read, or if the run would turn Lakebase history off or point it at
-another instance or database. Set `RESET_SETTINGS=true` only to start fresh. The logic is in
-`scripts/deploy_settings.py`. Lakebase history is per user (keyed by the `X-Forwarded-Email`
-identity Databricks Apps inject) and survives redeploys. Never run `bundle destroy` or drop the
-history database.
+The environment is a bundle **target** (`-t dev` default, `stg`, `prod`). Each target has a fixed
+app name, pinned in `databricks.yml`. There is no `--var app_name`.
 
 Scores are a deterministic function of the technical findings, so repeated runs on the same
 workspace are directly comparable **for a given identity**. Under OBO the findings reflect the
