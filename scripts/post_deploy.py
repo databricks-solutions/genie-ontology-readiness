@@ -1,4 +1,4 @@
-"""Post-deploy: render app.yml, grant the app SP read access, provision Lakebase
+"""Post-deploy: render app.yaml, grant the app SP read access, provision Lakebase
 (per-user history), and (re)deploy the app.
 
 Two modes (see deploy_settings.choose_mode):
@@ -53,6 +53,10 @@ import time
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent / "app"
+# The one app config file. The Git deploy uses it as committed. A CLI publish renders
+# values into it and restores the committed text when the run ends (see main()).
+APP_CONFIG = APP_DIR / "app.yaml"
+ORIGINAL_APP_CONFIG = ""  # the committed text, read at the start of main()
 
 # Reuse the app's git-tag version resolver (dependency-light — stdlib only) so
 # the baked version matches what the running app reports.
@@ -154,21 +158,18 @@ def infra_requested():
 
 
 def render_app_yml(values):
-    """Write app/app.yml from the template and the resolved settings.
+    """Write the resolved settings into app/app.yaml (rendered from the committed text).
 
-    Called after setup_lakebase(), so the Lakebase host and SP id are known. The
+    LAKEBASE_HOST is not written: the lakebase-db resource supplies it (valueFrom). The
     USE_LAKEBASE flag is on only when the history database was reached."""
     rendered = {name: setting.value for name, setting in values.items()}
     rendered["USE_LAKEBASE"] = "true" if (USE_LAKEBASE and _LAKEBASE["host"]) else "false"
-    rendered["LAKEBASE_HOST"] = _LAKEBASE["host"]
     rendered["LAKEBASE_USER"] = _LAKEBASE["sp_client_id"] or values["LAKEBASE_USER"].value
-    template = (APP_DIR / "app.yml.template").read_text()
-    text, missing = deploy_settings.render(template, rendered)
+    text, missing = deploy_settings.render(ORIGINAL_APP_CONFIG, rendered)
     for name in missing:
-        print(f"  (warning) could not set {name} in app.yml — leaving template default")
-    out = APP_DIR / "app.yml"
-    out.write_text(text)
-    print(f"  Rendered {out}")
+        print(f"  (warning) could not set {name} in app.yaml — leaving the committed value")
+    APP_CONFIG.write_text(text)
+    print(f"  Rendered {APP_CONFIG} (restored to the committed text when this run ends)")
 
 
 def _workspace_id_default():
@@ -231,7 +232,7 @@ def _get_app(name):
 def _read_workspace_text(path):
     """Text of a workspace file, or None if it cannot be read."""
     with tempfile.TemporaryDirectory() as tmp:
-        dest = Path(tmp) / "app.yml"
+        dest = Path(tmp) / "app.yaml"
         r = subprocess.run(_cli_cmd("workspace", "export", path, "--format", "RAW", "--file", str(dest)),
                            capture_output=True, text=True)
         if r.returncode != 0 or not dest.exists():
@@ -242,7 +243,7 @@ def _read_workspace_text(path):
 def resolve_settings(live):
     """Resolve every setting for this run. Prints the table; stops on a safety problem."""
     reset = reset_requested()
-    template_text = (APP_DIR / "app.yml.template").read_text()
+    template_text = ORIGINAL_APP_CONFIG
     forced = {"GOR_VERSION": git_version() or "", "LAKEBASE_USER": live["sp"], "LAKEBASE_HOST": ""}
     extra = {"WORKSPACE_ID": _workspace_id_default()}
     values, problems = deploy_settings.plan(
@@ -280,7 +281,7 @@ def _credential(instance):
 
 def setup_lakebase():
     """Create the app's database on the shared instance and record host + SP client id
-    for app.yml rendering. Idempotent: an existing database is reused."""
+    for app.yaml rendering. Idempotent: an existing database is reused."""
     import asyncio
     if not LAKEBASE_INSTANCE:
         print("  USE_LAKEBASE=true but LAKEBASE_INSTANCE_NAME is unset. Set it to an existing "
@@ -417,7 +418,7 @@ def attach_lakebase():
 
     Runs AFTER `bundle deploy`/`run`, because `bundle deploy` reconciles the app's
     resources from databricks.yml (which intentionally omits lakebase-db) and would
-    otherwise strip it. Pinned LAKEBASE_* env stays in app.yml; the resource
+    otherwise strip it. Pinned LAKEBASE_* env stays in app.yaml; the resource
     provides the SP's Postgres role + network path, so we restart to reconnect.
     """
     if not _LAKEBASE.get("host"):
@@ -438,7 +439,7 @@ def attach_lakebase():
 
 
 def stage_source():
-    """Copy app/ (with the built frontend and the rendered app.yml) to your own
+    """Copy app/ (with the built frontend and the rendered app.yaml) to your own
     staging folder and sync it there. Returns the workspace path.
 
     The folder is under your home directory, as the notebook installer uses. The
@@ -453,7 +454,7 @@ def stage_source():
         local = Path(tmp) / "app"
         shutil.copytree(APP_DIR, local, ignore=shutil.ignore_patterns(
             "node_modules", "__pycache__", ".pytest_cache", "*.pyc"))
-        # Do not delete the folder first. The deployed app's settings live in the app.yml
+        # Do not delete the folder first. The deployed app's settings live in the app.yaml
         # in this folder, and a failed sync must not leave the next run without them.
         rc = cli("sync", "--full", str(local), remote, check=False)
     if rc != 0:
@@ -527,6 +528,16 @@ def _fallback_app_name():
 
 
 def main():
+    """Run the publish, then put the committed app.yaml back, even when a stop exits early."""
+    global ORIGINAL_APP_CONFIG
+    ORIGINAL_APP_CONFIG = APP_CONFIG.read_text()
+    try:
+        _main()
+    finally:
+        APP_CONFIG.write_text(ORIGINAL_APP_CONFIG)
+
+
+def _main():
     global APP_NAME, WAREHOUSE_ID, USE_LAKEBASE, LAKEBASE_INSTANCE, LAKEBASE_DATABASE, LAKEBASE_SSL_MODE
     if not PROFILE:
         print("ERROR: DATABRICKS_PROFILE not set.")
@@ -552,7 +563,8 @@ def main():
         print("Mode: bundle deploy (first install, or INFRA=true)")
 
     WAREHOUSE_ID = values["WAREHOUSE_ID"].value
-    USE_LAKEBASE = values["USE_LAKEBASE"].value.strip().lower() == "true"
+    USE_LAKEBASE = deploy_settings.effective_lakebase(
+        values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value)
     LAKEBASE_INSTANCE = values["LAKEBASE_INSTANCE_NAME"].value
     LAKEBASE_DATABASE = values["LAKEBASE_DATABASE"].value
     LAKEBASE_SSL_MODE = values["LAKEBASE_SSL_MODE"].value
@@ -564,7 +576,7 @@ def main():
         _stop(["Lakebase is not available. This run would turn history off. Nothing was deployed. "
                "Make the instance AVAILABLE, then run again."])
 
-    print("\n[1/3] Rendering app.yml...")
+    print("\n[1/3] Rendering app.yaml...")
     render_app_yml(values)
 
     print("\n[2/3] Granting app SP read access...")
@@ -586,7 +598,7 @@ def main():
         cli("apps", "get", APP_NAME, check=False)
         return
 
-    print(f"\n[3/3] Publishing the app to target '{TARGET}' (re-sync app.yml + dist, start compute, deploy)...")
+    print(f"\n[3/3] Publishing the app to target '{TARGET}' (re-sync app.yaml + dist, start compute, deploy)...")
     # The app name is fixed by the target in databricks.yml — do NOT pass
     # --var app_name (the variable no longer exists; passing it would fail and,
     # historically, sharing one target's state across app names is the delete

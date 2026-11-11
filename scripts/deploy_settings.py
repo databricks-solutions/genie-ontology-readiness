@@ -8,15 +8,15 @@ Each setting is resolved in this order:
 
     you set        a value given for this run: an env var that is SET (even when
                    empty), or a notebook widget that is not empty
-    deployed app   the value in the deployed app's app.yml, or in its resources
-    default        the value in the new release's app/app.yml.template
+    deployed app   the value in the deployed app's app.yaml, or in its resources
+    default        the value in the new release's app/app.yaml
 
 Two kinds of key never follow that order:
 
     GOR_VERSION                always comes from the new release
     LAKEBASE_USER / LAKEBASE_HOST  always come from the live app and instance
 
-Keys that the new template has but the deployed app.yml does not keep the
+Keys that the new template has but the deployed app.yaml does not keep the
 template default. That is how new secure defaults reach an upgraded app.
 """
 
@@ -38,8 +38,8 @@ SOURCE_LIVE = "live"
 WAREHOUSE_RESOURCE = "sql-warehouse"
 LAKEBASE_RESOURCE = "lakebase-db"
 
-# Every app.yml env key that the app reads, plus WAREHOUSE_ID (which lives in the
-# sql-warehouse resource, not in app.yml). A test fails if the template gains a
+# Every app.yaml env key that the app reads, plus WAREHOUSE_ID (which lives in the
+# sql-warehouse resource, not in app.yaml). A test fails if the template gains a
 # value key that is missing here.
 KEYS = (
     "WAREHOUSE_ID",
@@ -60,13 +60,18 @@ KEYS = (
     "LAKEBASE_HOST",
 )
 ALWAYS_NEW = ("GOR_VERSION",)
+# Defaults that differ from the committed app.yaml. The app.yaml value is empty so that a
+# Git deploy falls back to the lakebase-db resource. The scripts still need a concrete name.
+DEFAULT_OVERRIDES = {"LAKEBASE_DATABASE": "ontology_readiness"}
+APP_CONFIG_NAME = "app.yaml"
+LEGACY_APP_CONFIG_NAME = "app.yml"
 ALWAYS_LIVE = ("LAKEBASE_USER", "LAKEBASE_HOST")
-# Keys that the deployed app reads from its resources (authoritative), not app.yml.
+# Keys that the deployed app reads from its resources (authoritative), not app.yaml.
 RESOURCE_KEYS = ("WAREHOUSE_ID", "LAKEBASE_INSTANCE_NAME", "LAKEBASE_DATABASE")
 
 
 def parse_env(text):
-    """Return {name: value} for the `env:` entries of an app.yml (or its template).
+    """Return {name: value} for the `env:` entries of an app.yaml (or its template).
 
     Only `value:` entries are returned. `valueFrom:` entries (such as the warehouse
     binding) are skipped on purpose: their value comes from a resource."""
@@ -120,7 +125,9 @@ def read_live(app, read_text):
     env, readable = {}, True
     if has_deployment:
         path = (deployment.get("source_code_path") or "").rstrip("/")
-        text = read_text(f"{path}/app.yml") if path else None
+        text = None
+        if path:  # app.yaml is current; app.yml is what releases before the Git path deployed
+            text = read_text(f"{path}/{APP_CONFIG_NAME}") or read_text(f"{path}/{LEGACY_APP_CONFIG_NAME}")
         if text is None:
             readable = False
         else:
@@ -140,6 +147,14 @@ def choose_mode(app_exists, infra):
     return "bundle" if (infra or not app_exists) else "upgrade"
 
 
+def effective_lakebase(value, instance):
+    """Whether history is on for a run. `auto` (or empty) is on when an instance is set."""
+    value = (value or "auto").strip().lower()
+    if value in ("true", "false"):
+        return value == "true"
+    return bool((instance or "").strip())
+
+
 def uses_lakebase(live_env, live_resources):
     """True when the deployed app keeps its history in Lakebase."""
     return (live_env.get("USE_LAKEBASE", "").strip().lower() == "true"
@@ -156,7 +171,7 @@ def resolve(explicit, live_env, live_resources, defaults, forced=None):
     """Return {key: Setting(value, source)} for every key in KEYS.
 
     explicit        values the customer set for this run (only keys that are set)
-    live_env        env values of the deployed app.yml ({} when unknown or reset)
+    live_env        env values of the deployed app.yaml ({} when unknown or reset)
     live_resources  values from the deployed app's resources ({} when unknown or reset)
     defaults        the new release's template defaults (plus any extra defaults)
     forced          values for ALWAYS_NEW and ALWAYS_LIVE keys; these ignore explicit"""
@@ -181,7 +196,7 @@ def _lakebase_problems(values, live_env, live_resources):
         return []
     old_instance = _deployed_value("LAKEBASE_INSTANCE_NAME", live_env, live_resources)
     old_database = _deployed_value("LAKEBASE_DATABASE", live_env, live_resources)
-    if values["USE_LAKEBASE"].value.strip().lower() != "true":
+    if not effective_lakebase(values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value):
         return [
             f"The deployed app saves history in Lakebase (instance '{old_instance}', "
             f"database '{old_database}'). This run turns Lakebase off. Then the app stops "
@@ -213,7 +228,7 @@ def find_problems(values, live, *, reset=False):
     if live.get("has_deployment") and not live.get("yml_readable"):
         # The deployed settings are unknown, so no comparison against them is meaningful.
         return [
-            f"The app is deployed from '{live.get('source_path', '')}'. Its app.yml cannot be "
+            f"The app is deployed from '{live.get('source_path', '')}'. Its app.yaml cannot be "
             "read, so its settings are unknown. Check that you can read that folder, then run again. "
             "To ignore the deployed settings, set RESET_SETTINGS=true."
         ]
@@ -225,7 +240,7 @@ def plan(explicit, live, template_text, *, forced=None, extra_defaults=None, res
 
     With reset=True the deployed values are ignored: each setting is either explicit
     or a release default."""
-    defaults = {**parse_env(template_text), **(extra_defaults or {})}
+    defaults = {**parse_env(template_text), **DEFAULT_OVERRIDES, **(extra_defaults or {})}
     env = {} if reset else live.get("env", {})
     resources = {} if reset else live.get("resources", {})
     values = resolve(explicit, env, resources, defaults, forced)
@@ -253,7 +268,7 @@ def _yaml_safe(value):
 
 
 def render(template_text, values):
-    """Return the app.yml text: the template with each env `value:` set from values.
+    """Return the app.yaml text: the template with each env `value:` set from values.
 
     Keys that the template does not have as a `value:` entry are skipped. Returns
     (text, missing), where missing lists template keys that could not be set."""

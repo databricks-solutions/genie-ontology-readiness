@@ -25,26 +25,35 @@ Bundles** + `post_deploy.py`.
 
 ## Deployment
 
-The main path is **in the workspace**: a Git folder, then [`notebooks/install.py`](notebooks/install.py)
-on Serverless compute. The Databricks Apps runtime builds the frontend. The first install and
-the upgrade use the same notebook. The steps are in the [README](./README.md) (**Quick start**).
-The notebook picks the release with the `release` widget (default `latest`), moves the Git folder
-to it, and writes `.deployed_version` (git sha, release, UTC time) to the staging folder.
+The default path is the **Databricks Apps UI, deploying from this Git repo**. Create a custom
+app, set the Git reference to a release tag and the source code path to `app`, add the resources
+`sql-warehouse` and (optionally) `lakebase-db`, then deploy. The steps are in the
+[README](./README.md) (**Quick start**).
 
-Terminal and CI deploys are the advanced path. The README section **Advanced: deploy from a
-terminal or CI** has the commands: `bundle deploy` plus `scripts/post_deploy.py` for a first
-install, and `scripts/post_deploy.py` alone for an upgrade. `INFRA=true` runs `bundle deploy`
-for infrastructure changes. `RESET_SETTINGS=true` starts fresh.
+The app config is one file, `app/app.yaml`. It is committed and holds no workspace values. A Git
+deploy uses it as committed. `valueFrom` binds `DATABRICKS_WAREHOUSE_ID` to `sql-warehouse` and
+`LAKEBASE_HOST` to `lakebase-db`. `app/package.json` runs the frontend build on deploy.
 
-Both paths reuse the deployed app's settings. The order is: the value you set, then the deployed
-app's value, then the release default. The logic is in `scripts/deploy_settings.py`. Both paths
-print a table of settings and sources. Both stop before any change if the deployed `app.yml`
-cannot be read, or if the run would turn Lakebase history off or point it at another instance or
-database. Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps
-inject) and survives redeploys. Never run `bundle destroy`, and never drop the history database.
+Two advanced paths write their settings into a copy of `app/app.yaml`, never into the repo:
+the notebook installer (`notebooks/install.py`, in a Git folder) and the CLI scripts
+(`scripts/post_deploy.py`, with `bundle deploy` for a first install and `INFRA=true`). Both reuse
+the deployed app's settings, in this order: the value you set, the deployed value, the release
+default. They print a table of settings and sources. They stop before any change if the deployed
+config cannot be read, or if the run would turn Lakebase history off or point it at another instance
+or database. `RESET_SETTINGS=true` starts fresh. The logic is in `scripts/deploy_settings.py`.
 
-The environment is a bundle **target** (`-t dev` default, `stg`, `prod`). Each target has a fixed
-app name, pinned in `databricks.yml`. There is no `--var app_name`.
+Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps inject) and
+survives redeploys. Never run `bundle destroy`, and never drop the history database.
+
+The app reads its own identity from the runtime: `DATABRICKS_CLIENT_ID` is the Lakebase user, and
+the `lakebase-db` resource gives the database and instance when the settings do not. The grant SQL
+for the app's service principal is served at `GET /api/setup/grants`.
+
+**Cutting a release:** write the version into `app/VERSION` (for example `1.4.0`), commit it, then
+tag the commit (`v1.4.0`). A Git deploy has no `.git`, so it reads this file for `GOR_VERSION`.
+
+The environment is a bundle **target** (`-t dev` default, `stg`, `prod`) for the CLI path. Each target
+has a fixed app name, pinned in `databricks.yml`. There is no `--var app_name`.
 
 Scores are a deterministic function of the technical findings, so repeated runs on the same
 workspace are directly comparable **for a given identity**. Under OBO the findings reflect the
@@ -75,7 +84,7 @@ policy lives in `sql_client.execute_sql`:
 3. With no forwarded token (OBO disabled, scheduled/unattended, local dev), the
    read runs as the **SP** directly.
 
-**Deploy-time override:** set `FORCE_SP=true` (env in `app.yml`, or
+**Deploy-time override:** set `FORCE_SP=true` (env in `app/app.yaml`, or
 `export FORCE_SP=true` before `post_deploy.py`) to force **SP-only mode** — the
 app never attempts OBO and runs every read as the service principal, even when
 user authorization is enabled. Use it to guarantee consistent workspace-wide
@@ -121,7 +130,7 @@ have an editor run the deep pass.
 ```
 app/
   app.py                     — FastAPI entry (port from DATABRICKS_APP_PORT)
-  app.yml.template           — env template; post_deploy.py renders app.yml
+  app/app.yaml                — committed app config (Git deploy); CLI and notebook render a copy
   server/
     config.py                — SP/local auth, host resolution, env config
     sql_client.py            — Statement Execution API
@@ -141,7 +150,7 @@ app/
 notebooks/
   install.py                 — workspace notebook installer (no CLI / Node.js needed)
 scripts/
-  post_deploy.py             — render app.yml, grant SP, publish
+  post_deploy.py             — render app/app.yaml, grant SP, publish
   setup_app_permissions.py   — UC read grants for the app SP
 databricks.yml               — DABs: app + sql-warehouse resource
 ```
@@ -175,7 +184,7 @@ cd app/frontend && npm install && npm run dev   # http://localhost:3000
 To trend readiness over time, add a Lakebase instance in `databricks.yml`
 (`database_instances` + a `lakebase-db` app resource, see the commented block),
 set `USE_LAKEBASE=true` before `post_deploy.py`, and uncomment `PGHOST`/`PGDATABASE`
-in `app.yml.template`. The app creates its snapshot table on startup.
+in `app/app.yaml`. The app creates its snapshot table on startup.
 
 ## Branding for a customer
 

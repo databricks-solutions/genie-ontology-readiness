@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import deploy_settings as ds  # noqa: E402
 import post_deploy  # noqa: E402
 
-TEMPLATE = (ROOT / "app" / "app.yml.template").read_text()
+TEMPLATE = (ROOT / "app" / "app.yaml").read_text()
 
 # A rendered app.yml as a customer's earlier release would have written it.
 DEPLOYED_YML = """\
@@ -61,7 +61,7 @@ LAKEBASE_APP = {
 
 def _live(app=LAKEBASE_APP, yml=DEPLOYED_YML, readable=True):
     def read_text(path):
-        assert path == "/Workspace/Users/a@x/.genie/app/app.yml"
+        assert path.endswith(("/app.yaml", "/app.yml"))
         return yml if readable else None
     return ds.read_live(app, read_text)
 
@@ -92,9 +92,11 @@ def test_parse_env_keeps_explicit_empty_value():
 
 
 def test_template_keys_match_known_keys():
-    """Drift guard: every value key in the template must be a key this module resolves."""
+    """Drift guard: every value key in app.yaml must be a key this module resolves.
+
+    WAREHOUSE_ID and LAKEBASE_HOST are bound with valueFrom (resources), so they have no value line."""
     template_keys = set(ds.parse_env(TEMPLATE))
-    assert template_keys == set(ds.KEYS) - {"WAREHOUSE_ID"}
+    assert template_keys == set(ds.KEYS) - {"WAREHOUSE_ID", "LAKEBASE_HOST"}
 
 
 def test_read_resources_warehouse_and_lakebase():
@@ -239,7 +241,8 @@ def test_unreadable_app_yml_without_deployment_does_not_stop():
 def test_reset_ignores_deployed_and_skips_stops():
     values, problems = _values(explicit={"WAREHOUSE_ID": "wh-new"}, reset=True)
     assert problems == []
-    assert values["USE_LAKEBASE"] == ("false", ds.SOURCE_DEFAULT)
+    assert values["USE_LAKEBASE"] == ("auto", ds.SOURCE_DEFAULT)
+    assert ds.effective_lakebase(values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value) is False
     assert values["GENIE_SPACE_ID"] == ("", ds.SOURCE_DEFAULT)
     assert values["WAREHOUSE_ID"] == ("wh-new", ds.SOURCE_YOU)
 
@@ -627,3 +630,59 @@ def test_widgets_validate_release_and_staging():
     assert ds.validate_widgets(_widgets(release="v1; rm")) != []
     assert ds.validate_widgets(_widgets(staging_folder="/tmp/x")) != []
     assert ds.validate_widgets(_widgets(staging_folder="/Workspace/Users/a/x")) == []
+
+
+# --- auto, and the committed app.yaml ---------------------------------------------
+
+def test_effective_lakebase_auto_follows_instance():
+    assert ds.effective_lakebase("auto", "inst") is True
+    assert ds.effective_lakebase("auto", "") is False
+    assert ds.effective_lakebase("", "inst") is True
+    assert ds.effective_lakebase("true", "") is True
+    assert ds.effective_lakebase("false", "inst") is False
+
+
+def test_auto_deployed_with_resource_keeps_history_and_stops_only_on_change():
+    """A Git-deployed app has USE_LAKEBASE=auto and the lakebase-db resource. Reuse keeps it on."""
+    app = {"active_deployment": {"source_code_path": "/Workspace/x/app"},
+           "resources": [{"name": "lakebase-db",
+                          "database": {"instance_name": "shared-inst", "database_name": "history_db"}}]}
+    live = ds.read_live(app, lambda p: 'env:\n  - name: USE_LAKEBASE\n    value: "auto"\n')
+    values, problems = ds.plan({}, live, TEMPLATE, forced={"GOR_VERSION": "1"})
+    assert problems == []
+    assert values["USE_LAKEBASE"] == ("auto", ds.SOURCE_DEPLOYED)
+    _, problems = ds.plan({"USE_LAKEBASE": "false"}, live, TEMPLATE)
+    assert len(problems) == 1 and "turns Lakebase off" in problems[0]
+
+
+def test_read_live_falls_back_to_legacy_app_yml():
+    app = {"resources": [], "active_deployment": {"source_code_path": "/Workspace/x/app"}}
+    seen = []
+
+    def read_text(path):
+        seen.append(path)
+        return None if path.endswith("app.yaml") else DEPLOYED_YML
+    live = ds.read_live(app, read_text)
+    assert live["yml_readable"] is True and live["env"]["BRAND_NAME"] == "Acme"
+    assert seen == ["/Workspace/x/app/app.yaml", "/Workspace/x/app/app.yml"]
+
+
+def test_default_database_is_ontology_readiness():
+    values, _ = ds.plan({}, ds.read_live(None, lambda p: None), TEMPLATE)
+    assert values["LAKEBASE_DATABASE"] == ("ontology_readiness", ds.SOURCE_DEFAULT)
+
+
+def test_main_restores_committed_app_yaml_even_when_a_run_stops(tmp_path, monkeypatch):
+    """A CLI publish renders app/app.yaml. The committed text must come back, even on a stop."""
+    committed = 'env:\n  - name: BRAND_NAME\n    value: "Databricks"\n'
+    target = tmp_path / "app.yaml"
+    target.write_text(committed)
+    monkeypatch.setattr(post_deploy, "APP_CONFIG", target)
+
+    def rendered_then_stop():
+        target.write_text('env:\n  - name: BRAND_NAME\n    value: "Acme"\n')
+        raise SystemExit(1)
+    monkeypatch.setattr(post_deploy, "_main", rendered_then_stop)
+    with pytest.raises(SystemExit):
+        post_deploy.main()
+    assert target.read_text() == committed

@@ -10,7 +10,7 @@
 # MAGIC 1. Creates (or reuses) the Databricks App with the SQL warehouse resource and the `sql` user scope.
 # MAGIC 2. Grants the app service principal read access (system schemas + assessed catalogs).
 # MAGIC 3. Optionally provisions per-user history on an existing Lakebase instance.
-# MAGIC 4. Stages the `app/` source into your workspace folder and renders `app.yml`.
+# MAGIC 4. Stages the `app/` source into your workspace folder and renders `app.yaml`.
 # MAGIC 5. Deploys the app. The **frontend is built by the Databricks Apps runtime** (`npm ci && npm run build`), so nothing is built locally.
 # MAGIC
 # MAGIC **First install**
@@ -41,7 +41,7 @@
 # MAGIC - [ ] Optional: an existing **Lakebase** instance for per-user assessment/plan history.
 # MAGIC
 # MAGIC **Safety stops.** The notebook stops before it changes anything if: the deployed app's
-# MAGIC `app.yml` cannot be read, or this run would turn Lakebase history off or point it at a
+# MAGIC `app.yaml` cannot be read, or this run would turn Lakebase history off or point it at a
 # MAGIC different instance or database. Set `reset_settings` to `true` only to start fresh on purpose.
 
 # COMMAND ----------
@@ -85,10 +85,10 @@ from databricks.sdk.service.workspace import ExportFormat, ImportFormat
 
 def find_repo_root(start: Path) -> Path:
     for candidate in [start, *start.parents]:
-        if (candidate / "databricks.yml").exists() and (candidate / "app" / "app.yml.template").exists():
+        if (candidate / "databricks.yml").exists() and (candidate / "app" / "app.yaml").exists():
             return candidate
     raise RuntimeError(
-        "Could not find the repo root (databricks.yml + app/app.yml.template). "
+        "Could not find the repo root (databricks.yml + app/app.yaml). "
         "Run this notebook from inside the cloned genie-ontology-readiness Git folder."
     )
 
@@ -217,7 +217,7 @@ live = deploy_settings.read_live(app_before.as_dict() if app_before else None, r
 # are only passed when non-empty, because an empty widget means "reuse".
 explicit = deploy_settings.explicit_from_widgets(cfg)
 
-TEMPLATE_TEXT = (APP_SRC / "app.yml.template").read_text()
+TEMPLATE_TEXT = (APP_SRC / "app.yaml").read_text()  # the committed app config (never edited here)
 forced = {"GOR_VERSION": git_version() or "", "LAKEBASE_USER": live["sp"], "LAKEBASE_HOST": ""}
 values, problems = deploy_settings.plan(
     explicit, live, TEMPLATE_TEXT, forced=forced,
@@ -241,7 +241,7 @@ print("\n".join(deploy_settings.format_table(values)))
 if problems:
     raise RuntimeError("Stopped before any change:\n- " + "\n- ".join(problems))
 
-USE_LAKEBASE = values["USE_LAKEBASE"].value.strip().lower() == "true"
+USE_LAKEBASE = deploy_settings.effective_lakebase(values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value)
 cfg.update({
     "warehouse_id": values["WAREHOUSE_ID"].value,
     "assess_catalogs": values["ASSESS_CATALOGS"].value,
@@ -483,33 +483,24 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Stage the app source and render `app.yml`
+# MAGIC ## 4. Stage the app source and render `app.yaml`
 
 # COMMAND ----------
 
 step(f"Staging app source to {STAGE_DIR}")
 # The same folder is used on every run. Files are overwritten, not deleted first, and
-# app.yml is written last. So a failed run never leaves the deployed settings unreadable.
+# app.yaml is written last. So a failed run never leaves the deployed settings unreadable.
 shutil.copytree(
     APP_SRC,
     STAGE_DIR,
     dirs_exist_ok=True,
     ignore=shutil.ignore_patterns(
-        "node_modules", "dist", "__pycache__", "__tests__", ".pytest_cache", "test_*.py", "app.yml",
+        "node_modules", "dist", "__pycache__", "__tests__", ".pytest_cache", "test_*.py",
     ),
 )
 
-# The Apps runtime runs `npm install` + `npm run build` when the source root has
-# a package.json, so the React frontend is built server-side, not on a laptop.
-Path(STAGE_DIR, "package.json").write_text(
-    '{\n'
-    '  "name": "genie-ontology-readiness-app",\n'
-    '  "private": true,\n'
-    '  "scripts": {\n'
-    '    "build": "cd frontend && npm ci --no-audit --no-fund && npm run build"\n'
-    '  }\n'
-    '}\n'
-)
+# The committed app/package.json (build script) is copied with the source. The Apps runtime
+# runs `npm install` and `npm run build` from it, so the React frontend is built server-side.
 
 rendered = {name: setting.value for name, setting in values.items()}
 rendered.update({
@@ -519,9 +510,9 @@ rendered.update({
 })
 app_yml, missing = deploy_settings.render(TEMPLATE_TEXT, rendered)
 for name in missing:
-    print(f"  (warning) could not set {name} in app.yml; leaving template default")
-Path(STAGE_DIR, "app.yml").write_text(app_yml)
-print("  staged source and rendered app.yml")
+    print(f"  (warning) could not set {name} in app.yaml; leaving template default")
+Path(STAGE_DIR, "app.yaml").write_text(app_yml)
+print("  staged source and rendered app.yaml")
 
 # COMMAND ----------
 

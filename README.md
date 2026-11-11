@@ -45,98 +45,98 @@ guides, and the public Databricks accelerators that raise each pillar's score.
 
 ## Quick start
 
-Install and upgrade the app **inside your Databricks workspace**. You do not need Node.js,
-npm, the Databricks CLI, or Python on your laptop. The Databricks Apps runtime builds the
-frontend during the deploy. Use the notebook installer for both steps.
-
-The steps use the Git folder UI. See Databricks docs:
-[Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
+Deploy the app from this Git repo in the Databricks Apps UI. You do not need Node.js, npm,
+the Databricks CLI or Python on your laptop. The Apps runtime builds the frontend during the
+deploy. Docs: [Deploy a Databricks app](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/deploy)
+and [Add resources to a Databricks app](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/resources).
 
 ### First install
 
-1. In the workspace, click **Create** → **Git folder**. Paste this repo's URL:
-   `https://github.com/databricks-solutions/genie-ontology-readiness.git`. The default branch is fine.
-   Click **Create Git folder**. See
-   [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
-2. Open `notebooks/install.py` from the Git folder. Attach it to **Serverless** compute.
-3. Set the widgets at the top of the notebook:
-   - `warehouse_id`: empty uses the first SQL warehouse you can see. Or set your own id.
-   - `lakebase_instance_name` and `lakebase_database`: optional. They turn on per-user history.
-     Use an existing Lakebase instance. Leave them empty to run without history.
-   - `assess_catalogs` and `brand_name`: optional.
-4. Click **Run all**. The notebook first moves the Git folder to the latest release. If it
-   moved, it stops and says so. Click **Run all** again.
+1. **(Optional) Create a Lakebase database for history.** Use an existing Lakebase instance, and
+   create a database for this app. Skip this step to run without history.
+2. In the workspace, go to **Apps** → **+ Create app** → **Create a custom app**. Enter a name, for
+   example `genie-ontology-readiness`. Under **Configure Git**, enter the repo URL
+   `https://github.com/databricks-solutions/genie-ontology-readiness.git`. For **Git reference**,
+   enter the latest release tag from the
+   [Releases page](https://github.com/databricks-solutions/genie-ontology-readiness/releases),
+   for example `v1.3.0`.
+3. Click **+ Add resource** and add these:
+   - **SQL warehouse**: key `sql-warehouse`, permission **Can use**. Choose your warehouse.
+   - **Lakebase database** (only if you did step 1): key `lakebase-db`, permission **Can connect
+     and create**. Choose the instance and database from step 1.
+4. Click **Create**. Then click **Deploy**, select **From Git**, and set **Source code path** to
+   `app`. Click **Deploy**. Wait until the deployment finishes.
+5. Run the GRANT SQL below once, as a user who can grant on the `system` schemas and on your
+   catalogs. Replace `<app-service-principal-id>` with the app's service principal id. The app
+   shows this id, and the full SQL, at `/api/setup/grants`. Without these grants, some signals
+   show as not available. The app still runs.
+6. Optional: if your workspace offers user authorization, enable the `sql` user scope for the app.
 
-The notebook creates the app and its service principal first, then sets up history in the same
-run, so Lakebase does not need an extra run. The last cell shows the app link and a JSON result.
+```sql
+GRANT USE CATALOG ON CATALOG system TO `<app-service-principal-id>`;
+GRANT USE SCHEMA ON SCHEMA system.information_schema TO `<app-service-principal-id>`;
+GRANT SELECT ON SCHEMA system.information_schema TO `<app-service-principal-id>`;
+GRANT USE SCHEMA ON SCHEMA system.access TO `<app-service-principal-id>`;
+GRANT SELECT ON SCHEMA system.access TO `<app-service-principal-id>`;
+GRANT USE SCHEMA ON SCHEMA system.query TO `<app-service-principal-id>`;
+GRANT SELECT ON SCHEMA system.query TO `<app-service-principal-id>`;
+-- For each catalog you want assessed, run these three (replace <catalog>):
+GRANT USE CATALOG ON CATALOG `<catalog>` TO `<app-service-principal-id>`;
+GRANT USE SCHEMA ON CATALOG `<catalog>` TO `<app-service-principal-id>`;
+GRANT SELECT ON CATALOG `<catalog>` TO `<app-service-principal-id>`;
+```
+
+The defaults work. The app lets users pick the catalogs to assess. To change the catalogs, the
+brand, or the Genie space at deploy time, use the [advanced notebook or CLI path](#advanced-automated-install-notebook).
 
 ### Upgrade to a new release
 
-An upgrade keeps your settings and your history.
+Resources, history, and the app itself are not touched. Only the code changes.
 
-1. Open `notebooks/install.py` from the same Git folder you created for the first install.
-2. Leave **all widgets empty**. Click **Run all**.
-3. If the notebook says the Git folder moved, click **Run all** again.
+1. Open the app. Click the arrow next to **Deploy**, then **Deploy using a different source**.
+2. On the **From Git** tab, enter the new release tag, for example `v1.4.0`. Keep **Source code
+   path** as `app`.
+3. Click **Deploy**. Wait until the deployment finishes.
 
-The notebook finds the latest release, moves the Git folder there, and deploys it. It prints a table
-of each setting and its source (`you set`, `deployed app`, `new release`, `live`, or `default`).
-
-**Choose a version.** Set the `release` widget to a tag, for example `v1.3.0`. Use `current` to
-deploy the Git folder as it is, with no GitHub call. The default is `latest`. For a rollback, set
-`release` to the old tag, for example `v1.2.0`, and click **Run all** twice if the Git folder moves.
-
-**What is kept**
-
-- The history database on Lakebase, with past runs and plans. The upgrade does not drop it.
-  A schema change only adds columns.
-- Every setting. The warehouse, catalogs, Genie space, brand, and Lakebase instance and database
-  come from the deployed app.
-- A setting that the new release adds takes the release default.
-
-**Change one setting.** Fill in only that widget. Leave the others empty. For example, fill in
-`brand_name` only. To clear a value, use the CLI path below, which can set a value to empty.
-
-**Start fresh.** Set `reset_settings` to `true`. The notebook then ignores the deployed settings.
-Each widget you did not fill in uses the release default. If you do not set the Lakebase
-widgets, the app stops using its history. The old history stays in Lakebase.
-
-**The notebook stops before it changes anything if:**
-
-- The deployed app's `app.yml` cannot be read. The stop message names the folder. Ask a user
-  who can read it, or an admin, to run the upgrade.
-- This run would turn Lakebase history off.
-- This run would point the app at another Lakebase instance or database.
-
-If the Git folder cannot move (the notebook prints how), switch it by hand: open the Git folder,
-use the branch dropdown to select the tag, and click **Pull**.
+**Rollback.** Follow the same steps, and enter the old tag, for example `v1.3.0`.
 
 **Do not:**
 
-- Delete the app in the Apps page. Use the upgrade instead.
+- Delete the app. Upgrade it instead.
 - Drop the Lakebase history database.
-- Change `lakebase_database` unless you want a new, empty history. A new name starts a new
-  database, and the old history is not used.
+- Change the `lakebase-db` resource to another database, unless you want a new, empty history.
 
-**Run on demand as a job (optional).** You can run `notebooks/install.py` as a Databricks job
-task to redeploy on demand. Set the widgets as job parameters. Do not add a schedule that pulls
-new releases. Upgrades are a deliberate step.
+### Advanced: automated install (notebook)
 
-### Advanced: deploy from a terminal or CI
+Use this path to set the catalogs, the brand, the Genie space, or the reset option at deploy time,
+or to run the install as a job. It is optional. Steps:
+
+1. In the workspace, click **Create** → **Git folder**. Paste the repo URL. The default branch is
+   fine. See [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
+2. Open `notebooks/install.py` from the Git folder. Attach it to **Serverless** compute.
+3. Set the widgets and click **Run all**. The notebook moves the Git folder to the latest release
+   first. If it moved, click **Run all** again. Upgrades use the same steps. Leave the widgets empty
+   to keep your settings. To pick a version, set the `release` widget, for example `v1.2.0`, or
+   `current` to deploy the folder as it is.
+4. `reset_settings=true` starts fresh. A job can run the notebook with the widgets as parameters.
+   Do not add a schedule that pulls new releases.
+
+The notebook keeps every setting you did not fill in, and it stops before any change if the
+deployed app's settings cannot be read, or if the run would turn Lakebase history off or point it
+at another database.
+
+### Advanced: terminal or CI
 
 Use this path only if you already work with the Databricks CLI, or if a pipeline deploys the app.
-It needs Node.js for the frontend build, the Databricks CLI, and Python 3.9+. It uses the same
-settings and the same safety stops as the notebook.
-
-Clone the release from a terminal:
+It needs Node.js, the Databricks CLI, and Python 3.9+. It uses the same settings and stops.
 
 ```bash
 # Stable: the latest release (recommended)
 tag=$(gh release view --repo databricks-solutions/genie-ontology-readiness --json tagName -q .tagName)
 git clone --branch "$tag" https://github.com/databricks-solutions/genie-ontology-readiness.git
-# (no gh? use the Releases page above and: git clone --branch <tag> <repo-url>)
 ```
 
-**First install** (from the repo root):
+First install, from the repo root:
 
 ```bash
 # 1. Build the frontend
@@ -155,7 +155,10 @@ export LAKEBASE_DATABASE=ontology_readiness
 python3 scripts/post_deploy.py
 ```
 
-**Upgrade** (from the repo root, after you check out the new tag):
+If you use Lakebase, run the upgrade command below once more after the first install. The app's
+service principal id is known only after step 2 creates the app.
+
+Upgrade, from the repo root, after you check out the new tag:
 
 ```bash
 # 1. Get the new release
@@ -169,21 +172,15 @@ cd app/frontend && npm install && npm run build && cd ../..
 DATABRICKS_PROFILE=<p> TARGET=prod python3 scripts/post_deploy.py
 ```
 
-Use the same `TARGET` as the first install. Do not set `WAREHOUSE_ID` or any other setting. The
-script reuses each deployed value, the same as the notebook. To change one setting, set only that
-variable. An empty value clears it, for example `ASSESS_CATALOGS=`.
-
+- **Change one setting:** set only that variable. An empty value clears it, for example `ASSESS_CATALOGS=`.
 - **Start fresh:** `RESET_SETTINGS=true`. Each setting you do not set uses the release default.
-- **Infrastructure change** (the release notes say `databricks.yml` changed): `INFRA=true`. This
-  runs `bundle deploy`. It needs the bundle state of the first install. If you are not the user
-  who ran it, bind the app first with
-  `databricks bundle deployment bind ontology_readiness <app-name> -t prod`.
-- The script stops with a message before it changes anything, under the same conditions as the
-  notebook.
+- **Infrastructure change** (the release notes say `databricks.yml` changed): `INFRA=true`. This runs
+  `bundle deploy`. It needs the bundle state of the first install. If you are not the user who ran
+  it, bind the app first with `databricks bundle deployment bind ontology_readiness <app-name> -t prod`.
 
 The `-t <target>` selects the environment and fixes the app name (`dev` → `genie-ontology-readiness-dev`,
-`stg` → `…-stg`, `prod` → the bare `genie-ontology-readiness`). There is no `--var app_name`.
-Never run `bundle destroy`, and never drop the history database.
+`stg` → `…-stg`, `prod` → the bare `genie-ontology-readiness`). There is no `--var app_name`. Never run
+`bundle destroy`, and never drop the history database.
 
 ### Run the assessment without the app (Genie Code skill)
 
@@ -250,7 +247,7 @@ covered by the `sql` user scope) and Lakebase credential minting.
 > attempt OBO (Genie REST, Lakebase) are opted out with `force_sp=True`.
 >
 > **SP-only mode.** To disable OBO entirely at deploy time, set the `FORCE_SP=true`
-> env (in `app.yml`, or `export FORCE_SP=true` before `post_deploy.py`). Every read
+> env (in `app.yaml`, or `export FORCE_SP=true` before `post_deploy.py`). Every read
 > then runs as the app SP regardless of any forwarded viewer token — useful when you
 > want consistent, workspace-wide system-table signals (e.g. Adoption) that don't
 > vary by who's viewing. The SP must hold the grants below. Default is `false`.

@@ -1,0 +1,59 @@
+# App configuration for Databricks Apps. This file is committed and holds no workspace values.
+#
+# A Git deploy in the Apps UI uses it as-is. The notebook installer and the CLI script
+# write their values into a copy of it (the staged or published copy). They never change
+# this file in the repo.
+#
+# Resource keys: the valueFrom names below must match the resource keys you add in the Apps
+# UI ("+ Add resource"): sql-warehouse (SQL warehouse) and lakebase-db (Lakebase database).
+command:
+  - python
+  - app.py
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  # Lakebase host of the lakebase-db resource. Without that resource, history stays off.
+  - name: LAKEBASE_HOST
+    valueFrom: lakebase-db
+  # auto: history is on when a Lakebase host is attached. true or false force it.
+  - name: USE_LAKEBASE
+    value: "auto"
+  # Catalogs to assess (comma-separated). Empty = every non-system catalog the app can see.
+  - name: ASSESS_CATALOGS
+    value: ""
+  # Largest request body the app accepts, in bytes (2 MiB).
+  - name: MAX_REQUEST_BYTES
+    value: "2097152"
+  # Postgres TLS mode for the history database.
+  - name: LAKEBASE_SSL_MODE
+    value: "verify-full"
+  # Optional Genie agent for the live answer-quality test (pillar 5).
+  - name: GENIE_SPACE_ID
+    value: ""
+  # Workspace id for deep links. Empty = the id the Apps runtime injects.
+  - name: WORKSPACE_ID
+    value: ""
+  # Release version. Empty = app/VERSION, then git, then the fallback.
+  - name: GOR_VERSION
+    value: ""
+  # false: decline a Genie test with no viewer token, instead of answering as the app SP.
+  - name: GENIE_ALLOW_SP_FALLBACK
+    value: "false"
+  # Branding shown in the app header.
+  - name: BRAND_NAME
+    value: "Databricks"
+  # true: every read runs as the app service principal. false: viewer first, SP fallback.
+  - name: FORCE_SP
+    value: "false"
+  # Empty = the app's own service principal (DATABRICKS_CLIENT_ID).
+  - name: LAKEBASE_USER
+    value: ""
+  # Empty = the database of the lakebase-db resource, then ontology_readiness.
+  - name: LAKEBASE_DATABASE
+    value: ""
+  # Lakebase Autoscaling endpoint. Leave empty for Provisioned.
+  - name: LAKEBASE_ENDPOINT_NAME
+    value: ""
+  # Empty = the instance of the lakebase-db resource.
+  - name: LAKEBASE_INSTANCE_NAME
+    value: ""

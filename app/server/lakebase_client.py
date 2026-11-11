@@ -95,6 +95,35 @@ async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "")
         return None
 
 
+_RESOURCE: dict | None = None
+
+
+def _lakebase_resource() -> dict:
+    """The instance and database of this app's own ``lakebase-db`` resource (read once).
+
+    A Git deploy in the Apps UI sets no database or instance name, so they come from
+    the attached resource. Empty when not in a Databricks App or when the read fails.
+    Read as the app service principal. Holds no secret.
+    """
+    global _RESOURCE
+    if _RESOURCE is None:
+        found = {"instance": "", "database": ""}
+        app_name = os.environ.get("DATABRICKS_APP_NAME", "")
+        if app_name:
+            try:
+                from server.config import _get_workspace_client
+                app = _get_workspace_client().apps.get(app_name)
+                for resource in (app.resources or []):
+                    if resource.name == "lakebase-db" and resource.database:
+                        found = {"instance": resource.database.instance_name or "",
+                                 "database": resource.database.database_name or ""}
+            except Exception as e:
+                logger.warning(f"Could not read the lakebase-db resource ({type(e).__name__}); "
+                               "using the app settings and defaults")
+        _RESOURCE = found
+    return _RESOURCE
+
+
 def _get_connection_config() -> dict:
     """Read Lakebase connection config from environment variables.
 
@@ -107,8 +136,17 @@ def _get_connection_config() -> dict:
     """
     host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "localhost")
     port = int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432"))
-    database = os.environ.get("LAKEBASE_DATABASE") or os.environ.get("PGDATABASE", "ontology_readiness")
-    user = os.environ.get("LAKEBASE_USER") or os.environ.get("PGUSER", "")
+    from server.runtime_config import resolve_database, resolve_lakebase_user
+
+    database, database_source = resolve_database(
+        os.environ.get("LAKEBASE_DATABASE") or os.environ.get("PGDATABASE", ""),
+        _lakebase_resource()["database"] if not os.environ.get("LAKEBASE_DATABASE") else "",
+    )
+    user, user_source = resolve_lakebase_user(
+        os.environ.get("LAKEBASE_USER") or os.environ.get("PGUSER", ""),
+        os.environ.get("DATABRICKS_CLIENT_ID", ""),
+    )
+    logger.info(f"Lakebase database from {database_source}; Lakebase user from {user_source}")
 
     return {
         "host": host,
@@ -165,7 +203,12 @@ async def init_pool() -> None:
         # retain Provisioned instance credentials for existing deployments.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
             endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
-            instance = os.environ.get("LAKEBASE_INSTANCE_NAME", "")
+            from server.runtime_config import resolve_instance
+            instance, instance_source = resolve_instance(
+                os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
+                _lakebase_resource()["instance"] if not os.environ.get("LAKEBASE_INSTANCE_NAME") else "",
+            )
+            logger.info(f"Lakebase instance from {instance_source}")
             if endpoint or instance:
                 password = await _fetch_db_credential(
                     instance_name=instance,
