@@ -431,7 +431,11 @@ METRICS = _index({
 # ---------------------------------------------------------------------------
 # 5. Genie Agents (counted from the audit log)
 # ---------------------------------------------------------------------------
-GENIE_AUDIT_LOOKBACK_DAYS = 30
+# Total agents: every space with audit events over this full lookback (not trashed).
+GENIE_AUDIT_LOOKBACK_DAYS = 90
+# Active agents: those with an event in this shorter window. A stale agent is counted in
+# the total but is not active (#120).
+GENIE_ACTIVE_WINDOW_DAYS = 30
 GENIE_TOTAL_POINTS = 40
 GENIE_ACTIVE_POINTS = 40
 GENIE_SHARE_POINTS = 20
@@ -443,8 +447,9 @@ GENIE_AGENTS = _index({
         {
             "id": "audit_counts",
             "comment": (
-                "Genie Agents = spaces seen in the audit log over the last 30 days, minus any that were "
-                "trashed. active_30d = spaces with activity in the last 30 days."
+                f"Genie Agents = spaces seen in the audit log over the last {GENIE_AUDIT_LOOKBACK_DAYS} days, "
+                "minus any that were trashed. "
+                f"active_30d = spaces with activity in the last {GENIE_ACTIVE_WINDOW_DAYS} days."
             ),
             "sql": (
                 "SELECT COUNT(*) AS total,\n"
@@ -453,7 +458,7 @@ GENIE_AGENTS = _index({
                 "  SELECT request_params.space_id AS space_id,\n"
                 "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,\n"
                 "         MAX(CASE WHEN event_date >= current_date() - INTERVAL "
-                f"{GENIE_AUDIT_LOOKBACK_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d\n"
+                f"{GENIE_ACTIVE_WINDOW_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d\n"
                 "  FROM system.access.audit\n"
                 "  WHERE service_name = 'aibiGenie'\n"
                 "    AND request_params.space_id IS NOT NULL\n"
@@ -491,7 +496,7 @@ GENIE_AGENTS = _index({
             "id": "no_active_genie_agents",
             "when": "total > 0 and active_30d == 0",
             "text": ("{total} Genie Agent(s) exist but none were active in the last "
-                     f"{GENIE_AUDIT_LOOKBACK_DAYS} days — drive adoption or retire stale agents."),
+                     f"{GENIE_ACTIVE_WINDOW_DAYS} days — drive adoption or retire stale agents."),
         },
     ],
 })

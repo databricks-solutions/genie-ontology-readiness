@@ -280,7 +280,7 @@ and only reflects what one principal can see.
 **Signals**
 
 ```sql
--- Genie Agents = spaces seen in the audit log over the last 30 days, minus any that were trashed. active_30d = spaces with activity in the last 30 days.
+-- Genie Agents = spaces seen in the audit log over the last 90 days, minus any that were trashed. active_30d = spaces with activity in the last 30 days.
 SELECT COUNT(*) AS total,
        SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d
 FROM (
@@ -291,7 +291,7 @@ FROM (
   WHERE service_name = 'aibiGenie'
     AND request_params.space_id IS NOT NULL
     AND request_params.space_id <> 'new'
-    AND event_date >= current_date() - INTERVAL 30 DAYS
+    AND event_date >= current_date() - INTERVAL 90 DAYS
   GROUP BY request_params.space_id
 ) WHERE trashed = 0;
 ```
