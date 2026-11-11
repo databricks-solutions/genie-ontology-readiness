@@ -366,6 +366,44 @@ class GenieAgentsGoldenTest(unittest.TestCase):
         self.assertEqual(out["unavailable_reason"], "insufficient_permission")
 
 
+    def test_only_stale_agents(self):
+        # Every agent is older than 30 days: they exist but none is active. Counts the
+        # agents, scores 40 (total only), and raises the "none were active" gap.
+        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((2, 0)))
+        self.assertEqual(out["score"], 40.0)
+        self.assertEqual(out["gaps"], [
+            "2 Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.",
+        ])
+
+
+class GenieAuditSqlTest(unittest.TestCase):
+    """The spec's audit query, run on an in-memory audit table (DuckDB), counts a stale agent
+    as an agent but not as active (#120). Skipped when duckdb is not installed."""
+
+    def _audit_table(self):
+        try:
+            import duckdb
+        except ImportError:  # pragma: no cover - requirements-dev.txt installs it
+            self.skipTest("duckdb not installed")
+        con = duckdb.connect()
+        con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
+                    "request_params STRUCT(space_id VARCHAR), workspace_id BIGINT)")
+        con.execute("INSERT INTO audit VALUES "
+                    "(current_date() - 3, 'aibiGenie', 'queryAgent', {'space_id': 'fresh'}, 1), "
+                    "(current_date() - 60, 'aibiGenie', 'queryAgent', {'space_id': 'stale'}, 1), "
+                    "(current_date() - 5, 'aibiGenie', 'trashSpace', {'space_id': 'gone'}, 1), "
+                    "(current_date() - 2, 'aibiGenie', 'queryAgent', {'space_id': 'new'}, 1)")
+        return con
+
+    def test_stale_agent_is_counted_but_not_active(self):
+        con = self._audit_table()
+        sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
+        sql = sql.replace("system.access.audit", "audit").rstrip(";")
+        total, active = con.execute(sql).fetchone()
+        self.assertEqual(total, 2)    # fresh + stale; trashed and 'new' are not agents
+        self.assertEqual(active, 1)   # only fresh has events in the last 30 days
+
+
 class GenieAgentsParityTest(unittest.TestCase):
     """The App emits exactly the gaps the spec's rules select, with their ids, in order."""
 

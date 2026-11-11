@@ -45,6 +45,7 @@ from server.signal_spec import (
     METRICS,
     GENIE_AGENTS as GENIE_SPEC,
     GENIE_AUDIT_LOOKBACK_DAYS,
+    GENIE_ACTIVE_WINDOW_DAYS,
     GENIE_TOTAL_POINTS,
     GENIE_ACTIVE_POINTS,
     GENIE_SHARE_POINTS,
@@ -1208,7 +1209,7 @@ async def _genie_audit_counts() -> dict:
     https://docs.databricks.com/aws/en/ai-bi/admin/audit).
 
     Single bounded scan: prune the account-level audit table to the workspaces in
-    scope (the runtime filter) and the last 30 days, then group by space_id and
+    scope (the runtime filter) and the full lookback window, then group by space_id and
     derive per-space "trashed" and "active in last 30 days" flags in one pass. The
     bounds keep this probe below the app gateway's streaming timeout on large accounts.
     Returns total / active_30d (each None if the audit table isn't readable).
@@ -1259,7 +1260,7 @@ async def _genie_audit_rows() -> list[dict]:
             + ("any_value(workspace_id) AS workspace_id, " if multi else "") +
             "         COUNT(*) AS events, "
             "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            f"         MAX(CASE WHEN event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d "
+            f"         MAX(CASE WHEN event_date >= current_date() - INTERVAL {GENIE_ACTIVE_WINDOW_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
             "    AND request_params.space_id <> 'new' "
@@ -1292,7 +1293,7 @@ def _genie_audit_signals(audit: dict) -> list:
                     "detail": f"Distinct agents observed in this workspace's audit log ({_GENIE_AUDIT_LOOKBACK_DAYS}d)"})
     if audit.get("active_30d") is not None:
         sig.append({"label": label["active_30d"], "value": audit["active_30d"],
-                    "detail": "Distinct agents with activity in the last 30 days — audit log"})
+                    "detail": f"Distinct agents with activity in the last {GENIE_ACTIVE_WINDOW_DAYS} days — audit log"})
     return sig
 
 
