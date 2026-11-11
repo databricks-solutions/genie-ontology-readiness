@@ -68,7 +68,7 @@ The steps use the Git folder UI. See Databricks docs:
    moved, it stops and says so. Click **Run all** again.
 
 The notebook creates the app and its service principal first, then sets up history in the same
-run. The last cell shows the app link and a JSON result. You do not need a second run.
+run, so Lakebase does not need an extra run. The last cell shows the app link and a JSON result.
 
 ### Upgrade to a new release
 
