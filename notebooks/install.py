@@ -4,18 +4,24 @@
 # MAGIC
 # MAGIC Installs the Genie Ontology Readiness app into **this workspace** without a local
 # MAGIC terminal, Node.js, or the Databricks CLI. It does the same work as the
-# MAGIC `bundle deploy` + `scripts/post_deploy.py` flow in the README:
+# MAGIC `scripts/post_deploy.py` flow in the README:
 # MAGIC
+# MAGIC 0. Reads the deployed app (if any) and decides every setting. Widgets you fill in win. Empty widgets reuse the deployed value.
 # MAGIC 1. Creates (or reuses) the Databricks App with the SQL warehouse resource and the `sql` user scope.
-# MAGIC 2. Stages the `app/` source into your workspace folder and renders `app.yml`.
-# MAGIC 3. Grants the app service principal read access (system schemas + assessed catalogs).
-# MAGIC 4. Optionally provisions per-user history on an existing Lakebase instance.
+# MAGIC 2. Grants the app service principal read access (system schemas + assessed catalogs).
+# MAGIC 3. Optionally provisions per-user history on an existing Lakebase instance.
+# MAGIC 4. Stages the `app/` source into your workspace folder and renders `app.yml`.
 # MAGIC 5. Deploys the app. The **frontend is built by the Databricks Apps runtime** (`npm ci && npm run build`), so nothing is built locally.
 # MAGIC
-# MAGIC **How to use**
-# MAGIC 1. Clone this repo into the workspace as a **Git folder** (Workspace → Create → Git folder), ideally at the latest [release tag](https://github.com/databricks-solutions/genie-ontology-readiness/releases).
+# MAGIC **How to use: first install**
+# MAGIC 1. Clone this repo into the workspace as a **Git folder** (Workspace → Create → Git folder), at the latest [release tag](https://github.com/databricks-solutions/genie-ontology-readiness/releases).
 # MAGIC 2. Open this notebook from the Git folder and attach it to **Serverless** compute.
-# MAGIC 3. Fill in the widgets at the top (only `warehouse_id` matters; it defaults to the first warehouse you can see) and click **Run all**.
+# MAGIC 3. Fill in the widgets at the top (`warehouse_id` defaults to the first warehouse you can see) and click **Run all**.
+# MAGIC
+# MAGIC **How to use: upgrade to a new release**
+# MAGIC 1. In the Git folder, pull the new release tag (Git folder → **Pull** / switch to the new tag).
+# MAGIC 2. Open this notebook, leave the widgets **empty**, and click **Run all**. Your settings and the Lakebase history are kept.
+# MAGIC 3. To change one setting, fill in only its widget. To start fresh, set `reset_settings` to `true`.
 # MAGIC
 # MAGIC **Prerequisites**
 # MAGIC - [ ] **Databricks Apps** is enabled in this workspace.
@@ -24,7 +30,9 @@
 # MAGIC - [ ] Optional: **user authorization** (on-behalf-of-user, Public Preview) enabled by a workspace admin, so assessments run as the viewing user.
 # MAGIC - [ ] Optional: an existing **Lakebase** instance for per-user assessment/plan history.
 # MAGIC
-# MAGIC Re-running the notebook is safe: it reuses the app, re-stages the source, re-applies grants and redeploys.
+# MAGIC **Safety stops.** The notebook stops before it changes anything if: the deployed app's
+# MAGIC `app.yml` cannot be read, or this run would turn Lakebase history off or point it at a
+# MAGIC different instance or database. Set `reset_settings` to `true` only to start fresh on purpose.
 
 # COMMAND ----------
 
@@ -37,13 +45,15 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 dbutils.widgets.text("app_name", "genie-ontology-readiness", "App name")
-dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID (empty = first available)")
-dbutils.widgets.text("assess_catalogs", "", "Catalogs to assess (comma-separated, empty = all)")
-dbutils.widgets.text("genie_space_id", "", "Genie Agent ID for the answer test (optional)")
-dbutils.widgets.text("brand_name", "Databricks", "Brand name")
-dbutils.widgets.dropdown("force_sp", "false", ["false", "true"], "SP-only mode (FORCE_SP)")
-dbutils.widgets.text("lakebase_instance_name", "", "Existing Lakebase instance (optional)")
-dbutils.widgets.text("lakebase_database", "ontology_readiness", "Lakebase database")
+dbutils.widgets.text("warehouse_id", "", "SQL warehouse ID (empty = reuse, or first available)")
+dbutils.widgets.text("assess_catalogs", "", "Catalogs to assess (comma-separated, empty = reuse)")
+dbutils.widgets.text("genie_space_id", "", "Genie Agent ID for the answer test (empty = reuse)")
+dbutils.widgets.text("brand_name", "", "Brand name (empty = reuse, or Databricks)")
+dbutils.widgets.text("force_sp", "", "SP-only mode: true or false (empty = reuse)")
+dbutils.widgets.text("lakebase_instance_name", "", "Existing Lakebase instance (empty = reuse)")
+dbutils.widgets.text("lakebase_database", "", "Lakebase database (empty = reuse, or ontology_readiness)")
+dbutils.widgets.dropdown("reset_settings", "false", ["false", "true"],
+                         "Ignore the deployed settings (fresh start)")
 
 # COMMAND ----------
 
@@ -57,6 +67,7 @@ from pathlib import Path
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import apps as apps_svc
+from databricks.sdk.service.workspace import ExportFormat
 
 
 def find_repo_root(start: Path) -> Path:
@@ -79,12 +90,20 @@ sys.dont_write_bytecode = True  # Git folders reject __pycache__ writes
 sys.path.insert(0, str(APP_SRC))
 from server.user_agent import PRODUCT_NAME, git_version, resolve_version  # noqa: E402
 
+# The settings-reuse logic is shared with scripts/post_deploy.py (stdlib only).
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+import deploy_settings  # noqa: E402
+
 cfg = {name: dbutils.widgets.get(name).strip() for name in (
-    "app_name", "warehouse_id", "assess_catalogs", "genie_space_id",
-    "brand_name", "force_sp", "lakebase_instance_name", "lakebase_database",
+    "app_name", "warehouse_id", "assess_catalogs", "genie_space_id", "brand_name",
+    "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
 )}
 if not re.fullmatch(r"[a-z0-9-]{2,30}", cfg["app_name"]):
     raise ValueError("app_name must be 2-30 characters of lowercase letters, numbers and dashes.")
+if cfg["force_sp"] not in ("", "true", "false"):
+    raise ValueError("force_sp must be true, false, or empty (reuse the deployed value).")
+if cfg["reset_settings"] not in ("false", "true"):
+    raise ValueError("reset_settings must be false or true.")
 
 w = WorkspaceClient(product=PRODUCT_NAME, product_version=resolve_version())
 me = w.current_user.me().user_name
@@ -95,10 +114,97 @@ def step(message: str) -> None:
     print(f"\n==> {message}", flush=True)
 
 
+def get_app_or_none(name: str):
+    try:
+        return w.apps.get(name)
+    except Exception as e:
+        if "does not exist" in str(e).lower() or "not found" in str(e).lower():
+            return None
+        raise
+
+
 print(f"Repo root:    {REPO_ROOT}")
 print(f"Deploying as: {me}")
 print(f"App name:     {cfg['app_name']}")
 print(f"Staging dir:  {STAGE_DIR}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 0. Read the deployed app and decide every setting
+# MAGIC
+# MAGIC A widget that is not empty wins. An empty widget reuses the value the deployed app
+# MAGIC already has. A value that the deployed app does not have uses the release default.
+# MAGIC The table below shows each value and where it came from. Nothing is changed in this cell.
+
+# COMMAND ----------
+
+RESET = cfg["reset_settings"] == "true"
+app_before = get_app_or_none(cfg["app_name"])
+
+
+def read_workspace_text(path: str):
+    """Text of a workspace file, or None if it cannot be read."""
+    try:
+        return w.workspace.download(path, format=ExportFormat.RAW).read().decode("utf-8")
+    except Exception as e:
+        print(f"  could not read {path}: {str(e)[:150]}")
+        return None
+
+
+live = deploy_settings.read_live(app_before.as_dict() if app_before else None, read_workspace_text)
+
+# Widgets: a value that is not empty is "you set". force_sp, lakebase_instance_name etc.
+# are only passed when non-empty, because an empty widget means "reuse".
+explicit = {name: value for name, value in {
+    "WAREHOUSE_ID": cfg["warehouse_id"],
+    "ASSESS_CATALOGS": cfg["assess_catalogs"],
+    "GENIE_SPACE_ID": cfg["genie_space_id"],
+    "BRAND_NAME": cfg["brand_name"],
+    "FORCE_SP": cfg["force_sp"],
+    "LAKEBASE_INSTANCE_NAME": cfg["lakebase_instance_name"],
+    "LAKEBASE_DATABASE": cfg["lakebase_database"],
+}.items() if value}
+if cfg["lakebase_instance_name"]:
+    explicit["USE_LAKEBASE"] = "true"  # naming an instance turns history on, as before
+
+TEMPLATE_TEXT = (APP_SRC / "app.yml.template").read_text()
+forced = {"GOR_VERSION": git_version() or "", "LAKEBASE_USER": live["sp"], "LAKEBASE_HOST": ""}
+values, problems = deploy_settings.plan(
+    explicit, live, TEMPLATE_TEXT, forced=forced,
+    extra_defaults={"WORKSPACE_ID": str(w.get_workspace_id())}, reset=RESET,
+)
+
+if not values["WAREHOUSE_ID"].value:
+    warehouses = list(w.warehouses.list())
+    if not warehouses:
+        raise RuntimeError("No SQL warehouse found. Create one (or set the warehouse_id widget) and re-run.")
+    values["WAREHOUSE_ID"] = deploy_settings.Setting(warehouses[0].id, deploy_settings.SOURCE_DEFAULT)
+    print(f"warehouse_id not set; using '{warehouses[0].name}' ({warehouses[0].id})")
+
+if RESET:
+    print("reset_settings=true: ignoring the deployed app's settings. "
+          "Each setting you did not set uses the release default.")
+if app_before is None:
+    print("The app does not exist yet (first install). Settings you did not set use the release defaults.")
+print("\nSettings for this run (you set > deployed app > default):")
+print("\n".join(deploy_settings.format_table(values)))
+if problems:
+    raise RuntimeError("Stopped before any change:\n- " + "\n- ".join(problems))
+
+USE_LAKEBASE = values["USE_LAKEBASE"].value.strip().lower() == "true"
+cfg.update({
+    "warehouse_id": values["WAREHOUSE_ID"].value,
+    "assess_catalogs": values["ASSESS_CATALOGS"].value,
+    "genie_space_id": values["GENIE_SPACE_ID"].value,
+    "brand_name": values["BRAND_NAME"].value,
+    "force_sp": values["FORCE_SP"].value,
+    "lakebase_instance_name": values["LAKEBASE_INSTANCE_NAME"].value if USE_LAKEBASE else "",
+    "lakebase_database": values["LAKEBASE_DATABASE"].value,
+    "use_lakebase": USE_LAKEBASE,
+})
+if cfg["use_lakebase"] and not cfg["lakebase_instance_name"]:
+    raise ValueError("Lakebase history is on, but no Lakebase instance is set. Set lakebase_instance_name.")
 
 # COMMAND ----------
 
@@ -108,11 +214,7 @@ print(f"Staging dir:  {STAGE_DIR}")
 # COMMAND ----------
 
 if not cfg["warehouse_id"]:
-    warehouses = list(w.warehouses.list())
-    if not warehouses:
-        raise RuntimeError("No SQL warehouse found. Create one (or set the warehouse_id widget) and re-run.")
-    cfg["warehouse_id"] = warehouses[0].id
-    print(f"warehouse_id not set; using '{warehouses[0].name}' ({warehouses[0].id})")
+    raise RuntimeError("No SQL warehouse id. Set the warehouse_id widget.")
 w.warehouses.get(cfg["warehouse_id"])  # fail fast on a wrong id / missing CAN USE
 
 WAREHOUSE_RESOURCE = apps_svc.AppResource(
@@ -125,21 +227,13 @@ WAREHOUSE_RESOURCE = apps_svc.AppResource(
 APP_DESCRIPTION = "Genie Ontology Readiness — assess, learn, and plan"
 
 
-def get_app_or_none(name: str):
-    try:
-        return w.apps.get(name)
-    except Exception as e:
-        if "does not exist" in str(e).lower() or "not found" in str(e).lower():
-            return None
-        raise
-
-
-def set_app_resources(extra: list | None = None) -> apps_svc.App:
+def set_app_resources(extra: list | None = None, drop: tuple = ()) -> apps_svc.App:
     """Point the app at the warehouse (+ any extra resources) and (re)assert the
-    `sql` user scope. Other existing resources are preserved."""
+    `sql` user scope. Other existing resources are preserved, except `drop` names."""
     current = w.apps.get(cfg["app_name"])
     keep_names = {"sql-warehouse", *(r.name for r in (extra or []))}
-    resources = [r for r in (current.resources or []) if r.name not in keep_names]
+    resources = [r for r in (current.resources or [])
+                 if r.name not in keep_names and r.name not in drop]
     resources += [WAREHOUSE_RESOURCE, *(extra or [])]
     return w.apps.update(
         name=cfg["app_name"],
@@ -153,8 +247,7 @@ def set_app_resources(extra: list | None = None) -> apps_svc.App:
 
 
 step(f"Creating or reusing app '{cfg['app_name']}'")
-app = get_app_or_none(cfg["app_name"])
-if app is None:
+if app_before is None:
     app = w.apps.create_and_wait(
         app=apps_svc.App(
             name=cfg["app_name"],
@@ -166,7 +259,8 @@ if app is None:
     print("  created")
 else:
     print("  exists, reusing it")
-app = set_app_resources()
+# A Lakebase resource is attached in step 3 when history is on. Otherwise drop a stale one.
+app = set_app_resources(drop=() if cfg["use_lakebase"] else ("lakebase-db",))
 SP_CLIENT_ID = app.service_principal_client_id
 if not SP_CLIENT_ID:
     raise RuntimeError("The app has no service principal yet. Wait a minute and re-run.")
@@ -246,10 +340,10 @@ print(f"\n  {len(grant_results) - failed_grants} grants applied, {failed_grants}
 # MAGIC %md
 # MAGIC ## 3. (Optional) Per-user history on Lakebase
 # MAGIC
-# MAGIC Runs only when `lakebase_instance_name` is set. Creates a dedicated database on
-# MAGIC that **existing** instance, attaches it to the app as the `lakebase-db`
-# MAGIC resource, and grants the app service principal on it (mirrors
-# MAGIC `post_deploy.py`).
+# MAGIC Runs only when history is on (`lakebase_instance_name` is set, or the deployed app
+# MAGIC already uses history). Creates a dedicated database on that **existing** instance,
+# MAGIC attaches it to the app as the `lakebase-db` resource, and grants the app service
+# MAGIC principal on it (mirrors `post_deploy.py`). Creating a database that already exists is a no-op.
 
 # COMMAND ----------
 
@@ -299,7 +393,7 @@ async def lakebase_exec(host: str, database: str, statements: list[str]) -> None
         await conn.close()
 
 
-if cfg["lakebase_instance_name"]:
+if cfg["use_lakebase"]:
     instance_name, database = cfg["lakebase_instance_name"], cfg["lakebase_database"]
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", database):
         raise ValueError("lakebase_database must be a lowercase Postgres identifier (letters, digits, _).")
@@ -335,7 +429,7 @@ if cfg["lakebase_instance_name"]:
     ]))
     LAKEBASE.update(host=host, user=SP_CLIENT_ID)
 else:
-    print("lakebase_instance_name is empty; skipping Lakebase (the app runs stateless, no saved history).")
+    print("History is off for this run (the app runs stateless, with no saved history).")
 
 # COMMAND ----------
 
@@ -345,6 +439,7 @@ else:
 # COMMAND ----------
 
 step(f"Staging app source to {STAGE_DIR}")
+# The deployed app.yml was read in step 0, so this rewrite does not lose the settings.
 shutil.rmtree(STAGE_DIR, ignore_errors=True)
 shutil.copytree(
     APP_SRC,
@@ -366,32 +461,15 @@ Path(STAGE_DIR, "package.json").write_text(
     '}\n'
 )
 
-
-def set_env(text: str, name: str, value: str) -> str:
-    """Set `- name: <name>` / `value: "..."` in the app.yml template (as post_deploy.py)."""
-    pattern = rf'(- name: {name}\n\s+value: ")[^"]*(")'
-    new_text, n = re.subn(pattern, lambda m: m.group(1) + value.replace('"', '') + m.group(2), text)
-    if n == 0:
-        print(f"  (warning) could not set {name} in app.yml; leaving template default")
-    return new_text
-
-
-use_lakebase = bool(LAKEBASE["host"])
-app_yml = (APP_SRC / "app.yml.template").read_text()
-for name, value in {
-    "ASSESS_CATALOGS": cfg["assess_catalogs"],
-    "GENIE_SPACE_ID": cfg["genie_space_id"],
-    "WORKSPACE_ID": str(w.get_workspace_id()),
-    "GOR_VERSION": git_version() or "",
-    "BRAND_NAME": cfg["brand_name"] or "Databricks",
-    "FORCE_SP": cfg["force_sp"],
-    "USE_LAKEBASE": "true" if use_lakebase else "false",
+rendered = {name: setting.value for name, setting in values.items()}
+rendered.update({
+    "USE_LAKEBASE": "true" if cfg["use_lakebase"] else "false",
     "LAKEBASE_HOST": LAKEBASE["host"],
-    "LAKEBASE_USER": LAKEBASE["user"],
-    "LAKEBASE_DATABASE": cfg["lakebase_database"],
-    "LAKEBASE_INSTANCE_NAME": cfg["lakebase_instance_name"] if use_lakebase else "",
-}.items():
-    app_yml = set_env(app_yml, name, value)
+    "LAKEBASE_USER": LAKEBASE["user"] or values["LAKEBASE_USER"].value,
+})
+app_yml, missing = deploy_settings.render(TEMPLATE_TEXT, rendered)
+for name in missing:
+    print(f"  (warning) could not set {name} in app.yml; leaving template default")
 Path(STAGE_DIR, "app.yml").write_text(app_yml)
 print("  staged source and rendered app.yml")
 
@@ -425,5 +503,5 @@ displayHTML(
     f"<h3>Genie Ontology Readiness is deployed</h3>"
     f"<p>Open the app: <a href='{app.url}' target='_blank'>{app.url}</a></p>"
     f"<p>Service principal grants: {len(grant_results) - failed_grants} applied, {failed_grants} failed. "
-    f"Per-user history: {'enabled' if use_lakebase else 'disabled'}.</p>"
+    f"Per-user history: {'enabled' if cfg['use_lakebase'] else 'disabled'}.</p>"
 )

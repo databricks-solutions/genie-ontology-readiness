@@ -23,68 +23,38 @@ Bundles** + `post_deploy.py`.
 - **Node.js 18+** and **Python 3.11** with `pip install "databricks-sdk>=0.36.0"`.
 - A **SQL Warehouse** (its `id` is needed for assessment queries).
 
-## Deployment (3 commands)
+## Deployment
 
-No local tooling? Run [`notebooks/install.py`](notebooks/install.py) from a workspace
-Git folder on serverless instead: it does the same create/grant/render/deploy steps
-with the SDK, and the Databricks Apps runtime builds the frontend. See the README.
+Full steps are in the [README](./README.md): **First install**, **Upgrade to a new
+release**, and the notebook installer. In short, from the repository root:
 
-All commands run from the repository root.
+- **First install:** build the frontend, `databricks bundle deploy -t prod --profile <p>
+  --var="warehouse_id=<id>"`, then `DATABRICKS_PROFILE=<p> TARGET=prod WAREHOUSE_ID=<id>
+  python3 scripts/post_deploy.py`.
+- **Upgrade:** build the frontend, then `DATABRICKS_PROFILE=<p> TARGET=prod python3
+  scripts/post_deploy.py`. It reuses the deployed app's settings and Lakebase history.
+  It syncs `app/` to your own folder and runs `apps deploy`. It does not run `bundle deploy`.
+- **Infrastructure change** (`databricks.yml` changed): add `INFRA=true` to the upgrade
+  command. This runs `bundle deploy` with the reused warehouse id.
 
-### 1. Build the frontend
+The environment is a bundle **target** (`-t dev` default, `stg`, `prod`). Each target has
+a **fixed app name**: `dev` → `genie-ontology-readiness-dev`, `stg` → `…-stg`, `prod` → the
+bare `genie-ontology-readiness`. It is pinned per target in `databricks.yml`. There is no
+`--var app_name`. Keep `TARGET` equal to the `-t` value of the first install.
 
-```bash
-cd app/frontend && npm install && npm run build && cd ../..
-```
+`post_deploy.py` reads the deployed app first. Settings resolve in this order: the value you
+set (an env var that is set, even if empty) > the deployed app's value > the release default.
+It prints a table with each value and its source. It stops before any change if the
+deployed `app.yml` cannot be read, or if the run would turn Lakebase history off or point it at
+another instance or database. Set `RESET_SETTINGS=true` only to start fresh. The logic is in
+`scripts/deploy_settings.py`. Lakebase history is per user (keyed by the `X-Forwarded-Email`
+identity Databricks Apps inject) and survives redeploys. Never run `bundle destroy` or drop the
+history database.
 
-### 2. Deploy infrastructure (app + SQL warehouse resource)
-
-```bash
-databricks bundle deploy -t dev \
-  --profile <your-profile> \
-  --var="warehouse_id=<your_warehouse_id>"
-```
-
-Each environment is a **bundle target** with its own Terraform state and a
-**fixed app name** (`dev` → `genie-ontology-readiness-dev`, `stg` → `…-stg`,
-`prod` → the bare `genie-ontology-readiness`). Pick the environment with
-`-t <target>`; there is **no `--var app_name`** — the name is pinned per target
-in `databricks.yml` on purpose, so a deploy can't rename/destroy another env's
-app. For a clean production name, deploy `-t prod`. Routine redeploys of an
-existing app should use the non-destructive `databricks apps deploy <name>`;
-reserve `bundle deploy` for first-time create / infra changes.
-
-### 3. Post-deploy (render app.yml, grant SP read access, publish)
-
-```bash
-export DATABRICKS_PROFILE=<your-profile>
-export TARGET=dev   # dev (default) | stg | prod — must match the `-t` above;
-                    # the app name is derived from the target, don't set it here
-export WAREHOUSE_ID=<your_warehouse_id>
-# Per-user history (assessment runs + saved plans) — recommended:
-export USE_LAKEBASE=true
-export LAKEBASE_INSTANCE_NAME=<your-instance>   # an existing Lakebase instance to reuse (leave unset to skip history)
-export LAKEBASE_DATABASE=ontology_readiness     # a dedicated DB created on that instance
-# Optional:
-# export ASSESS_CATALOGS="sales,finance"     # restrict scope (default: all non-system catalogs)
-# export GENIE_SPACE_ID=<id>                  # enable the live Genie answer test (pillar 5)
-# export BRAND_NAME="Acme"                    # header branding
-# export FORCE_SP=true                        # SP-only mode: never attempt OBO, run every read as the app SP
-
-python3 scripts/post_deploy.py   # requires: pip install "databricks-sdk>=0.36.0" asyncpg
-```
-
-`post_deploy.py` renders `app/app.yml`, grants the **app service principal** read
-access (system schemas + assessed catalogs), and republishes the app. When
-`USE_LAKEBASE=true` it also creates the app's Postgres database on the shared
-Lakebase instance, attaches the `lakebase-db` app resource, and pins the
-connection env. Assessment history and generated plans are then persisted
-**per user** (keyed by the `X-Forwarded-Email` identity Databricks Apps inject)
-and survive across sessions. Scores are a deterministic function of the technical
-findings, so repeated runs on the same workspace are directly comparable **for a
-given identity**. Under OBO the findings reflect the viewing user's grants, so
-signals gated behind grants a viewer lacks (notably the workspace-wide Adoption
-system tables) can read lower for a restricted viewer than for the SP — use
+Scores are a deterministic function of the technical findings, so repeated runs on the same
+workspace are directly comparable **for a given identity**. Under OBO the findings reflect the
+viewing user's grants, so signals gated behind grants a viewer lacks (notably the workspace-wide
+Adoption system tables) can read lower for a restricted viewer than for the SP — use
 `FORCE_SP=true` when you need a single, viewer-independent workspace-wide score.
 
 ## Auth: on-behalf-of-user by default, service-principal fallback

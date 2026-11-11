@@ -60,20 +60,120 @@ git clone --branch "$tag" https://github.com/databricks-solutions/genie-ontology
 git clone https://github.com/databricks-solutions/genie-ontology-readiness.git
 ```
 
-Then build and deploy:
+### First install
+
+Clone the release (see **Get the code** above). Run these steps from the repo root. Use the
+same target (`prod` here) for every release. `-t prod` gives the app the name
+`genie-ontology-readiness`.
 
 ```bash
+# 1. Build the frontend
 cd app/frontend && npm install && npm run build && cd ../..
-databricks bundle deploy -t dev --profile <p> --var="warehouse_id=<id>"
-DATABRICKS_PROFILE=<p> TARGET=dev WAREHOUSE_ID=<id> python3 scripts/post_deploy.py
+
+# 2. Create the app and its SQL warehouse resource
+databricks bundle deploy -t prod --profile <p> --var="warehouse_id=<id>"
+
+# 3. Grant the app read access, set up history, and deploy the app
+export DATABRICKS_PROFILE=<p>
+export TARGET=prod
+export WAREHOUSE_ID=<id>
+export USE_LAKEBASE=true                        # optional: per-user history
+export LAKEBASE_INSTANCE_NAME=<instance>        # an existing Lakebase instance
+export LAKEBASE_DATABASE=ontology_readiness
+python3 scripts/post_deploy.py
 ```
+
+If you use Lakebase, run the upgrade command below once more after the first install. The
+app's service principal id is known only after step 2 creates the app. The second run
+finishes the Lakebase grants.
+
+### Upgrade to a new release
+
+An upgrade keeps your settings and your history. Run these steps from the repo folder you
+cloned for the first install.
+
+```bash
+# 1. Get the new release
+git fetch --tags origin
+git checkout "$(gh release view --repo databricks-solutions/genie-ontology-readiness --json tagName -q .tagName)"
+
+# 2. Build the frontend
+cd app/frontend && npm install && npm run build && cd ../..
+
+# 3. Upgrade the app in place
+DATABRICKS_PROFILE=<p> TARGET=prod python3 scripts/post_deploy.py
+```
+
+Use the same `TARGET` as the first install. Do not set `WAREHOUSE_ID` or any other
+setting. The script reuses each deployed value. It prints a table. The table shows each
+setting and its source: `you set`, `deployed app`, `new release`, `live`, or `default`.
+
+The upgrade does not run `bundle deploy`. It copies `app/` to your own folder,
+`/Workspace/Users/<you>/.genie-ontology-readiness/<app>`, and deploys it there. You do not
+need the bundle state of whoever ran the first install. You do need to read the deployed
+app's source folder, because that is where its settings are. If another user ran the first
+install, ask that user or an admin to run the upgrade. If you cannot read the folder, the
+script stops before any change.
+
+**What is kept**
+
+- The history database on Lakebase, with past runs and plans. The upgrade does not drop
+  it. A schema change only adds columns.
+- Every setting you did not set. This includes the warehouse, the catalogs, the Genie space,
+  the brand, `FORCE_SP`, `GENIE_ALLOW_SP_FALLBACK`, `MAX_REQUEST_BYTES`, and the Lakebase
+  instance and database.
+- A key that the new release adds takes the release default.
+
+**Change one setting.** Set only that variable. Set it to an empty value to clear it.
+
+```bash
+DATABRICKS_PROFILE=<p> TARGET=prod BRAND_NAME="Acme" python3 scripts/post_deploy.py
+DATABRICKS_PROFILE=<p> TARGET=prod ASSESS_CATALOGS= python3 scripts/post_deploy.py
+```
+
+**Start fresh.** Set `RESET_SETTINGS=true`. The script then ignores the deployed settings.
+Each setting you do not set uses the release default. If you do not set Lakebase again, the app
+stops using its history. The old history stays in Lakebase.
+
+```bash
+DATABRICKS_PROFILE=<p> TARGET=prod RESET_SETTINGS=true WAREHOUSE_ID=<id> python3 scripts/post_deploy.py
+```
+
+**The script stops before it changes anything if:**
+
+- The deployed `app.yml` cannot be read.
+- This run would turn Lakebase history off.
+- This run would point the app at another Lakebase instance or database.
+
+Fix the setting, or set `RESET_SETTINGS=true` if you want that change on purpose.
+
+**Infrastructure changes.** If the release notes say `databricks.yml` changed, run the
+upgrade with `INFRA=true`. This runs `bundle deploy` with the reused warehouse id.
+
+```bash
+INFRA=true DATABRICKS_PROFILE=<p> TARGET=prod python3 scripts/post_deploy.py
+```
+
+`INFRA=true` needs the bundle state of the first install. If you are not the user who ran
+it, bind the app to your bundle first:
+
+```bash
+databricks bundle deployment bind ontology_readiness <app-name> -t prod
+```
+
+**Roll back.** Check out the previous release tag. Then run the upgrade command again. A
+schema change only adds columns, so the previous release can still read the history.
+
+**Do not:**
+
+- Run `bundle destroy`.
+- Drop the history database.
+- Run `bundle deploy` by hand for an upgrade without `INFRA=true`.
 
 The `-t <target>` selects the environment and fixes the app name (`dev`, the
 default → `genie-ontology-readiness-dev`, `stg` → `…-stg`, `prod` → the bare
-`genie-ontology-readiness`). There is no `--var app_name` — the name is pinned
-per target so a deploy can never rename or delete another environment's app. Keep
-`TARGET` in step 2 matching the `-t` in step 1. **For a production install**, use
-`-t prod` (with `TARGET=prod`) to get the unsuffixed `genie-ontology-readiness`.
+`genie-ontology-readiness`). There is no `--var app_name`. The name is pinned
+per target, so a deploy can never rename or delete another environment's app.
 
 See **[CLAUDE.md](./CLAUDE.md)** for prerequisites, the service-principal grants the
 assessment needs, local development, optional Lakebase history, and branding.
@@ -97,6 +197,10 @@ Databricks Apps runtime during deployment, so nothing is built on your machine. 
 staged source lives in `/Workspace/Users/<you>/.genie-ontology-readiness/<app_name>`.
 The app name is a widget (default `genie-ontology-readiness`), so use a different name
 than any app you manage with `bundle deploy` to keep the two flows separate.
+
+**Upgrade:** pull the Git folder to the new release tag, leave the widgets empty, and click
+**Run all**. The notebook reads the deployed app's settings and keeps them. Fill in one widget
+to change one setting. Set `reset_settings` to `true` only to start fresh.
 
 ### Run the assessment without the app (Genie Code skill)
 
