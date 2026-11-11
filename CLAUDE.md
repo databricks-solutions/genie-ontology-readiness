@@ -42,6 +42,7 @@ default. They print a table of settings and sources. They stop before any change
 config cannot be read, or if the run would turn Lakebase history off or point it at another instance
 or database. `RESET_SETTINGS=true` starts fresh. The logic is in `scripts/deploy_settings.py`.
 
+The history tables live in `public` for existing installs, and in schema `genie_ontology_readiness` for a new database (chosen at startup in `app/server/history_schema.py`). A Lakebase error at startup turns history off; the app still runs.
 Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps inject) and
 survives redeploys. Never run `bundle destroy`, and never drop the history database.
 

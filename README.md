@@ -65,7 +65,7 @@ and [Add resources to a Databricks app](https://docs.databricks.com/aws/en/dev-t
    - **Lakebase database** (only if you did step 1): key `lakebase-db`, permission **Can connect
      and create**. Choose the instance and database from step 1.
 4. Click **Create**. Then click **Deploy**, select **From Git**, and set **Source code path** to
-   `app`. Click **Deploy**. Wait until the deployment finishes.
+   `app`. Click **Deploy**. Wait until the deployment finishes. Then check that the app status shows **Running**. A deployment can succeed while the app fails to start, so do not stop at "succeeded".
 5. Run the GRANT SQL below once, as a user who can grant on the `system` schemas and on your
    catalogs. Replace `<app-service-principal-id>` with the app's service principal id. The app
    shows this id, and the full SQL, at `/api/setup/grants`. Without these grants, some signals
@@ -91,12 +91,12 @@ brand, or the Genie space at deploy time, use the [advanced notebook or CLI path
 
 ### Upgrade to a new release
 
-Resources, history, and the app itself are not touched. Only the code changes.
+Resources, history, and the app itself are not touched. Only the code changes. No Postgres grant step is needed. The app creates its own history schema on a new database. If Lakebase history cannot start, the app still runs without history, and the status still shows **Running**.
 
 1. Open the app. Click the arrow next to **Deploy**, then **Deploy using a different source**.
 2. On the **From Git** tab, enter the new release tag, for example `v1.4.0`. Keep **Source code
    path** as `app`.
-3. Click **Deploy**. Wait until the deployment finishes.
+3. Click **Deploy**. Wait until the deployment finishes. Then check that the app status shows **Running**. A deployment can succeed while the app fails to start.
 
 **Rollback.** Follow the same steps, and enter the old tag, for example `v1.3.0`.
 

@@ -10,6 +10,7 @@ import aiohttp
 from typing import Optional
 
 from server.user_agent import with_ua
+from server.history_schema import LEGACY_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -138,13 +139,20 @@ def _get_connection_config() -> dict:
     port = int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432"))
     from server.runtime_config import resolve_database, resolve_lakebase_user
 
+    # Labels say where a value came from. PGDATABASE and PGUSER are what Apps injects for
+    # an attached database resource, so they are labelled "database resource".
+    app_db, pg_db = os.environ.get("LAKEBASE_DATABASE", ""), os.environ.get("PGDATABASE", "")
     database, database_source = resolve_database(
-        os.environ.get("LAKEBASE_DATABASE") or os.environ.get("PGDATABASE", ""),
-        _lakebase_resource()["database"] if not os.environ.get("LAKEBASE_DATABASE") else "",
+        app_db or pg_db,
+        "" if (app_db or pg_db) else _lakebase_resource()["database"],
+        env_label="app setting" if app_db else "database resource",
+        injected_label="lakebase-db resource lookup",
     )
+    app_user, pg_user = os.environ.get("LAKEBASE_USER", ""), os.environ.get("PGUSER", "")
     user, user_source = resolve_lakebase_user(
-        os.environ.get("LAKEBASE_USER") or os.environ.get("PGUSER", ""),
+        app_user or pg_user,
         os.environ.get("DATABRICKS_CLIENT_ID", ""),
+        env_label="app setting" if app_user else "database resource",
     )
     logger.info(f"Lakebase database from {database_source}; Lakebase user from {user_source}")
 
@@ -287,6 +295,67 @@ async def get_pool():
     """Get the connection pool, refreshing the token if needed. Returns None if unavailable."""
     await _refresh_pool_if_needed()
     return _pool
+
+
+# The schema the history tables live in. Chosen once at startup (see prepare_history_schema).
+_HISTORY_SCHEMA = LEGACY_SCHEMA
+
+
+def history_table(table: str) -> str:
+    """The schema-qualified name of a history table, in the schema chosen at startup."""
+    from server.history_schema import qualified_table
+    return qualified_table(_HISTORY_SCHEMA, table)
+
+
+async def prepare_history_schema() -> str:
+    """Choose the history schema and create it if it is new. Returns the schema name.
+
+    Existing tables in public are kept (their history is already there). A new database
+    gets its own schema, because the app's service principal may lack CREATE on public."""
+    global _HISTORY_SCHEMA
+    from server.history_schema import (HISTORY_SCHEMA, HISTORY_TABLES, choose_history_schema,
+                                       legacy_probe_sql, quote_ident)
+    pool = await get_pool()
+    if pool is None:
+        raise RuntimeError("Lakebase pool is not available")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(legacy_probe_sql())
+        schema, reason = choose_history_schema(HISTORY_TABLES if (row and row["legacy_present"]) else [])
+        if schema != LEGACY_SCHEMA:
+            await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {quote_ident(HISTORY_SCHEMA)}")
+    _HISTORY_SCHEMA = schema
+    logger.info(f"Lakebase history schema: {schema} ({reason})")
+    return schema
+
+
+async def start_history() -> bool:
+    """Start Lakebase history. Never raises: any failure leaves history off and the app running.
+
+    Returns True when history is ready. Called at startup, so an error here must not stop
+    the app from starting (the UI must still load)."""
+    from server.config import USE_LAKEBASE
+    if not USE_LAKEBASE:
+        return False
+    try:
+        await init_pool()
+        if not is_available():
+            logger.warning("Lakebase pool unavailable — history/plans disabled")
+            return False
+        await prepare_history_schema()
+        from server.snapshots import ensure_table as ensure_snapshots
+        from server.plans import ensure_table as ensure_plans
+        await ensure_snapshots()
+        await ensure_plans()
+        logger.info("Lakebase pool ready — assessment history + plans enabled")
+        return True
+    except Exception as e:
+        logger.warning(f"Lakebase history is off: startup failed ({type(e).__name__}). "
+                       "The app runs without history. Check the grants and the database.")
+        try:
+            await close_pool()
+        except Exception:
+            pass
+        return False
 
 
 async def execute_query(query: str, params: Optional[list] = None) -> list[dict]:

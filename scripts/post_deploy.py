@@ -347,25 +347,33 @@ def _grant_history():
     user_email = _LAKEBASE.get("user_email", "")
     if not (host and sp):
         return
-    grants = [
-        f'GRANT USAGE, CREATE ON SCHEMA public TO "{sp}"',
-        f'GRANT ALL ON ALL TABLES IN SCHEMA public TO "{sp}"',
-        f'GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO "{sp}"',
-        f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "{sp}"',
-        f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "{sp}"',
-    ]
+    # public: existing installs keep their tables there. genie_ontology_readiness: a new
+    # database gets its own schema (the app creates it). Each statement runs on its own, so a
+    # schema that does not exist yet does not stop the others.
+    grants = []
+    for schema in ("public", "genie_ontology_readiness"):
+        grants += [
+            f'GRANT USAGE, CREATE ON SCHEMA {schema} TO "{sp}"',
+            f'GRANT ALL ON ALL TABLES IN SCHEMA {schema} TO "{sp}"',
+            f'GRANT ALL ON ALL SEQUENCES IN SCHEMA {schema} TO "{sp}"',
+            f'ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL ON TABLES TO "{sp}"',
+            f'ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL ON SEQUENCES TO "{sp}"',
+        ]
 
     async def _grant():
         import asyncpg
         token = _credential(LAKEBASE_INSTANCE)
         conn = await asyncpg.connect(host=host, port=5432, database=LAKEBASE_DATABASE,
                                      user=user_email, password=token, ssl=_lakebase_ssl())
+        done = 0
         try:
             for g in grants:
-                await conn.execute(g)
-            print(f"  granted schema + table + sequence privileges to app SP ({sp[:12]}...)")
-        except Exception as e:
-            print(f"  WARNING: grant skipped ({str(e)[:120]})")
+                try:
+                    await conn.execute(g)
+                    done += 1
+                except Exception as e:
+                    print(f"  skipped: {g.split(' TO ')[0]} ({str(e)[:80]})")
+            print(f"  granted {done} of {len(grants)} history privileges to app SP ({sp[:12]}...)")
         finally:
             await conn.close()
     try:

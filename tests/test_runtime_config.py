@@ -15,7 +15,7 @@ from server import user_agent  # noqa: E402
 
 
 def test_lakebase_user_falls_back_to_app_client_id():
-    assert rc.resolve_lakebase_user("", "sp-client") == ("sp-client", "runtime")
+    assert rc.resolve_lakebase_user("", "sp-client") == ("sp-client", "runtime (client id)")
     assert rc.resolve_lakebase_user("explicit", "sp-client") == ("explicit", "app setting")
 
 
