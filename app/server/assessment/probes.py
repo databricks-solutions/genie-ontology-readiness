@@ -400,7 +400,7 @@ def _src(view: str, sources: dict) -> str | None:
     return f"({union}) AS _t"
 
 
-def _internal_catalog_filter(sources: dict) -> str:
+def _internal_catalog_filter(sources: dict, column: str = "table_catalog") -> str:
     """Extra WHERE clause to exclude internal catalogs when grouping by
     ``table_catalog`` over the metastore-wide system view — the named internal
     catalogs plus any ``__``-prefixed system catalog (e.g. Databricks-internal
@@ -409,7 +409,7 @@ def _internal_catalog_filter(sources: dict) -> str:
     if not sources.get("system_ok"):
         return ""
     in_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-    return f"AND table_catalog NOT IN ({in_list}) AND table_catalog NOT RLIKE '^__' "
+    return f"AND {column} NOT IN ({in_list}) AND {column} NOT RLIKE '^__' "
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +684,20 @@ async def _column_coverage_chunked(
     return c_total, c_commented, per_schema
 
 
+def tagged_tables_sql(source: str, where: str) -> str:
+    """Distinct tables carrying >=1 governed tag, counted by fully-qualified name (#92).
+
+    Counting bare ``table_name`` collapses same-named tables in different schemas or
+    catalogs (``sales.dim_customer`` vs ``finance.dim_customer``) into one. The FQN
+    form matches the Domains pillar's tagged counts and the skill's
+    ``references/pillar-signals.md`` (keep the two in lockstep).
+    """
+    return (
+        "SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
+        f"FROM {source} WHERE {where}"
+    )
+
+
 async def probe_metadata() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
@@ -746,9 +760,11 @@ async def probe_metadata() -> dict:
         tt = _src("table_tags", s)
         if tt is not None:
             try:
-                tagged_tables = await _scalar(
-                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
-                )
+                # Same population as the table-comment scan above: in system mode, drop
+                # internal catalogs (system/__databricks_internal/...) so their tags
+                # don't count — matches the skill's source-resolution rule.
+                tag_where = _schema_sql(s, "schema_name") + " " + _internal_catalog_filter(s, "catalog_name")
+                tagged_tables = await _scalar(tagged_tables_sql(tt, tag_where.strip()))
             except Exception:
                 tagged_tables = None
 
