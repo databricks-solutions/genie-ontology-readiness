@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
 from server import snapshots
+from server.scope import scope_hash
 from server.assessment.scoring import run_assessment_stream
 from server.config import MAX_RUN_SECONDS as CONFIG_MAX_RUN_SECONDS, set_user_token
 from server.security import safe_error
@@ -59,6 +60,8 @@ class AssessmentRun:
     finished_at: Optional[float] = None
     events: list[dict] = field(default_factory=list)
     task: Optional[asyncio.Task] = None
+    # Normalized request scope (server.scope), saved with the snapshot (#89).
+    scope: Optional[dict] = None
     # UI runs replace each other (one at a time per user). Legacy one-request
     # streams are not exclusive: they never replace, and are never replaced.
     exclusive: bool = True
@@ -178,6 +181,7 @@ def start_run(
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
     replace_existing: bool = True,
+    scope: Optional[dict] = None,
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
@@ -192,7 +196,7 @@ def start_run(
             if other.principal == principal and other.exclusive and not other.done:
                 _cancel(other, "replaced by a new run")
 
-    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=replace_existing)
+    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=replace_existing, scope=scope)
     _runs[run.id] = run
     run.task = asyncio.create_task(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
@@ -218,7 +222,7 @@ async def _drive(
     try:
         async for event in run_assessment_stream():
             if event.get("type") == "complete":
-                await _save_snapshot(event, run.principal)
+                await _save_snapshot(event, run.principal, run.scope)
             run.append(event)
     except asyncio.CancelledError:
         run.append(_error_event(run, "The assessment was cancelled.", reason="cancelled"))
@@ -233,10 +237,12 @@ async def _drive(
         run.finish()
 
 
-async def _save_snapshot(event: dict, principal: str) -> None:
+async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:
     scorecard = {"overall": event["overall"], "pillars": event["pillars"], "top_gaps": event["top_gaps"]}
+    event["scope"] = scope
+    event["scope_hash"] = scope_hash(scope)
     try:
-        sid = await snapshots.save_snapshot(scorecard, created_by=principal)
+        sid = await snapshots.save_snapshot(scorecard, created_by=principal, scope=scope)
         event["snapshot_id"] = sid
         event["snapshot_saved"] = sid is not None
     except Exception as e:

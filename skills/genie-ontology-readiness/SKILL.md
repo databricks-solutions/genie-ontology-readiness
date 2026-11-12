@@ -106,6 +106,9 @@ the internal-catalog filter on the right catalog column — see above — or the
 per-catalog UNION). `n_catalogs` = the number of user (non-internal) catalogs in
 scope. Validated live against a metastore-wide `system` source; per-catalog union
 mode is scoped to its enumerated catalogs so it needs no internal-catalog filter.
+**`<CATALOG_BATCH>`** is one batch of those in-scope catalogs, as quoted names
+(`'a', 'b', ...`); the column scan runs once per batch (see the Metadata pillar), and
+because a batch holds only user catalogs it needs no internal-catalog filter either.
 
 The `system.*` pillars (Genie Agents, Adoption, and the "top accessed certified"
 signal) always read the account-level system tables directly — they don't use

@@ -84,11 +84,13 @@ SELECT COUNT(*) AS total,
        SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
 FROM <TABLES> WHERE table_schema <> 'information_schema';
 
--- column comment coverage (heaviest read; on a wide metastore, scan in
--- per-catalog batches and sum, rather than one metastore-wide query that times out)
-SELECT COUNT(*) AS total,
+-- column comment coverage: the heaviest read. Run it once per BATCH of
+-- catalogs and add the results up (see "Running column_comments" below).
+SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total,
        SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
-FROM <COLUMNS> WHERE table_schema <> 'information_schema';
+FROM <COLUMNS>
+WHERE table_catalog IN (<CATALOG_BATCH>) AND table_schema <> 'information_schema'
+GROUP BY table_catalog, table_schema;
 
 -- governed-tag reach (best-effort; treat failure as unknown). Count by
 -- fully-qualified name so same-named tables in different schemas/catalogs
@@ -96,6 +98,17 @@ FROM <COLUMNS> WHERE table_schema <> 'information_schema';
 SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS tagged_tables
 FROM <TABLE_TAGS> WHERE schema_name <> 'information_schema';
 ```
+
+**Running `column_comments`:**
+
+1. **Never** run this as one query over the whole metastore: on a large estate it runs for many minutes and times out.
+2. Take the catalogs in scope (the non-internal catalogs from Source resolution, or the catalogs the user asked for) and count their tables in one query: `SELECT lower(table_catalog) AS cat, COUNT(*) AS n FROM <TABLES> WHERE table_schema <> 'information_schema' GROUP BY 1`. Skip catalogs with no tables.
+3. Pack the catalogs into batches by table count: a catalog with more than **5,000** tables is a batch on its own; put the others together until the next one would take the batch past 5,000 tables (in per-catalog mode, also stop at 25 catalogs). **Every catalog goes into exactly one batch and is named in that batch's `IN (...)` list. Never use `NOT IN` to cover "the rest"**: that is an unbounded scan of the whole metastore.
+4. Run the query once per batch, with `<CATALOG_BATCH>` set to that batch's catalog names, quoted and in **lower case** (`table_catalog` is stored in lower case). In per-catalog mode, build `<COLUMNS>` from only that batch's catalogs. Run several batches at the same time if you can.
+5. Add up `total` and `commented` over every row of the batches that succeeded: those sums are `col_total` and `col_commented`. Keep the per-schema rows; the drill-down below reuses them, so columns are never scanned twice.
+6. If some batches fail, compute coverage over the catalogs you could read, and add a note: "column coverage over N of M catalogs".
+7. If every batch fails, or no batch finishes for **5 minutes**, mark the pillar **unavailable**. Do not count column coverage as 0.
+8. On a very large estate, suggest that the user limits the assessment to the catalogs that matter.
 
 `table_pct = pct(table_commented, table_total)`;
 `col_pct = pct(col_commented, col_total)`.
@@ -112,24 +125,23 @@ FROM <TABLE_TAGS> WHERE schema_name <> 'information_schema';
 
 **Drill-down — Comment coverage by schema (worst first)** (which schemas drag the score down):
 
+Don't scan columns again. Use the per-schema rows you kept from the `column_comments`
+batches, and get the table side with this scan:
+
 ```sql
-WITH t AS (
-  SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS tables,
-         SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS t_comm
-  FROM <TABLES> WHERE table_schema <> 'information_schema' GROUP BY table_catalog, table_schema
-), c AS (
-  SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS cols,
-         SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS c_comm
-  FROM <COLUMNS> WHERE table_schema <> 'information_schema' GROUP BY table_catalog, table_schema
-)
-SELECT COALESCE(t.cat, c.cat) AS catalog, COALESCE(t.sch, c.sch) AS schema, t.tables AS tables,
-       ROUND(100.0 * t.t_comm / NULLIF(t.tables,0), 1) AS table_comment_pct,
-       ROUND(100.0 * c.c_comm / NULLIF(c.cols,0), 1)  AS column_comment_pct
-FROM t FULL OUTER JOIN c ON t.cat = c.cat AND t.sch = c.sch
-ORDER BY (COALESCE(ROUND(100.0*t.t_comm/NULLIF(t.tables,0),1),0)
-        + COALESCE(ROUND(100.0*c.c_comm/NULLIF(c.cols,0),1),0)) ASC
-LIMIT 500;
+SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS tables,
+       SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS t_comm
+FROM <TABLES> WHERE table_schema <> 'information_schema'
+GROUP BY table_catalog, table_schema;
 ```
+
+For each (`cat`, `sch`) that appears in either result:
+
+- `table_comment_pct = round(100 * t_comm / tables, 1)`
+- `column_comment_pct = round(100 * commented / total, 1)` (from the column batches)
+
+Treat a missing side as 0. Sort by `table_comment_pct + column_comment_pct`, lowest first,
+and show at most 500 rows.
 
 ---
 
