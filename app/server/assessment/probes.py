@@ -32,6 +32,17 @@ import json
 import logging
 import aiohttp
 
+from server.signal_spec import (
+    METADATA as METADATA_SPEC,
+    TABLE_COMMENT_TARGET_PCT,
+    COLUMN_COMMENT_TARGET_PCT,
+    METADATA_TABLE_WEIGHT,
+    METADATA_COLUMN_WEIGHT,
+    METADATA_COLUMN_BATCH_SIZE,
+    METADATA_NO_PROGRESS_TIMEOUT_S,
+    gap_text,
+    render_sql,
+)
 from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
 from server.user_agent import with_ua
@@ -400,7 +411,7 @@ def _src(view: str, sources: dict) -> str | None:
     return f"({union}) AS _t"
 
 
-def _internal_catalog_filter(sources: dict) -> str:
+def _internal_catalog_filter(sources: dict, column: str = "table_catalog") -> str:
     """Extra WHERE clause to exclude internal catalogs when grouping by
     ``table_catalog`` over the metastore-wide system view — the named internal
     catalogs plus any ``__``-prefixed system catalog (e.g. Databricks-internal
@@ -409,7 +420,7 @@ def _internal_catalog_filter(sources: dict) -> str:
     if not sources.get("system_ok"):
         return ""
     in_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-    return f"AND table_catalog NOT IN ({in_list}) AND table_catalog NOT RLIKE '^__' "
+    return f"AND {column} NOT IN ({in_list}) AND {column} NOT RLIKE '^__' "
 
 
 # ---------------------------------------------------------------------------
@@ -557,50 +568,54 @@ async def probe_uc_foundation() -> dict:
 # per-catalog batches with bounded concurrency, accumulating coverage and emitting
 # progress as batches land. Tuned against a 1068-catalog workspace (a 30-catalog
 # batch returns in ~7s): 25/batch × 6 concurrent finishes ~1068 catalogs in <1 min.
-_METADATA_BATCH_SIZE = 25
+# Batch size and the no-progress timeout live in signal_spec, so the skill's
+# documented batching (#112) matches this scan.
+_METADATA_BATCH_SIZE = METADATA_COLUMN_BATCH_SIZE
 _METADATA_SCAN_CONCURRENCY = 6
 # Stall only if NO batch completes within this window (not a fixed total deadline),
 # so a slow-but-progressing scan of a huge metastore is allowed to finish.
-_METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
+_METADATA_NO_PROGRESS_TIMEOUT = METADATA_NO_PROGRESS_TIMEOUT_S
 
 _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
 
 
-def _coverage_query(
-    view: str,
+def column_coverage_batch_sql(
     catalogs_batch: list[str],
     system_ok: bool,
     schemas: list[str] | None = None,
 ) -> str:
-    """Per-catalog comment-coverage query for an information_schema ``view``
-    (tables/columns) scoped to a batch of catalogs, grouped by ``table_catalog``.
+    """Column comment coverage for one batch of catalogs, grouped by catalog/schema.
 
-    system_ok: filter the metastore-wide view by ``table_catalog IN (...)`` (prunes
-    to just these catalogs). Per-catalog: UNION each catalog's own view. Grouping by
-    catalog lets the scan both total up coverage AND retain a per-catalog breakdown
-    for the drill-down, in one pass.
+    The SQL is the shared spec query (``signal_spec.METADATA`` ``column_comments``,
+    #112), so the skill runs the identical per-batch statement. system_ok: the
+    metastore-wide view, pruned by ``table_catalog IN (...)``. Per-catalog: a UNION of
+    just this batch's catalog views (the IN filter is then a no-op). Grouping by
+    schema gives both the totals AND the drill-down rows in one pass.
     """
-    cov = ("COUNT(*) AS total, "
-           "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented")
-    schema_sql = schema_predicate(schemas)
+    q = METADATA_SPEC["queries_by_id"]["column_comments"]
     if system_ok:
-        in_list = ", ".join(quote_literal(c) for c in catalogs_batch)
-        return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM system.information_schema.{view} "
-                f"WHERE table_catalog IN ({in_list}) AND {schema_sql} "
-                f"GROUP BY table_catalog, table_schema")
-    union = " UNION ALL ".join(f"SELECT * FROM {quote_ident(c)}.information_schema.{view}" for c in catalogs_batch)
-    return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM ({union}) AS _c "
-            f"WHERE {schema_sql} GROUP BY table_catalog, table_schema")
+        source = "system.information_schema.columns"
+    else:
+        union = " UNION ALL ".join(
+            f"SELECT * FROM {quote_ident(c)}.information_schema.columns" for c in catalogs_batch
+        )
+        source = f"({union}) AS _c"
+    # information_schema stores catalog names in lower case, and the comparison is
+    # case-sensitive, so a configured name like "Sales" must match as 'sales'.
+    in_list = ", ".join(quote_literal(c.lower()) for c in catalogs_batch)
+    return render_sql(q["sql"], {"<COLUMNS>": source, "<CATALOG_BATCH>": in_list},
+                      schema_filter=schema_predicate(schemas)).rstrip(";")
 
 
 async def _column_coverage_chunked(
     catalogs: list[str],
     system_ok: bool,
     schemas: list[str] | None = None,
-) -> tuple[int, int, dict]:
-    """(columns, commented-columns, per_schema) computed in per-catalog batches with
-    bounded concurrency, where per_schema maps (catalog, schema) -> (columns, commented).
+) -> tuple[int, int, dict, int]:
+    """(columns, commented-columns, per_schema, failed_catalogs) computed in per-catalog
+    batches with bounded concurrency, where per_schema maps (catalog, schema) ->
+    (columns, commented) and failed_catalogs counts catalogs in batches that failed.
     Emits pillar_progress as each batch lands and raises TimeoutError only if no
     batch completes within _METADATA_NO_PROGRESS_TIMEOUT."""
     batches = [catalogs[i:i + _METADATA_BATCH_SIZE] for i in range(0, len(catalogs), _METADATA_BATCH_SIZE)]
@@ -610,11 +625,10 @@ async def _column_coverage_chunked(
     # shows the query shape once rather than one near-identical row per batch.
     _cov_view = "system.information_schema.columns" if system_ok else "<catalog>.information_schema.columns"
     record_query(
-        "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
-        "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
-        f"FROM {_cov_view} WHERE table_catalog IN (:catalogs) "
-        f"AND {schema_predicate(schemas)} GROUP BY table_catalog, table_schema",
-        {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches"},
+        render_sql(METADATA_SPEC["queries_by_id"]["column_comments"]["sql"],
+                   {"<COLUMNS>": _cov_view, "<CATALOG_BATCH>": ":catalogs"},
+                   schema_filter=schema_predicate(schemas)).rstrip(";"),
+        {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches of {_METADATA_BATCH_SIZE}"},
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = failed_cats = 0
@@ -626,7 +640,7 @@ async def _column_coverage_chunked(
                 # record=False: the per-batch queries differ only in their catalog
                 # list, so we record ONE representative below instead of one row per
                 # batch in the "View SQL" disclosure.
-                rows = await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False)
+                rows = await execute_sql(column_coverage_batch_sql(batch, system_ok, schemas), record=False)
                 bt = sum(int(r.get("total") or 0) for r in rows)
                 bc = sum(int(r.get("commented") or 0) for r in rows)
                 return len(batch), bt, bc, True, rows
@@ -681,7 +695,17 @@ async def _column_coverage_chunked(
     if failed_cats:
         logger.warning(f"metadata scan: {failed_cats}/{total_cats} catalogs unreadable; "
                        f"coverage computed over the {ok_cats} readable")
-    return c_total, c_commented, per_schema
+    return c_total, c_commented, per_schema, failed_cats
+
+
+def tagged_tables_sql(source: str, where: str) -> str:
+    """Distinct tables carrying >=1 governed tag, counted by fully-qualified name (#92).
+
+    The SQL is the shared spec query (``signal_spec.METADATA``), so the skill renders
+    the identical statement.
+    """
+    q = METADATA_SPEC["queries_by_id"]["tagged_tables"]
+    return render_sql(q["sql"], {"<TABLE_TAGS>": source}, schema_filter=where).rstrip(";")
 
 
 async def probe_metadata() -> dict:
@@ -699,13 +723,13 @@ async def probe_metadata() -> dict:
         # scan). In system mode the metastore-wide tables view also spans internal
         # catalogs (system/samples/…), but column coverage below is scoped to the
         # enumerated non-internal catalogs; exclude the same internal catalogs here
-        # so both halves of the 50/50 score measure the same population. (Per-catalog
-        # _src is already scoped to that list.)
+        # so both halves of the 50/50 score measure the same population. That means
+        # the named internal catalogs AND any __-prefixed one (#109), the same rule as
+        # the tag count below and the skill's Source resolution. (Per-catalog _src is
+        # already scoped to that list.)
         if system_ok:
-            internal_list = ", ".join(quote_literal(c) for c in _INTERNAL_CATALOGS)
             tables_src, tables_where = ("system.information_schema.tables",
-                                        f"WHERE {_schema_sql(s)} "
-                                        f"AND table_catalog NOT IN ({internal_list})")
+                                        f"WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}".rstrip())
         else:
             tables_src, tables_where = tbl, f"WHERE {_schema_sql(s)}"
         trows = await execute_sql(
@@ -727,8 +751,9 @@ async def probe_metadata() -> dict:
         # metastore fills in progressively instead of timing out on one big scan.
         # Fall back to a single query only when there's no catalog list to chunk by.
         col_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
+        col_failed = 0
         if catalogs:
-            c_total, c_commented, col_per_schema = await _column_coverage_chunked(
+            c_total, c_commented, col_per_schema, col_failed = await _column_coverage_chunked(
                 catalogs, system_ok, s.get("schemas")
             )
         else:
@@ -746,30 +771,42 @@ async def probe_metadata() -> dict:
         tt = _src("table_tags", s)
         if tt is not None:
             try:
-                tagged_tables = await _scalar(
-                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
-                )
+                # Same population as the table-comment scan above: in system mode, drop
+                # internal catalogs (system/__databricks_internal/...) so their tags
+                # don't count — matches the skill's source-resolution rule.
+                tag_where = _schema_sql(s, "schema_name") + " " + _internal_catalog_filter(s, "catalog_name")
+                tagged_tables = await _scalar(tagged_tables_sql(tt, tag_where.strip()))
             except Exception:
                 tagged_tables = None
 
         table_pct = _pct(t_commented, t_total)
         col_pct = _pct(c_commented, c_total)
-        score = round(0.5 * table_pct + 0.5 * col_pct, 1)
+        score = round(METADATA_TABLE_WEIGHT * table_pct + METADATA_COLUMN_WEIGHT * col_pct, 1)
 
+        # gap_ids[i] is the spec id of gaps[i] (same order), for the impact statements.
         gaps = []
-        if table_pct < 80:
-            gaps.append(f"Only {table_pct}% of tables have descriptions — Genie relies on these to understand data.")
-        if col_pct < 60:
-            gaps.append(f"Only {col_pct}% of columns are commented; aim for high coverage on gold-layer columns.")
+        gap_ids = []
+        if table_pct < TABLE_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "table_comments_low", table_pct=table_pct))
+            gap_ids.append("table_comments_low")
+        if col_pct < COLUMN_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "column_comments_low", col_pct=col_pct))
+            gap_ids.append("column_comments_low")
         if tagged_tables is not None and t_total and tagged_tables == 0:
-            gaps.append("No governed tags found; tags aid discovery and domain organization.")
+            gaps.append(gap_text(METADATA_SPEC, "no_tagged_tables"))
+            gap_ids.append("no_tagged_tables")
 
+        label = METADATA_SPEC["signal_labels"]
         signals = [
-            {"label": "Tables commented", "value": table_pct, "unit": "%", "detail": f"{t_commented} of {t_total} tables"},
-            {"label": "Columns commented", "value": col_pct, "unit": "%", "detail": f"{c_commented} of {c_total} columns"},
+            {"label": label["table_comments"], "value": table_pct, "unit": "%",
+             "detail": f"{t_commented} of {t_total} tables"},
+            {"label": label["column_comments"], "value": col_pct, "unit": "%",
+             "detail": f"{c_commented} of {c_total} columns"
+                       + (f" (over {len(catalogs) - col_failed} of {len(catalogs)} catalogs)" if col_failed else "")},
         ]
         if tagged_tables is not None:
-            signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
+            signals.append({"label": label["tagged_tables"], "value": tagged_tables,
+                            "detail": "Tables with ≥1 governed tag"})
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
@@ -793,7 +830,11 @@ async def probe_metadata() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
-            "note": None,
+            "gap_ids": gap_ids,
+            # #112: the same disclosure the skill gives when some batches fail, so a
+            # score computed over part of the estate isn't read as complete.
+            "note": (f"Column coverage over {len(catalogs) - col_failed} of {len(catalogs)} catalogs "
+                     f"({col_failed} could not be read).") if col_failed else None,
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
             "drill_down": _drill(
                 "Comment coverage by schema (worst first)",
