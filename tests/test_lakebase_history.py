@@ -182,3 +182,86 @@ def test_user_label_says_resource_when_from_pguser():
     value, source = runtime_config.resolve_lakebase_user("pg_user", "client", env_label="database resource")
     assert (value, source) == ("pg_user", "database resource")
     assert runtime_config.resolve_lakebase_user("", "client") == ("client", "runtime (client id)")
+
+
+
+# --- scoped snapshots: every statement uses the schema chosen at startup ----------------
+
+class _SnapConn(_Conn):
+    """Records every statement (execute, fetchrow, fetch, fetchval) and the scope-check args."""
+
+    def __init__(self, scope_columns=2):
+        super().__init__(legacy_present=False)
+        self.scope_columns = scope_columns
+        self.count_args = []
+
+    async def fetchrow(self, sql, *args):
+        self.executed.append(sql)
+        return {"id": 7}
+
+    async def fetch(self, sql, *args):
+        self.executed.append(sql)
+        return []
+
+    async def fetchval(self, sql, *args):
+        self.executed.append(sql)
+        self.count_args.append(args)
+        return self.scope_columns
+
+
+def _snapshot_conn(monkeypatch, schema, scope_columns=2):
+    conn = _SnapConn(scope_columns)
+    _patch_pool(monkeypatch, conn)
+    monkeypatch.setattr(lc, "_HISTORY_SCHEMA", schema)
+
+    async def enabled():
+        return True
+    monkeypatch.setattr(snapshots, "_enabled", enabled)
+    monkeypatch.setattr(snapshots, "_scope_columns", True)
+    return conn
+
+
+def test_snapshot_statements_use_the_chosen_schema_in_both_schemas(monkeypatch):
+    for schema in ("public", "genie_ontology_readiness"):
+        conn = _snapshot_conn(monkeypatch, schema)
+        table = f'"{schema}"."ontology_assessment_snapshots"'
+        asyncio.run(snapshots.ensure_table())
+        scope = {"catalogs": ["sales"], "schemas": [], "workspace_filter": None}
+        assert asyncio.run(snapshots.save_snapshot({"overall": {"score": 1, "level": 1}}, "me", scope)) == 7
+        asyncio.run(snapshots.list_snapshots("me"))
+        asyncio.run(snapshots.get_snapshot(7, "me"))
+        # CREATE, ALTER, INSERT, SELECT (list), SELECT (get)
+        assert len(conn.executed) == 5, conn.executed
+        for sql in conn.executed:
+            assert table in sql, (schema, sql)
+            assert "ontology_assessment_snapshots" not in sql.replace(table, ""), (schema, sql)
+
+
+def test_scope_column_check_resolves_the_chosen_schema(monkeypatch):
+    conn = _snapshot_conn(monkeypatch, "genie_ontology_readiness", scope_columns=2)
+
+    async def failing_alter(sql, *args):
+        if sql.startswith("ALTER TABLE"):
+            raise RuntimeError("must be owner of table")
+        conn.executed.append(sql)
+    conn.execute = failing_alter
+    asyncio.run(snapshots.ensure_table())
+    assert conn.count_args == [('"genie_ontology_readiness"."ontology_assessment_snapshots"',)]
+    assert snapshots._scope_columns is True
+
+
+def test_failed_scope_migration_turns_scope_columns_off(monkeypatch):
+    conn = _snapshot_conn(monkeypatch, "public", scope_columns=0)
+
+    async def failing_alter(sql, *args):
+        if sql.startswith("ALTER TABLE"):
+            raise RuntimeError("must be owner of table")
+        conn.executed.append(sql)
+    conn.execute = failing_alter
+    asyncio.run(snapshots.ensure_table())
+    assert conn.count_args == [('"public"."ontology_assessment_snapshots"',)]
+    assert snapshots._scope_columns is False
+    asyncio.run(snapshots.save_snapshot({"overall": {}}, "me", None))
+    insert = [s for s in conn.executed if s.startswith("INSERT")][-1]
+    assert "scope" not in insert
+    assert '"public"."ontology_assessment_snapshots"' in insert

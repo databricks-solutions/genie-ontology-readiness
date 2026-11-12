@@ -15,6 +15,7 @@ from server.pillars import (
     level_from_score,
     readiness_stage,
     readiness_guidance,
+    TOP_GAPS_LIMIT,
 )
 from server.assessment.probes import PROBES, prime_request_sources, _progress_sink
 from server.sql_client import (
@@ -91,7 +92,7 @@ def _finalize(pillars_out: list[dict]) -> dict:
     for pil in ranked:
         for g in pil["gaps"]:
             top_gaps.append({"pillar": pil["name"], "gap": g})
-    top_gaps = top_gaps[:6]
+    top_gaps = top_gaps[:TOP_GAPS_LIMIT]
 
     return {
         "overall": {
