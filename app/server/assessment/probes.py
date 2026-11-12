@@ -783,13 +783,18 @@ async def probe_metadata() -> dict:
         col_pct = _pct(c_commented, c_total)
         score = round(METADATA_TABLE_WEIGHT * table_pct + METADATA_COLUMN_WEIGHT * col_pct, 1)
 
+        # gap_ids[i] is the spec id of gaps[i] (same order), for the impact statements.
         gaps = []
+        gap_ids = []
         if table_pct < TABLE_COMMENT_TARGET_PCT:
             gaps.append(gap_text(METADATA_SPEC, "table_comments_low", table_pct=table_pct))
+            gap_ids.append("table_comments_low")
         if col_pct < COLUMN_COMMENT_TARGET_PCT:
             gaps.append(gap_text(METADATA_SPEC, "column_comments_low", col_pct=col_pct))
+            gap_ids.append("column_comments_low")
         if tagged_tables is not None and t_total and tagged_tables == 0:
             gaps.append(gap_text(METADATA_SPEC, "no_tagged_tables"))
+            gap_ids.append("no_tagged_tables")
 
         label = METADATA_SPEC["signal_labels"]
         signals = [
@@ -825,6 +830,7 @@ async def probe_metadata() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
+            "gap_ids": gap_ids,
             # #112: the same disclosure the skill gives when some batches fail, so a
             # score computed over part of the estate isn't read as complete.
             "note": (f"Column coverage over {len(catalogs) - col_failed} of {len(catalogs)} catalogs "

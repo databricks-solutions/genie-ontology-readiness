@@ -127,6 +127,10 @@ export interface PillarScore {
   note: string | null;
   signals: Signal[];
   gaps: string[];
+  // Impact for Genie Ontology (server/impact.py). Optional: snapshots saved before
+  // impact statements existed have none.
+  impact?: string | null;
+  gap_impacts?: (string | null)[];
   best_practices: string[];
   summary: string;
   metrics: Record<string, unknown>;
@@ -151,12 +155,15 @@ export interface ScorecardOverall {
   level_label: string;
   readiness_stage: string;
   readiness_detail: string;
+  // Fixed framing: the score is readiness for Genie Ontology (Private Preview).
+  readiness_framing?: string;
   assessed_at?: string;
 }
 
 export interface TopGap {
   pillar: string;
   gap: string;
+  impact?: string | null;
 }
 
 export interface Scorecard {

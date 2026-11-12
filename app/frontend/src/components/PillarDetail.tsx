@@ -12,6 +12,16 @@ import GenieTester from './GenieTester';
 import DrillDownModal from './DrillDownModal';
 import SqlModal from './SqlModal';
 
+// The impact statement for Genie Ontology, shown under a pillar or a gap.
+function ImpactLine({ text, compact = false }: { text: string; compact?: boolean }) {
+  return (
+    <span className={`block text-ink-600 leading-relaxed ${compact ? 'text-xs mt-0.5' : 'text-sm mt-2'}`}>
+      <span className="font-medium text-ink-700">Impact for Genie Ontology: </span>
+      {text}
+    </span>
+  );
+}
+
 // A visible "read as" line naming the identity that served this pillar's reads.
 function IdentityLine({ identity }: { identity: SignalIdentity }) {
   return (
@@ -170,6 +180,7 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
   return (
     <div className="px-4 pb-4 pt-1 space-y-4">
       {pillar.summary && <p className="text-sm text-ink-700 leading-relaxed">{pillar.summary}</p>}
+      {pillar.impact && <ImpactLine text={pillar.impact} />}
 
       {pillar.identity && <IdentityLine identity={pillar.identity} />}
 
@@ -198,7 +209,10 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
             {pillar.gaps.map((g, i) => (
               <li key={i} className="flex items-start gap-2 text-sm text-amber-800">
                 <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-500" />
-                <span>{g}</span>
+                <span>
+                  {g}
+                  {pillar.gap_impacts?.[i] && <ImpactLine text={pillar.gap_impacts[i] as string} compact />}
+                </span>
               </li>
             ))}
           </ul>

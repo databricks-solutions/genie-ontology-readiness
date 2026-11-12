@@ -621,9 +621,14 @@ export default function Scorecard({
                 <Gauge score={overall.score} color={scoreColor(overall.score)} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-start justify-between gap-3 flex-wrap mb-1">
-                    <div className="flex items-center gap-3 flex-wrap min-w-0">
-                      <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
-                      <LevelBadge level={overall.level} label={overall.level_label} />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-xs font-semibold uppercase tracking-wider text-ink-400">
+                        Readiness for Genie Ontology
+                      </span>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
+                        <LevelBadge level={overall.level} label={overall.level_label} />
+                      </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -645,6 +650,9 @@ export default function Scorecard({
                     </div>
                   </div>
                   <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
+                  {overall.readiness_framing && (
+                    <p className="text-xs text-ink-500 leading-relaxed mt-2">{overall.readiness_framing}</p>
+                  )}
                   <div className="flex items-center gap-3 flex-wrap mt-2">
                     {config.assess_catalogs.length > 0 && (
                       <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
@@ -756,6 +764,12 @@ export default function Scorecard({
                   <span>
                     <span className="font-medium text-ink-800">{g.pillar}:</span>{' '}
                     <span className="text-ink-600">{g.gap}</span>
+                    {g.impact && (
+                      <span className="block text-xs text-ink-500 mt-0.5 leading-relaxed">
+                        <span className="font-medium text-ink-600">Impact for Genie Ontology: </span>
+                        {g.impact}
+                      </span>
+                    )}
                   </span>
                 </li>
               ))}

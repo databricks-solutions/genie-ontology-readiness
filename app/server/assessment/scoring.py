@@ -25,6 +25,7 @@ from server.sql_client import (
     captured_queries,
 )
 from server.content.library import best_practices_for, capability_summary
+from server.impact import OVERALL_FRAMING, gap_impact, pillar_impact
 from server.security import safe_error
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,20 @@ logger = logging.getLogger(__name__)
 
 def _error_probe(detail: str) -> dict:
     return {"available": False, "score": 0.0, "signals": [], "gaps": [], "note": detail, "metrics": {}}
+
+
+def _gap_impacts(probe: dict) -> list[str | None]:
+    """One impact statement per gap, aligned with ``probe["gaps"]``.
+
+    A probe that sends ``gap_ids`` gets a statement per gap. A probe without ids,
+    or with ids that do not line up with its gaps, gets None for every gap. The
+    pillar-level statement then stands in for those gaps.
+    """
+    gaps = probe.get("gaps") or []
+    gap_ids = probe.get("gap_ids") or []
+    if len(gap_ids) != len(gaps):
+        return [None] * len(gaps)
+    return [gap_impact(gid) for gid in gap_ids]
 
 
 def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
@@ -60,6 +75,12 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         "note": probe.get("note"),
         "signals": probe.get("signals", []),
         "gaps": probe.get("gaps", []),
+        # Impact for Genie Ontology (server/impact.py): the fixed pillar statement,
+        # shown only under the rule in impact.pillar_impact; and one gap statement
+        # per gap (None where the gap has no id).
+        "impact": pillar_impact(key, score=score, has_gaps=bool(probe.get("gaps")),
+                                available=tech_available),
+        "gap_impacts": _gap_impacts(probe),
         "best_practices": best_practices_for(key),
         "summary": capability_summary(pillar_def["capability"]),
         "metrics": probe.get("metrics", {}),
@@ -90,8 +111,10 @@ def _finalize(pillars_out: list[dict]) -> dict:
     ranked = sorted(pillars_out, key=lambda x: (x["score"], -x["weight"]))
     top_gaps = []
     for pil in ranked:
-        for g in pil["gaps"]:
-            top_gaps.append({"pillar": pil["name"], "gap": g})
+        for i, g in enumerate(pil["gaps"]):
+            # The gap's own statement, or the pillar-level statement when it has none.
+            impact = pil["gap_impacts"][i] or pil["impact"]
+            top_gaps.append({"pillar": pil["name"], "gap": g, "impact": impact})
     top_gaps = top_gaps[:TOP_GAPS_LIMIT]
 
     return {
@@ -103,6 +126,7 @@ def _finalize(pillars_out: list[dict]) -> dict:
             # Gap-driven guidance derived from the customer's actual gaps, not the
             # static per-tier agenda; generic tier detail is the no-gaps fallback.
             "readiness_detail": readiness_guidance(ranked, stage["detail"]),
+            "readiness_framing": OVERALL_FRAMING,
             "assessed_at": datetime.now(timezone.utc).isoformat(),
         },
         "top_gaps": top_gaps,
