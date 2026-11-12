@@ -68,6 +68,17 @@ TABLE_COMMENT_TARGET_PCT = 80
 COLUMN_COMMENT_TARGET_PCT = 60
 METADATA_TABLE_WEIGHT = 0.5
 METADATA_COLUMN_WEIGHT = 0.5
+# Column coverage is the heaviest read (a row per column of every table), so both the
+# App and the skill scan it in batches of catalogs (#112). A metastore-wide scan of a
+# ~1,400-catalog estate runs past 15 minutes; a 25-catalog batch returns in seconds.
+METADATA_COLUMN_BATCH_SIZE = 25
+# The skill's agent runs far fewer queries at once than the App, so it packs catalogs
+# by size instead: at most this many tables per batch, a bigger catalog on its own.
+# On a 1,392-catalog / 78k-table metastore that is ~8 queries instead of 56.
+METADATA_BATCH_MAX_TABLES = 5000
+# Give up only when NO batch has finished for this long (not a fixed total deadline),
+# so a slow but progressing scan of a huge metastore can still finish.
+METADATA_NO_PROGRESS_TIMEOUT_S = 300
 
 METADATA = _index({
     "key": "metadata",
@@ -86,16 +97,48 @@ METADATA = _index({
         {
             "id": "column_comments",
             "comment": (
-                "column comment coverage (heaviest read; on a wide metastore, scan in\n"
-                "per-catalog batches and sum, rather than one metastore-wide query that times out)"
+                "column comment coverage: the heaviest read. Run it once per BATCH of\n"
+                "catalogs and add the results up (see \"Running column_comments\" below)."
             ),
             "sql": (
-                "SELECT COUNT(*) AS total,\n"
+                "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total,\n"
                 "       SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented\n"
-                "FROM <COLUMNS> WHERE {schema_filter};"
+                "FROM <COLUMNS>\n"
+                "WHERE table_catalog IN (<CATALOG_BATCH>) AND {schema_filter}\n"
+                "GROUP BY table_catalog, table_schema;"
             ),
             "schema_column": "table_schema",
-            "app_impl": "_column_coverage_chunked: same counts, scanned in per-catalog batches",
+            # The App runs this exact SQL once per batch (_column_coverage_chunked).
+            "shared": True,
+            "procedure": [
+                "**Never** run this as one query over the whole metastore: on a large estate it "
+                "runs for many minutes and times out.",
+                "Take the catalogs in scope (the non-internal catalogs from Source resolution, or "
+                "the catalogs the user asked for) and count their tables in one query: "
+                "`SELECT lower(table_catalog) AS cat, COUNT(*) AS n FROM <TABLES> WHERE "
+                "table_schema <> 'information_schema' GROUP BY 1`. Skip catalogs with no tables.",
+                "Pack the catalogs into batches by table count: a catalog with more than "
+                f"**{METADATA_BATCH_MAX_TABLES:,}** tables is a batch on its own; put the others "
+                f"together until the next one would take the batch past {METADATA_BATCH_MAX_TABLES:,} "
+                f"tables (in per-catalog mode, also stop at {METADATA_COLUMN_BATCH_SIZE} catalogs). "
+                "**Every catalog goes into exactly one batch and is named in that batch's "
+                "`IN (...)` list. Never use `NOT IN` to cover \"the rest\"**: that is an unbounded "
+                "scan of the whole metastore.",
+                "Run the query once per batch, with `<CATALOG_BATCH>` set to that batch's catalog "
+                "names, quoted and in **lower case** (`table_catalog` is stored in lower case). "
+                "In per-catalog mode, build `<COLUMNS>` from only that batch's catalogs. Run "
+                "several batches at the same time if you can.",
+                "Add up `total` and `commented` over every row of the batches that succeeded: "
+                "those sums are `col_total` and `col_commented`. Keep the per-schema rows; the "
+                "drill-down below reuses them, so columns are never scanned twice.",
+                "If some batches fail, compute coverage over the catalogs you could read, and add "
+                "a note: \"column coverage over N of M catalogs\".",
+                "If every batch fails, or no batch finishes for "
+                f"**{METADATA_NO_PROGRESS_TIMEOUT_S // 60} minutes**, mark the pillar "
+                "**unavailable**. Do not count column coverage as 0.",
+                "On a very large estate, suggest that the user limits the assessment to the "
+                "catalogs that matter.",
+            ],
         },
         {
             "id": "tagged_tables",
