@@ -21,12 +21,15 @@ Conventions used below:
 
 ## 1. Unity Catalog Foundation — weight 15
 
+<!-- BEGIN GENERATED: pillar-uc_foundation -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
 -- schemas (exclude the per-catalog information_schema)
 SELECT COUNT(*) AS n_schemas
-FROM <SCHEMATA> WHERE schema_name <> 'information_schema';
+FROM <SCHEMATA>
+WHERE schema_name <> 'information_schema';
 
 -- table footprint + managed share
 SELECT COUNT(*) AS total,
@@ -42,23 +45,29 @@ FROM hive_metastore.information_schema.tables
 WHERE table_schema <> 'information_schema';
 ```
 
-Let `n_catalogs` = user (non-internal) catalogs in scope. If `non_uc` is
-readable, `uc_coverage_pct = pct(total, total + non_uc)`.
+`n_catalogs` = user (non-internal) catalogs in scope.
+If `non_uc` is readable: `uc_coverage_pct = pct(total, total + non_uc)`.
 
-**Score** (start at 0):
-- `+40` if `n_catalogs > 0`
-- `+30` if `total > 0`
-- `+15` if `total >= 50`
-- `+15` if `n_schemas >= 5`
+**Score:**
 
-**Signals to display:** Catalogs (`n_catalogs`), Schemas (`n_schemas`), Managed
-(`pct(managed, total)`%). If `non_uc` is known, also: In Unity Catalog
-(`uc_coverage_pct`%) and Not in Unity Catalog (`non_uc` tables).
+Start at 0, then:
+- `+40` if `n_catalogs > 0`;
+- `+30` if `total > 0`;
+- `+15` if `total >= 50`;
+- `+15` if `n_schemas >= 5`.
+
+Cap the result at 100.
+
+**Signals to display:** Catalogs (`n_catalogs`), Schemas (`n_schemas`), Managed (`pct(managed, total)`%), In Unity Catalog (`uc_coverage_pct`%) when `non_uc` is known, and Not in Unity Catalog (`non_uc` tables) when `non_uc` is known.
 
 **Gaps:**
 - `n_catalogs == 0` → "No user catalogs found — Unity Catalog may not be in active use."
 - `total < 50` → "Limited table footprint; broaden UC adoption beyond an initial workload."
-- `non_uc > 0` → "`{non_uc}` table(s) (`{100 - uc_coverage_pct}`%) are still in the legacy hive_metastore (not in Unity Catalog) — migrate them into UC (see UCX)."
+- `non_uc > 0` (only when the hive_metastore read succeeded) → "`{non_uc}` table(s) (`{not_uc_pct}`%) are still in the legacy hive_metastore (not in Unity Catalog) — migrate them into UC (see the UCX accelerator)."
+<!-- END GENERATED: pillar-uc_foundation -->
+
+When a schema allowlist is in force, skip the `hive_tables` query and its signal: the
+workspace's Hive footprint is not that schema's.
 
 **Drill-down — Tables by schema** (which schemas hold the footprint, and how managed each is; largest first):
 
@@ -147,32 +156,44 @@ and show at most 500 rows.
 
 ## 3. Relationships & Modeling — weight 12
 
+<!-- BEGIN GENERATED: pillar-relationships -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
 -- declared constraints (if table_constraints isn't available, note it and score gold-layer only)
-SELECT constraint_type, COUNT(*) AS n FROM <TABLE_CONSTRAINTS> GROUP BY constraint_type;
--- -> pk = count of 'PRIMARY KEY', fk = count of 'FOREIGN KEY'
+SELECT constraint_type, COUNT(*) AS n
+FROM <TABLE_CONSTRAINTS>
+WHERE table_schema <> 'information_schema'
+GROUP BY constraint_type;
 
 -- curated gold/mart layer, detected by schema or table naming
 SELECT COUNT(*) AS gold_tables
 FROM <TABLES>
-WHERE lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
-   OR lower(table_name)   RLIKE '^(gold_|mart_|dim_|fact_)';
+WHERE table_schema <> 'information_schema'
+  AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
+       OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)');
 ```
 
-**Score** (start at 0):
-- `+50` if `gold_tables > 0`
-- if constraints available: `+35` if `fk > 0`; `+15` if `pk > 0`
+`pk` = count of `'PRIMARY KEY'` rows; `fk` = count of `'FOREIGN KEY'` rows.
 
-**Signals to display:** Gold-layer tables (`gold_tables`); and when constraints
-are available, Primary keys (`pk`) and Foreign keys (`fk`).
-If `table_constraints` was unreadable, add the note: *"Constraint metadata not
-available; relationship score is based on the gold layer only."*
+**Score:**
+
+Start at 0, then:
+- `+50` if `gold_tables > 0`;
+- if constraints are available: `+35` if `fk > 0`; `+15` if `pk > 0`.
+
+Cap the result at 100.
+
+**Signals to display:** Gold-layer tables (`gold_tables`), Primary keys (`pk`) when constraints are available, and Foreign keys (`fk`) when constraints are available.
 
 **Gaps:**
 - `gold_tables == 0` → "No clearly-named gold/mart layer detected; Genie performs best on curated, pre-joined tables."
-- constraints available and `fk == 0` → "No foreign-key constraints declared; PK/FK relationships let Genie infer joins reliably."
+- `constraints_available and fk == 0` (only when constraint metadata is readable) → "No foreign-key constraints declared; PK/FK relationships let Genie infer joins reliably."
+<!-- END GENERATED: pillar-relationships -->
+
+If `table_constraints` was unreadable, add the note: *"Constraint metadata not available;
+relationship score is based on the gold layer only."*
 
 **Drill-down — Modeling by schema (thinnest first)** (where the gold layer / constraints are thin). Drop the PK/FK columns if `table_constraints` wasn't available:
 
@@ -200,33 +221,42 @@ ORDER BY gold_tables ASC, foreign_keys ASC LIMIT 500;
 
 ## 4. Metrics — weight 20
 
+<!-- BEGIN GENERATED: pillar-metrics -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
 -- metric view count (table_type spelling varies by runtime: try 'METRIC_VIEW' then 'METRIC VIEW')
-SELECT COUNT(*) AS metric_views FROM <TABLES> WHERE table_type = 'METRIC_VIEW';
+SELECT COUNT(*) AS metric_views
+FROM <TABLES>
+WHERE table_type = 'METRIC_VIEW' AND table_schema <> 'information_schema';
 
--- described metric views
+-- described metric views (a read that fails counts as 0)
 SELECT COUNT(*) AS commented
 FROM <TABLES>
-WHERE table_type = 'METRIC_VIEW' AND comment IS NOT NULL AND trim(comment) <> '';
+WHERE table_type = 'METRIC_VIEW' AND comment IS NOT NULL AND trim(comment) <> '' AND table_schema <> 'information_schema';
 ```
 
-If neither `table_type` spelling is recognized by the metastore, mark the pillar
-**unavailable** (reason: not enabled on this metastore version).
+`uncommented = metric_views - commented`.
 
 **Score:**
-- If `metric_views == 0` → **score 0** (and the single gap below).
-- Else: `30 + 40 * min(metric_views, 10)/10 + 30 * (commented / metric_views)`,
-  rounded to 1 decimal.
 
-**Signals to display:** Metric views (`metric_views`); Commented
-(`pct(commented, metric_views)`%) when `metric_views > 0`.
+If `metric_views == 0`, the score is **0** and only the gap below applies.
+
+Otherwise:
+
+`30 + 40 * min(metric_views, 10) / 10 + 30 * (commented / metric_views)`, rounded to 1 decimal and capped at 100.
+
+**Signals to display:** Metric views (`metric_views`) and Commented (`pct(commented, metric_views)`%) when `metric_views > 0`.
 
 **Gaps:**
 - `metric_views == 0` → "No metric views found. Metric views are the GA foundation that feeds Genie Ontology — define KPIs centrally here."
-- `metric_views < 3` (and > 0) → "Few metric views; expand coverage so common KPIs are centrally defined and certified."
-- `metric_views - commented > 0` → "`{uncommented}` metric view(s) lack a description — Genie reads metric-view, dimension, and measure comments to reason; add them."
+- `0 < metric_views < 3` → "Few metric views; expand coverage so common KPIs are centrally defined and certified."
+- `uncommented > 0` → "`{uncommented}` metric view(s) lack a description — Genie reads metric-view, dimension, and measure comments to reason; add them."
+<!-- END GENERATED: pillar-metrics -->
+
+If neither `table_type` spelling is recognized by the metastore, mark the pillar
+**unavailable** (reason: not enabled on this metastore version).
 
 **Drill-down — Metric views by schema** (where the semantic layer lives, and how much is described):
 
@@ -245,9 +275,12 @@ Counted from the **audit system table** (workspace-wide, via the viewer's own
 system-table access) — *not* the Genie REST API, which is permission/scope-gated
 and only reflects what one principal can see.
 
-**Signals** (over the last 30 days; a space is a "Genie Agent"):
+<!-- BEGIN GENERATED: pillar-genie_agents -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
+**Signals**
 
 ```sql
+-- Genie Agents = spaces seen in the audit log over the last 30 days, minus any that were trashed. active_30d = spaces with activity in the last 30 days.
 SELECT COUNT(*) AS total,
        SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d
 FROM (
@@ -263,23 +296,28 @@ FROM (
 ) WHERE trashed = 0;
 ```
 
+**Score:**
+
+Start at 0, then:
+- `+40` if `total > 0`;
+- `+40` if `active_30d > 0`;
+- `+20` if `total > 0` and `active_30d / total >= 0.3`.
+
+Cap the result at 100.
+
+**Signals to display:** Genie Agents (`total`) and Active agents (30d) (`active_30d`).
+
+**Gaps:**
+- `total == 0` → "No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics."
+- `total > 0 and active_30d == 0` → "`{total}` Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents."
+<!-- END GENERATED: pillar-genie_agents -->
+
 If `system.access.audit` is unreadable, mark the pillar **unavailable** (reason:
 insufficient permission — the identity needs `SELECT` on `system.access.audit`).
-
-**Score** (start at 0):
-- `+40` if `total > 0`
-- `+40` if `active_30d > 0`
-- `+20` if `total > 0 AND active_30d / total >= 0.3`
-
-**Signals to display:** Genie Agents (`total`), Active agents (30d) (`active_30d`).
 
 **Note to include:** curation quality (instructions, example/verified SQL,
 benchmarks) isn't visible in the audit log; recommend the Genie Agent Quality
 Workshop to assess and lift it.
-
-**Gaps:**
-- `total == 0` → "No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics."
-- else if `active_30d == 0` → "`{total}` Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents."
 
 **Drill-down — Genie Agents by audit activity** (top agents by event volume, bounded to 200). The `names` CTE resolves each space's latest display name over a wider 90-day window (names only appear on create/update events, not query events). On a very large or shared metastore this scan can be slow — keep the `LIMIT` and the 90-day bound. Add a `workspace` column (join `system.access.workspaces_latest` on `workspace_id`) when more than one workspace is in scope:
 
@@ -418,25 +456,27 @@ FROM <TABLE_TAGS> GROUP BY catalog_name, schema_name ORDER BY domain_tagged DESC
 
 ## 7. Adoption & Activity — weight 5
 
-**Signals** (both best-effort against system tables):
+<!-- BEGIN GENERATED: pillar-adoption -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
+**Signals**
 
 ```sql
+-- active users, last 30 days (system.access.audit)
 SELECT COUNT(DISTINCT user_identity.email) AS active_users
 FROM system.access.audit
 WHERE event_date >= current_date() - INTERVAL 30 DAYS;
 
+-- query volume, last 30 days (system.query.history)
 SELECT COUNT(*) AS queries_30d
 FROM system.query.history
 WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS;
 ```
 
-If **both** reads fail, mark the pillar **unavailable** (system.access /
-system.query not enabled or not granted). If either returns, score with what you have.
+**Score:**
 
-**Score:** `band(active_users) + (50 if queries_30d > 0 else 0)`, where `band`
-tiers the user count so day-to-day drift rarely moves the score:
+Start at 0, then add the band for `active_users`:
 
-| active_users | band |
+| active_users | points |
 |---|---|
 | `<= 0` | 0 |
 | `1–4` | 20 |
@@ -444,11 +484,17 @@ tiers the user count so day-to-day drift rarely moves the score:
 | `20–49` | 45 |
 | `>= 50` | 50 |
 
-**Signals to display:** Active users (30d) (`active_users`), Queries (30d)
-(`queries_30d`) — whichever returned.
+Then add `+50` if `queries_30d > 0`. Cap the result at 100.
 
-**Gaps:** none (adoption is informational; it contributes to the score but
-doesn't emit its own next-step gaps).
+**Signals to display:** Active users (30d) (`active_users`) when readable and Queries (30d) (`queries_30d`) when readable.
+
+**Gaps:** none (the pillar emits no gap text).
+<!-- END GENERATED: pillar-adoption -->
+
+If **both** reads fail, mark the pillar **unavailable** (system.access / system.query
+not enabled or not granted). If either returns, score with what you have.
+
+Adoption is informational: it adds to the score but emits no next-step gaps.
 
 **Drill-down — Adoption by workspace** (only meaningful when more than one workspace is in scope; with a single workspace, adoption is one workspace-wide number with no breakdown):
 
