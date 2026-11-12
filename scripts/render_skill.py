@@ -178,6 +178,33 @@ SKILL_REGIONS = {"at-a-glance": _at_a_glance}
 
 # --- pillar-signals.md -----------------------------------------------------
 
+def _adoption_band_table() -> list[str]:
+    """The adoption band table: ``<= 0``, then each tier from the spec as a range."""
+    rows = ["| active_users | points |", "|---|---|", f"| {_code('<= 0')} | 0 |"]
+    last = len(S.ADOPTION_USER_BANDS) - 1
+    for i, (at_least, pts) in enumerate(S.ADOPTION_USER_BANDS):
+        if i == last:
+            label = f">= {at_least}"
+        else:
+            label = f"{at_least}–{S.ADOPTION_USER_BANDS[i + 1][0] - 1}"
+        rows.append(f"| {_code(label)} | {int(pts)} |")
+    return rows
+
+
+def _score_lines(item) -> list[str]:
+    """Markdown lines for one score item. A string is prose as written. A tuple is a tagged
+    item the spec keeps as data: ``("code", expr[, trailing])`` is a code span plus text,
+    and ``("bands",)`` is the adoption band table."""
+    if isinstance(item, str):
+        return [item]
+    kind = item[0]
+    if kind == "code":
+        return [_code(item[1]) + (item[2] if len(item) > 2 else "")]
+    if kind == "bands":
+        return _adoption_band_table()
+    raise ValueError(f"unknown score item {item!r}")
+
+
 def _pillar_block(spec: dict) -> str:
     out = ["**Signals**", "", "```sql"]
     for i, q in enumerate(spec["queries"]):
@@ -190,15 +217,23 @@ def _pillar_block(spec: dict) -> str:
         if q.get("procedure"):
             out += [f"**Running {_code(q['id'])}:**", ""]
             out += [f"{n}. {step}" for n, step in enumerate(q["procedure"], 1)] + [""]
-    out += spec["derived"] + [""]
-    out += [f"**Score:** {_code(spec['score'])}", ""]
+    if spec["derived"]:
+        out += spec["derived"] + [""]
+    # A one-expression score is a code span; a multi-term score is a list of Markdown lines.
+    if isinstance(spec["score"], str):
+        out += [f"**Score:** {_code(spec['score'])}", ""]
+    else:
+        out += ["**Score:**", "", *(line for item in spec["score"] for line in _score_lines(item)), ""]
     shown = [f"{s['label']} ({s['value']})" + (f" {s['when']}" if s.get("when") else "") for s in spec["signals"]]
     if shown:
         out += ["**Signals to display:** " + _join(shown) + ".", ""]
-    out.append("**Gaps:**")
-    for g in spec["gaps"]:
-        cond = _code(g["when"]) + (f" ({g['when_note']})" if g.get("when_note") else "")
-        out.append(f'- {cond} → "{_ticks(g["text"])}"')
+    if not spec["gaps"]:
+        out.append("**Gaps:** none (the pillar emits no gap text).")
+    else:
+        out.append("**Gaps:**")
+        for g in spec["gaps"]:
+            cond = _code(g["when"]) + (f" ({g['when_note']})" if g.get("when_note") else "")
+            out.append(f'- {cond} → "{_ticks(g["text"])}"')
     return "\n".join(out) + "\n"
 
 

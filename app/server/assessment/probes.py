@@ -28,18 +28,49 @@ see ``prime_request_sources``.
 
 import asyncio
 import contextvars
+import functools
 import json
 import logging
 import aiohttp
 
 from server.signal_spec import (
     METADATA as METADATA_SPEC,
+    UC_FOUNDATION as UC_SPEC,
+    REL_MODELING as REL_SPEC,
+    REL_GOLD_POINTS,
+    REL_FK_POINTS,
+    REL_PK_POINTS,
+    GOLD_SCHEMA_PATTERN,
+    GOLD_TABLE_PATTERN,
+    METRICS,
+    GENIE_AGENTS as GENIE_SPEC,
+    GENIE_AUDIT_LOOKBACK_DAYS,
+    GENIE_TOTAL_POINTS,
+    GENIE_ACTIVE_POINTS,
+    GENIE_SHARE_POINTS,
+    GENIE_ACTIVE_SHARE,
+    ADOPTION as ADOPTION_SPEC,
+    ADOPTION_QUERY_POINTS,
+    ADOPTION_WINDOW_DAYS,
+    adoption_band_points,
+    METRIC_VIEW_TYPES,
+    METRIC_BASE_POINTS,
+    METRIC_RAMP_POINTS,
+    METRIC_RAMP_VIEWS,
+    METRIC_QUALITY_POINTS,
+    METRIC_FEW_VIEWS,
     TABLE_COMMENT_TARGET_PCT,
     COLUMN_COMMENT_TARGET_PCT,
     METADATA_TABLE_WEIGHT,
     METADATA_COLUMN_WEIGHT,
     METADATA_COLUMN_BATCH_SIZE,
     METADATA_NO_PROGRESS_TIMEOUT_S,
+    UC_CATALOG_POINTS,
+    UC_TABLE_POINTS,
+    UC_FOOTPRINT_POINTS,
+    UC_SCHEMA_POINTS,
+    UC_FOOTPRINT_TABLES,
+    UC_SCHEMA_MIN,
     gap_text,
     render_sql,
 )
@@ -182,6 +213,27 @@ def _pct(num, den) -> float:
     num = float(num or 0)
     den = float(den or 0)
     return round(100.0 * num / den, 1) if den else 0.0
+
+
+def _spec_gap(pillar: dict, gap_id: str, gaps: list, gap_ids: list, **values) -> None:
+    """Append a spec gap's App text and its id together, so ``gaps`` and ``gap_ids``
+    stay aligned one-to-one (the shared contract for #88)."""
+    gaps.append(gap_text(pillar, gap_id, **values))
+    gap_ids.append(gap_id)
+
+
+def _with_gap_ids(probe):
+    """Every migrated probe result carries ``gap_ids`` next to ``gaps``. Results with no
+    gaps (unavailable, or nothing to flag) get an empty list."""
+    @functools.wraps(probe)
+    async def wrapped():
+        result = await probe()
+        result.setdefault("gap_ids", [])
+        # A probe that adds a gap string must add its id too; fail loudly rather than drift.
+        if len(result["gap_ids"]) != len(result.get("gaps") or []):
+            raise AssertionError(f"{probe.__name__}: gap_ids and gaps differ in length")
+        return result
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -426,19 +478,21 @@ def _internal_catalog_filter(sources: dict, column: str = "table_catalog") -> st
 # ---------------------------------------------------------------------------
 # 1. Unity Catalog foundation
 # ---------------------------------------------------------------------------
+@_with_gap_ids
 async def probe_uc_foundation() -> dict:
     s = await _resolve_sources()
     n_catalogs = len(s["catalogs"])
     if n_catalogs == 0 and not s["system_ok"]:
         return _empty(_no_catalogs_note("assessment"))
+    q = UC_SPEC["queries_by_id"]
+    label = UC_SPEC["signal_labels"]
     try:
         tbl = _src("tables", s)
         sch = _src("schemata", s)
-        n_schemas = await _scalar(f"SELECT COUNT(*) FROM {sch} WHERE {_schema_sql(s, 'schema_name')}")
+        n_schemas = await _scalar(render_sql(q["schemas"]["sql"], {"<SCHEMATA>": sch},
+                                             schema_filter=_schema_sql(s, "schema_name")).rstrip(";"))
         rows = await execute_sql(
-            f"""SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed
-                FROM {tbl} WHERE {_schema_sql(s)}"""
+            render_sql(q["tables"]["sql"], {"<TABLES>": tbl}, schema_filter=_schema_sql(s)).rstrip(";")
         )
         total = int(rows[0].get("total") or 0)
         managed = int(rows[0].get("managed") or 0)
@@ -452,10 +506,7 @@ async def probe_uc_foundation() -> dict:
         # leftover Hive footprint — skip the hive_metastore signal in that case.
         if not s.get("schemas"):
             try:
-                non_uc = int(await _scalar(
-                    "SELECT COUNT(*) FROM hive_metastore.information_schema.tables "
-                    "WHERE table_schema <> 'information_schema'"
-                ) or 0)
+                non_uc = int(await _scalar(q["hive_tables"]["sql"].rstrip(";")) or 0)
             except Exception as e:
                 logger.info(f"hive_metastore not readable for UC-coverage signal: {str(e)[:80]}")
                 non_uc = None
@@ -463,39 +514,38 @@ async def probe_uc_foundation() -> dict:
 
         score = 0.0
         if n_catalogs:
-            score += 40
+            score += UC_CATALOG_POINTS
         if total > 0:
-            score += 30
-        if total >= 50:
-            score += 15
-        if n_schemas and n_schemas >= 5:
-            score += 15
+            score += UC_TABLE_POINTS
+        if total >= UC_FOOTPRINT_TABLES:
+            score += UC_FOOTPRINT_POINTS
+        if n_schemas and n_schemas >= UC_SCHEMA_MIN:
+            score += UC_SCHEMA_POINTS
         score = min(score, 100.0)
 
-        gaps = []
-        if not n_catalogs:
-            gaps.append("No user catalogs found — Unity Catalog may not be in active use.")
-        if total < 50:
-            gaps.append("Limited table footprint; broaden UC adoption beyond an initial workload.")
+        gaps: list[str] = []
+        gap_ids: list[str] = []
+        if n_catalogs == 0:
+            _spec_gap(UC_SPEC, "no_user_catalogs", gaps, gap_ids)
+        if total < UC_FOOTPRINT_TABLES:
+            _spec_gap(UC_SPEC, "small_table_footprint", gaps, gap_ids)
         if non_uc:
-            gaps.append(
-                f"{non_uc} table(s) ({round(100 - uc_coverage_pct, 1)}%) are still in the legacy "
-                f"hive_metastore (not in Unity Catalog) — migrate them into UC (see the UCX accelerator)."
-            )
+            _spec_gap(UC_SPEC, "hive_metastore_tables", gaps, gap_ids,
+                      non_uc=non_uc, not_uc_pct=round(100 - uc_coverage_pct, 1))
 
         signals = [
-            {"label": "Catalogs", "value": n_catalogs, "detail": "User catalogs assessed"},
-            {"label": "Schemas", "value": n_schemas, "detail": "Excluding information_schema"},
-            {"label": "Managed", "value": _pct(managed, total), "unit": "%", "detail": "% of tables that are UC-managed"},
+            {"label": label["catalogs"], "value": n_catalogs, "detail": "User catalogs assessed"},
+            {"label": label["schemas"], "value": n_schemas, "detail": "Excluding information_schema"},
+            {"label": label["managed"], "value": _pct(managed, total), "unit": "%", "detail": "% of tables that are UC-managed"},
         ]
         # Only surface the not-in-UC footprint (never the raw in-UC table count).
         if non_uc is not None:
             signals.append({
-                "label": "In Unity Catalog", "value": uc_coverage_pct, "unit": "%",
+                "label": label["in_uc"], "value": uc_coverage_pct, "unit": "%",
                 "detail": "Share of tables in Unity Catalog vs. legacy hive_metastore",
             })
             signals.append({
-                "label": "Not in Unity Catalog", "value": non_uc,
+                "label": label["not_in_uc"], "value": non_uc,
                 "detail": "Tables still in legacy hive_metastore",
             })
 
@@ -537,6 +587,7 @@ async def probe_uc_foundation() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
+            "gap_ids": gap_ids,
             "note": None,
             "metrics": {
                 "catalogs": n_catalogs, "schemas": n_schemas, "tables": total,
@@ -847,18 +898,22 @@ async def probe_metadata() -> dict:
 # ---------------------------------------------------------------------------
 # 3. Relationships & modeling (PK/FK + gold layer)
 # ---------------------------------------------------------------------------
+@_with_gap_ids
 async def probe_relationships() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
     if tbl is None:
         return _empty(_no_catalogs_note("relationship assessment"))
+    q = REL_SPEC["queries_by_id"]
+    label = REL_SPEC["signal_labels"]
     try:
         constraints_available = True
         pk = fk = 0
         tc = _src("table_constraints", s)
         try:
             rows = await execute_sql(
-                f"SELECT constraint_type, COUNT(*) AS n FROM {tc} WHERE {_schema_sql(s)} GROUP BY constraint_type"
+                render_sql(q["constraints"]["sql"], {"<TABLE_CONSTRAINTS>": tc},
+                           schema_filter=_schema_sql(s)).rstrip(";")
             )
             by_type = {r["constraint_type"]: int(r["n"] or 0) for r in rows}
             pk = by_type.get("PRIMARY KEY", 0)
@@ -867,33 +922,31 @@ async def probe_relationships() -> dict:
             constraints_available = False
 
         gold_tables = await _scalar(
-            f"""SELECT COUNT(*) FROM {tbl}
-                WHERE {_schema_sql(s)}
-                  AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
-                   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)')"""
+            render_sql(q["gold_tables"]["sql"], {"<TABLES>": tbl}, schema_filter=_schema_sql(s)).rstrip(";")
         ) or 0
 
         score = 0.0
         if gold_tables and gold_tables > 0:
-            score += 50
+            score += REL_GOLD_POINTS
         if constraints_available:
             if fk > 0:
-                score += 35
+                score += REL_FK_POINTS
             if pk > 0:
-                score += 15
+                score += REL_PK_POINTS
         score = min(score, 100.0)
 
-        gaps = []
-        if not gold_tables:
-            gaps.append("No clearly-named gold/mart layer detected; Genie performs best on curated, pre-joined tables.")
+        gaps: list[str] = []
+        gap_ids: list[str] = []
+        if gold_tables == 0:
+            _spec_gap(REL_SPEC, "no_gold_layer", gaps, gap_ids)
         if constraints_available and fk == 0:
-            gaps.append("No foreign-key constraints declared; PK/FK relationships let Genie infer joins reliably.")
+            _spec_gap(REL_SPEC, "no_fk_constraints", gaps, gap_ids)
 
-        signals = [{"label": "Gold-layer tables", "value": gold_tables, "detail": "Tables in gold/mart/analytics-style schemas"}]
+        signals = [{"label": label["gold_tables"], "value": gold_tables, "detail": "Tables in gold/mart/analytics-style schemas"}]
         if constraints_available:
             signals += [
-                {"label": "Primary keys", "value": pk, "detail": "Declared PK constraints"},
-                {"label": "Foreign keys", "value": fk, "detail": "Declared FK constraints"},
+                {"label": label["pk"], "value": pk, "detail": "Declared PK constraints"},
+                {"label": label["fk"], "value": fk, "detail": "Declared FK constraints"},
             ]
 
         note = None if constraints_available else "Constraint metadata not available; relationship score is based on the gold layer only."
@@ -905,8 +958,8 @@ async def probe_relationships() -> dict:
             grows = await execute_sql(
                 f"SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS n FROM {tbl} "
                 f"WHERE {_schema_sql(s)} "
-                f"AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)' "
-                f"   OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)') "
+                f"AND (lower(table_schema) RLIKE '{GOLD_SCHEMA_PATTERN}' "
+                f"   OR lower(table_name) RLIKE '{GOLD_TABLE_PATTERN}') "
                 f"{_internal_catalog_filter(s)}GROUP BY table_catalog, table_schema"
             )
             gold_by = {(r.get("cat"), r.get("sch")): int(r.get("n") or 0) for r in grows if r.get("cat") and r.get("sch")}
@@ -943,7 +996,7 @@ async def probe_relationships() -> dict:
             drill_rows.append(row)
         drill_rows.sort(key=lambda r: (r["gold_tables"], r.get("foreign_keys", 0)))
 
-        return {"available": True, "score": score, "signals": signals, "gaps": gaps, "note": note,
+        return {"available": True, "score": score, "signals": signals, "gaps": gaps, "gap_ids": gap_ids, "note": note,
                 "metrics": {"primary_keys": pk, "foreign_keys": fk, "gold_tables": gold_tables, "constraints_available": constraints_available},
                 "drill_down": _drill("Modeling by schema (thinnest first)", drill_cols, drill_rows)}
     except Exception as e:
@@ -953,19 +1006,26 @@ async def probe_relationships() -> dict:
 # ---------------------------------------------------------------------------
 # 4. Semantic layer (metric views)
 # ---------------------------------------------------------------------------
+@_with_gap_ids
 async def probe_metrics() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
     if tbl is None:
         return _empty(_no_catalogs_note("semantic-layer assessment"))
     try:
+        q = METRICS["queries_by_id"]
+        label = METRICS["signal_labels"]
+
+        def _metric_sql(query_id: str, type_value: str) -> str:
+            # The spec's METRIC_VIEW literal, spelled the way this runtime reports it.
+            return render_sql(q[query_id]["sql"], {"<TABLES>": tbl, "'METRIC_VIEW'": f"'{type_value}'"},
+                              schema_filter=_schema_sql(s)).rstrip(";")
+
         metric_views = None
         type_value = None
-        for tv in ("METRIC_VIEW", "METRIC VIEW"):
+        for tv in METRIC_VIEW_TYPES:
             try:
-                metric_views = await _scalar(
-                    f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{tv}' {_schema_and(s)}"
-                )
+                metric_views = await _scalar(_metric_sql("metric_views", tv))
                 if metric_views is not None:
                     type_value = tv
                     break
@@ -977,11 +1037,15 @@ async def probe_metrics() -> dict:
 
         # If no metric views, return early with the "absent" result
         if metric_views == 0:
+            gaps: list[str] = []
+            gap_ids: list[str] = []
+            _spec_gap(METRICS, "no_metric_views", gaps, gap_ids)
             return {
                 "available": True,
                 "score": 0.0,
-                "signals": [{"label": "Metric views", "value": 0, "detail": "UC metric views"}],
-                "gaps": ["No metric views found. Metric views are the GA foundation that feeds Genie Ontology — define KPIs centrally here."],
+                "signals": [{"label": label["metric_views"], "value": 0, "detail": "UC metric views"}],
+                "gaps": gaps,
+                "gap_ids": gap_ids,
                 "note": None,
                 "metrics": {"metric_views": 0},
             }
@@ -989,43 +1053,37 @@ async def probe_metrics() -> dict:
         # Query for commented metric views (defensive: treat failure as 0)
         commented = 0
         try:
-            commented = await _scalar(
-                f"SELECT COUNT(*) FROM {tbl} WHERE table_type = '{type_value}' AND comment IS NOT NULL AND trim(comment) <> '' {_schema_and(s)}"
-            ) or 0
+            commented = await _scalar(_metric_sql("commented", type_value)) or 0
         except Exception:
             commented = 0
 
-        # Score formula:
-        # - existence: +30 if metric_views > 0
-        # - coverage ramp: +40 * min(metric_views, 10) / 10
-        # - quality: +30 * (commented / metric_views)
-        score = 30.0
-        score += 40.0 * min(metric_views, 10) / 10.0
-        score += 30.0 * (float(commented) / float(metric_views)) if metric_views > 0 else 0.0
+        # Score formula (see the spec's `score`): base + coverage ramp + quality.
+        score = float(METRIC_BASE_POINTS)
+        score += METRIC_RAMP_POINTS * min(metric_views, METRIC_RAMP_VIEWS) / float(METRIC_RAMP_VIEWS)
+        score += METRIC_QUALITY_POINTS * (float(commented) / float(metric_views)) if metric_views > 0 else 0.0
         score = round(min(score, 100.0), 1)
 
         # Build signals
         signals = [
-            {"label": "Metric views", "value": metric_views, "detail": "UC metric views"}
+            {"label": label["metric_views"], "value": metric_views, "detail": "UC metric views"}
         ]
         if metric_views > 0:
             signals.append({
-                "label": "Commented",
+                "label": label["commented"],
                 "value": _pct(commented, metric_views),
                 "unit": "%",
                 "detail": "Share of metric views with a description",
             })
 
         # Build gaps
-        gaps = []
-        if metric_views < 3:
-            gaps.append("Few metric views; expand coverage so common KPIs are centrally defined and certified.")
+        gaps: list[str] = []
+        gap_ids: list[str] = []
+        if metric_views < METRIC_FEW_VIEWS:
+            _spec_gap(METRICS, "few_metric_views", gaps, gap_ids)
         if metric_views > 0:
             uncommented = metric_views - commented
             if uncommented > 0:
-                gaps.append(
-                    f"{uncommented} metric view(s) lack a description — Genie reads metric-view, dimension, and measure comments to reason; add them."
-                )
+                _spec_gap(METRICS, "metric_views_uncommented", gaps, gap_ids, uncommented=uncommented)
 
         # Per-schema drill-down (#10): where the metric views live (and how many
         # are described), so teams see which schemas still lack a semantic layer.
@@ -1050,6 +1108,7 @@ async def probe_metrics() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
+            "gap_ids": gap_ids,
             "note": None,
             "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
             "drill_down": _drill(
@@ -1069,7 +1128,7 @@ async def probe_metrics() -> dict:
 # 5. Genie Agents (REST) — deep curation assessment
 # ---------------------------------------------------------------------------
 _MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
-_GENIE_AUDIT_LOOKBACK_DAYS = 30
+_GENIE_AUDIT_LOOKBACK_DAYS = GENIE_AUDIT_LOOKBACK_DAYS  # the spec's window (its SQL and gap text use it too)
 # A space's display_name only appears on create/update audit events, not on the
 # query/conversation events that drive the 30-day activity count. Resolve names
 # over a wider window so an actively-queried but not-recently-edited space still
@@ -1157,19 +1216,8 @@ async def _genie_audit_counts() -> dict:
     try:
         workspace_filter, parameters = workspace_predicate()
         rows = await execute_sql(
-            "SELECT COUNT(*) AS total, "
-            "       SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d "
-            "FROM ( "
-            "  SELECT request_params.space_id AS space_id, "
-            "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
-            "  FROM system.access.audit "
-            "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
-            "    AND request_params.space_id <> 'new' "
-            f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
-            f"    {workspace_filter}"
-            "  GROUP BY request_params.space_id "
-            ") WHERE trashed = 0",
+            render_sql(GENIE_SPEC["queries_by_id"]["audit_counts"]["sql"],
+                       workspace_filter=workspace_filter).rstrip(";"),
             parameters=parameters or None,
         )
         row = rows[0] if rows else {}
@@ -1211,7 +1259,7 @@ async def _genie_audit_rows() -> list[dict]:
             + ("any_value(workspace_id) AS workspace_id, " if multi else "") +
             "         COUNT(*) AS events, "
             "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            "         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d "
+            f"         MAX(CASE WHEN event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
             "    AND request_params.space_id <> 'new' "
@@ -1238,15 +1286,17 @@ async def _genie_audit_rows() -> list[dict]:
 
 def _genie_audit_signals(audit: dict) -> list:
     sig = []
+    label = GENIE_SPEC["signal_labels"]
     if audit.get("total") is not None:
-        sig.append({"label": "Genie Agents", "value": audit["total"],
+        sig.append({"label": label["total"], "value": audit["total"],
                     "detail": f"Distinct agents observed in this workspace's audit log ({_GENIE_AUDIT_LOOKBACK_DAYS}d)"})
     if audit.get("active_30d") is not None:
-        sig.append({"label": "Active agents (30d)", "value": audit["active_30d"],
+        sig.append({"label": label["active_30d"], "value": audit["active_30d"],
                     "detail": "Distinct agents with activity in the last 30 days — audit log"})
     return sig
 
 
+@_with_gap_ids
 async def probe_genie_agents() -> dict:
     """Count Genie Agents from the audit log ONLY (system.access.audit / aibiGenie).
 
@@ -1271,24 +1321,26 @@ async def probe_genie_agents() -> dict:
 
     score = 0.0
     if total > 0:
-        score += 40
+        score += GENIE_TOTAL_POINTS
     if active > 0:
-        score += 40
-    if total > 0 and active / total >= 0.3:
-        score += 20
+        score += GENIE_ACTIVE_POINTS
+    if total > 0 and active / total >= GENIE_ACTIVE_SHARE:
+        score += GENIE_SHARE_POINTS
     score = min(score, 100.0)
 
-    gaps = []
+    gaps: list[str] = []
+    gap_ids: list[str] = []
     if total == 0:
-        gaps.append("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics.")
+        _spec_gap(GENIE_SPEC, "no_genie_agents", gaps, gap_ids)
     elif active == 0:
-        gaps.append(f"{total} Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.")
+        _spec_gap(GENIE_SPEC, "no_active_genie_agents", gaps, gap_ids, total=total)
 
     return {
         "available": True,
         "score": round(score, 1),
         "signals": _genie_audit_signals(audit),
         "gaps": gaps,
+        "gap_ids": gap_ids,
         "note": f"Counted from the in-scope workspaces' system.access.audit events over the last "
                 f"{_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie). Curation quality — instructions, "
                 "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
@@ -1549,8 +1601,11 @@ async def probe_domains() -> dict:
 # ---------------------------------------------------------------------------
 # 7. Adoption & activity (system tables — optional)
 # ---------------------------------------------------------------------------
+@_with_gap_ids
 async def probe_adoption() -> dict:
     wsf, wparams = workspace_predicate()
+    q = ADOPTION_SPEC["queries_by_id"]
+    label = ADOPTION_SPEC["signal_labels"]
     try:
         # Keep the last read failure so we can classify WHY both signals came back
         # empty (issue #20): system tables not enabled vs. a grant the SP/viewer
@@ -1562,8 +1617,7 @@ async def probe_adoption() -> dict:
             # lacks the grant, execute_sql falls back to the app SP automatically.
             # Scoped to the workspaces in the active filter (issue #25).
             active_users = await _scalar(
-                "SELECT COUNT(DISTINCT user_identity.email) FROM system.access.audit "
-                f"WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}",
+                render_sql(q["active_users"]["sql"], workspace_filter=wsf).rstrip(";"),
                 parameters=wparams,
             )
         except Exception as e:
@@ -1573,8 +1627,7 @@ async def probe_adoption() -> dict:
         queries_30d = None
         try:
             queries_30d = await _scalar(
-                "SELECT COUNT(*) FROM system.query.history "
-                f"WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}",
+                render_sql(q["queries_30d"]["sql"], workspace_filter=wsf).rstrip(";"),
                 parameters=wparams,
             )
         except Exception as e:
@@ -1600,29 +1653,17 @@ async def probe_adoption() -> dict:
 
         # Band the (time-windowed) activity counts into fixed tiers so day-to-day
         # drift rarely moves the score — keeps runs comparable while still
-        # rewarding real adoption.
-        def _band(users: int | None) -> float:
-            u = users or 0
-            if u <= 0:
-                return 0.0
-            if u < 5:
-                return 20.0
-            if u < 20:
-                return 35.0
-            if u < 50:
-                return 45.0
-            return 50.0
-
-        score = _band(active_users)
+        # rewarding real adoption (the bands are in the spec).
+        score = adoption_band_points(active_users)
         if queries_30d and queries_30d > 0:
-            score += 50
+            score += ADOPTION_QUERY_POINTS
         score = min(score, 100.0)
 
         signals = []
         if active_users is not None:
-            signals.append({"label": "Active users (30d)", "value": active_users, "detail": "Distinct users in audit log"})
+            signals.append({"label": label["active_users"], "value": active_users, "detail": "Distinct users in audit log"})
         if queries_30d is not None:
-            signals.append({"label": "Queries (30d)", "value": queries_30d, "detail": "Query history volume"})
+            signals.append({"label": label["queries_30d"], "value": queries_30d, "detail": "Query history volume"})
 
         # Per-workspace drill-down (#10) — only meaningful when more than one
         # workspace is in scope (adoption is otherwise a single workspace-wide number).
@@ -1636,7 +1677,7 @@ async def probe_adoption() -> dict:
                 await _adoption_by_workspace(wsf, wparams),
             )
 
-        return {"available": True, "score": score, "signals": signals, "gaps": [], "note": None,
+        return {"available": True, "score": score, "signals": signals, "gaps": [], "gap_ids": [], "note": None,
                 "metrics": {"active_users_30d": active_users, "queries_30d": queries_30d},
                 "drill_down": drill_down}
     except Exception as e:
@@ -1653,12 +1694,12 @@ async def _adoption_by_workspace(wsf: str, wparams: dict) -> list[dict]:
             "FROM ( "
             "  SELECT workspace_id, COUNT(DISTINCT user_identity.email) AS active_users "
             "  FROM system.access.audit "
-            f"  WHERE event_date >= current_date() - INTERVAL 30 DAYS {wsf}"
+            f"  WHERE event_date >= current_date() - INTERVAL {ADOPTION_WINDOW_DAYS} DAYS {wsf}"
             "  GROUP BY workspace_id "
             ") u "
             "LEFT JOIN ( "
             "  SELECT workspace_id, COUNT(*) AS queries FROM system.query.history "
-            f"  WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS {wsf}"
+            f"  WHERE start_time >= current_timestamp() - INTERVAL {ADOPTION_WINDOW_DAYS} DAYS {wsf}"
             "  GROUP BY workspace_id "
             ") q ON CAST(u.workspace_id AS STRING) = CAST(q.workspace_id AS STRING) "
             "LEFT JOIN system.access.workspaces_latest w "
