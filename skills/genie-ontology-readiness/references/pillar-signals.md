@@ -74,6 +74,8 @@ GROUP BY table_catalog, table_schema ORDER BY tables DESC LIMIT 500;
 
 ## 2. Metadata Richness — weight 22
 
+<!-- BEGIN GENERATED: pillar-metadata -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
@@ -88,8 +90,11 @@ SELECT COUNT(*) AS total,
        SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented
 FROM <COLUMNS> WHERE table_schema <> 'information_schema';
 
--- governed-tag reach (best-effort; treat failure as unknown)
-SELECT COUNT(DISTINCT table_name) AS tagged_tables FROM <TABLE_TAGS>;
+-- governed-tag reach (best-effort; treat failure as unknown). Count by
+-- fully-qualified name so same-named tables in different schemas/catalogs
+-- are counted separately (matches the Domains pillar).
+SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS tagged_tables
+FROM <TABLE_TAGS> WHERE schema_name <> 'information_schema';
 ```
 
 `table_pct = pct(table_commented, table_total)`;
@@ -97,13 +102,13 @@ SELECT COUNT(DISTINCT table_name) AS tagged_tables FROM <TABLE_TAGS>;
 
 **Score:** `round(0.5 * table_pct + 0.5 * col_pct, 1)`
 
-**Signals to display:** Tables commented (`table_pct`%), Columns commented
-(`col_pct`%), and Tagged tables (`tagged_tables`) when known.
+**Signals to display:** Tables commented (`table_pct`%), Columns commented (`col_pct`%), and Tagged tables (`tagged_tables`) when known.
 
 **Gaps:**
 - `table_pct < 80` → "Only `{table_pct}`% of tables have descriptions — Genie relies on these to understand data."
 - `col_pct < 60` → "Only `{col_pct}`% of columns are commented; aim for high coverage on gold-layer columns."
-- `tagged_tables == 0` (when `table_total > 0`) → "No governed tags found; tags aid discovery and domain organization."
+- `table_total > 0 and tagged_tables == 0` (only when the tag read succeeded) → "No governed tags found; tags aid discovery and domain organization."
+<!-- END GENERATED: pillar-metadata -->
 
 **Drill-down — Comment coverage by schema (worst first)** (which schemas drag the score down):
 
@@ -181,7 +186,7 @@ ORDER BY gold_tables ASC, foreign_keys ASC LIMIT 500;
 
 ---
 
-## 4. Metric Views — weight 20
+## 4. Metrics — weight 20
 
 **Signals**
 

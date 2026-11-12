@@ -32,6 +32,15 @@ import json
 import logging
 import aiohttp
 
+from server.signal_spec import (
+    METADATA as METADATA_SPEC,
+    TABLE_COMMENT_TARGET_PCT,
+    COLUMN_COMMENT_TARGET_PCT,
+    METADATA_TABLE_WEIGHT,
+    METADATA_COLUMN_WEIGHT,
+    gap_text,
+    render_sql,
+)
 from server.security import quote_ident, quote_literal, safe_error
 from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
 from server.user_agent import with_ua
@@ -400,7 +409,7 @@ def _src(view: str, sources: dict) -> str | None:
     return f"({union}) AS _t"
 
 
-def _internal_catalog_filter(sources: dict) -> str:
+def _internal_catalog_filter(sources: dict, column: str = "table_catalog") -> str:
     """Extra WHERE clause to exclude internal catalogs when grouping by
     ``table_catalog`` over the metastore-wide system view — the named internal
     catalogs plus any ``__``-prefixed system catalog (e.g. Databricks-internal
@@ -409,7 +418,7 @@ def _internal_catalog_filter(sources: dict) -> str:
     if not sources.get("system_ok"):
         return ""
     in_list = ", ".join("'" + c + "'" for c in _INTERNAL_CATALOGS)
-    return f"AND table_catalog NOT IN ({in_list}) AND table_catalog NOT RLIKE '^__' "
+    return f"AND {column} NOT IN ({in_list}) AND {column} NOT RLIKE '^__' "
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +693,16 @@ async def _column_coverage_chunked(
     return c_total, c_commented, per_schema
 
 
+def tagged_tables_sql(source: str, where: str) -> str:
+    """Distinct tables carrying >=1 governed tag, counted by fully-qualified name (#92).
+
+    The SQL is the shared spec query (``signal_spec.METADATA``), so the skill renders
+    the identical statement.
+    """
+    q = METADATA_SPEC["queries_by_id"]["tagged_tables"]
+    return render_sql(q["sql"], {"<TABLE_TAGS>": source}, schema_filter=where).rstrip(";")
+
+
 async def probe_metadata() -> dict:
     s = await _resolve_sources()
     tbl = _src("tables", s)
@@ -746,30 +765,36 @@ async def probe_metadata() -> dict:
         tt = _src("table_tags", s)
         if tt is not None:
             try:
-                tagged_tables = await _scalar(
-                    f"SELECT COUNT(DISTINCT table_name) FROM {tt} WHERE {_schema_sql(s, 'schema_name')}"
-                )
+                # Same population as the table-comment scan above: in system mode, drop
+                # internal catalogs (system/__databricks_internal/...) so their tags
+                # don't count — matches the skill's source-resolution rule.
+                tag_where = _schema_sql(s, "schema_name") + " " + _internal_catalog_filter(s, "catalog_name")
+                tagged_tables = await _scalar(tagged_tables_sql(tt, tag_where.strip()))
             except Exception:
                 tagged_tables = None
 
         table_pct = _pct(t_commented, t_total)
         col_pct = _pct(c_commented, c_total)
-        score = round(0.5 * table_pct + 0.5 * col_pct, 1)
+        score = round(METADATA_TABLE_WEIGHT * table_pct + METADATA_COLUMN_WEIGHT * col_pct, 1)
 
         gaps = []
-        if table_pct < 80:
-            gaps.append(f"Only {table_pct}% of tables have descriptions — Genie relies on these to understand data.")
-        if col_pct < 60:
-            gaps.append(f"Only {col_pct}% of columns are commented; aim for high coverage on gold-layer columns.")
+        if table_pct < TABLE_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "table_comments_low", table_pct=table_pct))
+        if col_pct < COLUMN_COMMENT_TARGET_PCT:
+            gaps.append(gap_text(METADATA_SPEC, "column_comments_low", col_pct=col_pct))
         if tagged_tables is not None and t_total and tagged_tables == 0:
-            gaps.append("No governed tags found; tags aid discovery and domain organization.")
+            gaps.append(gap_text(METADATA_SPEC, "no_tagged_tables"))
 
+        label = METADATA_SPEC["signal_labels"]
         signals = [
-            {"label": "Tables commented", "value": table_pct, "unit": "%", "detail": f"{t_commented} of {t_total} tables"},
-            {"label": "Columns commented", "value": col_pct, "unit": "%", "detail": f"{c_commented} of {c_total} columns"},
+            {"label": label["table_comments"], "value": table_pct, "unit": "%",
+             "detail": f"{t_commented} of {t_total} tables"},
+            {"label": label["column_comments"], "value": col_pct, "unit": "%",
+             "detail": f"{c_commented} of {c_total} columns"},
         ]
         if tagged_tables is not None:
-            signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
+            signals.append({"label": label["tagged_tables"], "value": tagged_tables,
+                            "detail": "Tables with ≥1 governed tag"})
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
