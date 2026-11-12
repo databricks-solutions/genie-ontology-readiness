@@ -222,17 +222,139 @@ the app, using **your own** Unity Catalog permissions. It produces the same seve
 scorecard, maturity level, readiness stage, and prioritized gaps, with no app, app
 service principal, or Lakebase.
 
-1. Publish the skill folder (`SKILL.md` + `references/`) as a Unity Catalog skill in a
-   catalog/schema you own, or copy it into your workspace skills folder.
-2. In Genie Code, ask *"Assess this workspace's Genie Ontology readiness"* (or invoke
-   `genie-ontology-readiness`).
-3. You need `USE CATALOG` + `SELECT` on the catalogs to assess. `SELECT` on
+There are two ways to install it. **Start with the workspace folder:** it needs no
+preview. Publish it as a Unity Catalog skill only if you need UC grants, tags and
+audit for sharing, and your workspace can turn on the Beta previews it needs. A UC
+skill loads in **Genie One** only: Genie Code reads skills from workspace folders, not
+from Unity Catalog.
+
+#### 1. Install it in a workspace skills folder (recommended, no preview needed)
+
+Genie Code loads every skill in `/Workspace/.assistant/skills/` (all users) and
+`/Users/<you>/.assistant/skills/` (just you)
+([docs](https://docs.databricks.com/aws/en/genie-code/skills)). Genie One's
+*Customizations → Skills* lists the same folders. From the repository root:
+
+```bash
+P=<your-profile>
+# Everyone in the workspace:
+databricks workspace import-dir skills/genie-ontology-readiness \
+  /Workspace/.assistant/skills/genie-ontology-readiness --overwrite -p $P
+# ...or only you:
+# databricks workspace import-dir skills/genie-ontology-readiness \
+#   "/Users/<you>/.assistant/skills/genie-ontology-readiness" --overwrite -p $P
+```
+
+To update it, run the same command with the new release. Access follows the folder's
+workspace permissions.
+
+#### 2. Optional: publish it as a Unity Catalog skill (Beta, Genie One only)
+
+A [UC skill](https://docs.databricks.com/aws/en/ai-gateway/govern-skills) is a securable
+(`<catalog>.<schema>.genie-ontology-readiness`), so access is managed with grants, tags
+and audit like any other UC object. **This path is Beta** and needs two previews
+([docs](https://docs.databricks.com/aws/en/genie-one/chat#share-a-skill-with-your-team)):
+
+- **Enhanced Unity AI Gateway**: account console → *Previews* (account admin).
+- **Unity Gateway skills in Genie**: workspace → *Previews* (workspace admin,
+  [how](https://docs.databricks.com/aws/en/admin/workspace-settings/manage-previews)).
+
+Genie Code doesn't load UC skills
+([Genie Code skills docs](https://docs.databricks.com/aws/en/genie-code/skills) cover
+workspace folders only), so keep the step 1 install for Genie Code users.
+
+Use a schema in a standard (not foreign) catalog with managed storage. Publishing needs
+`USE CATALOG`, `USE SCHEMA` and `CREATE VOLUME`; updating needs `WRITE VOLUME` and
+`READ VOLUME`; people who run the skill need `USE CATALOG`, `USE SCHEMA` and
+`READ VOLUME`. From the repository root:
+
+```bash
+P=<your-profile>; CAT=<catalog>; SCH=<schema>; NAME=genie-ontology-readiness
+HOST=$(databricks auth describe -p $P -o json | jq -r .details.host)
+TOKEN=$(databricks auth token -p $P | jq -r .access_token)
+
+# a. Create the skill securable (first publish only)
+databricks api post "/api/2.1/unity-catalog/skills?parent=schemas/$CAT.$SCH&skill_id=$NAME" \
+  --json '{}' -p $P
+
+# b. Upload the bundle (raw bytes, one PUT per file)
+for f in SKILL.md references/pillar-signals.md references/scoring-and-output.md; do
+  curl -sf -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" \
+    --data-binary @skills/$NAME/$f "$HOST/api/2.0/fs/files/Skills/$CAT/$SCH/$NAME/$f?overwrite=true"
+done
+
+# c. Finalize: the server validates SKILL.md's frontmatter and serves the new bundle
+databricks api post "/api/2.1/unity-catalog/skills/$CAT.$SCH.$NAME/finalize" -p $P
+```
+
+To **update** a published skill, rerun steps b and c; grants, tags and the owner are
+kept. The upload overwrites and adds files but never deletes them, so if a release
+removes a file, delete it from `/Skills/$CAT/$SCH/$NAME/` as well.
+
+> `databricks fs cp <dir> dbfs:/Skills/...` also uploads the bundle, but it fails with
+> *"Public DBFS root is disabled"* on workspaces that disable the DBFS root. The Files
+> API `PUT` above works either way.
+
+You can also publish from the UI instead: install the skill in your workspace folder
+(step 1), then in Genie One open *Customizations → Skills*, select the skill, click
+**Share**, and pick a catalog and schema under **Publish to**.
+
+**Share it.** Sharing is a UC grant, not a copy: users read the live skill under your
+grants and audit. Grant the people who run it:
+
+```sql
+GRANT USE CATALOG ON CATALOG <catalog> TO `<group>`;
+GRANT USE SCHEMA, READ VOLUME ON SCHEMA <catalog>.<schema> TO `<group>`;
+```
+
+Or, in Genie One, open *Customizations → Skills*, select the skill, click **Share**, add
+users or groups, and click **Done**. Only the skill's owner, or a principal with
+`MANAGE` on it, can change its grants.
+
+**Enable or install it.** In Genie One, *Customizations → Skills* lists shared skills
+next to your own (or use **+** → *Skills* → *Browse skills* in a chat). A skill you
+published yourself shows an **Enable skill** switch, off by default; turn it on. A
+skill a teammate shared with you shows **Install**. Enabled and installed skills also
+run in Genie One scheduled tasks. The Genie One UI can't add files to a published skill, so update it
+with steps b and c above (or Catalog Explorer).
+
+**Use it from a local coding agent (optional).** The
+[Unity Gateway CLI](https://docs.databricks.com/aws/en/agents/uc-skills/use-uc-skills)
+downloads the published skill into Claude Code, Codex, Gemini, OpenCode, or Copilot:
+
+```bash
+uv tool install git+https://github.com/databricks/unity-gateway
+ug configure --agents claude --workspaces https://<workspace-host>
+ug skills add --names <catalog>.<schema>.genie-ontology-readiness
+```
+
+A download is a point-in-time copy; run `ug skills add` again after each release.
+
+More: [create and share UC skills](https://docs.databricks.com/aws/en/agents/uc-skills/create-share-uc-skills)
+· [Skills API reference](https://docs.databricks.com/aws/en/ai-gateway/skill-reference).
+
+After installing or updating by either path, **start a new chat**; chats already open
+keep the old version.
+
+#### 3. Run it
+
+1. In Genie Code or Genie One, ask *"Assess this workspace's Genie Ontology
+   readiness"* (or type `/genie-ontology-readiness`).
+2. You need `USE CATALOG` + `SELECT` on the catalogs to assess. `SELECT` on
    `system.information_schema`, `system.access.audit`, `system.query.history`, and
    `system.access.table_lineage` makes the result richer. A pillar whose reads are
    denied is reported as *unavailable*; it doesn't fail the run.
 
-The skill transcribes the app's scoring (`app/server/pillars.py`,
-`app/server/assessment/`). Scoring changes must update both together.
+#### Keeping the skill in sync with the app
+
+The skill and the app share one signal spec: weights, levels, stages, the roll-up
+rules, and each migrated pillar's SQL, score formula, and gap text live in
+`app/server/pillars.py` and `app/server/signal_spec.py`. The matching sections of the
+skill's docs are generated from them. To change a signal, edit the spec, run
+`python3 scripts/render_skill.py`, and commit both. `scripts/check.sh` fails if the
+skill docs are stale. Pillars not yet migrated to `signal_spec.py` are still
+transcribed by hand and must be updated in both places
+([#108](https://github.com/databricks-solutions/genie-ontology-readiness/issues/108)).
 
 ## Permissions required
 

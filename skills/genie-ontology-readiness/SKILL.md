@@ -5,7 +5,7 @@ description: >-
   (and the learned Genie Ontology preview) by running read-only SQL against
   information_schema and system tables. Produces a weighted 0-100 readiness
   score across seven pillars — Unity Catalog foundation, metadata richness,
-  relationships & modeling, metric views, Genie Agents, domains & stewardship,
+  relationships & modeling, metrics, Genie Agents, domains & stewardship,
   and adoption — with a maturity level, a readiness stage, and prioritized,
   gap-driven next steps. Use when someone asks "is <workspace> ready for Genie /
   Genie Ontology", "score our Genie readiness", "assess our Unity Catalog
@@ -113,13 +113,15 @@ signal) always read the account-level system tables directly — they don't use
 
 ## Scoring at a glance
 
-- Seven pillars, each scored 0-100. Pillar **weights sum to 100**:
-  UC foundation 15 · metadata 22 · relationships 12 · metrics 20 ·
-  Genie Agents 16 · domains 10 · adoption 5.
+<!-- BEGIN GENERATED: at-a-glance -->
+<!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
+- 7 pillars, each scored 0-100. Pillar **weights sum to 100**:
+  Unity Catalog Foundation 15 · Metadata Richness 22 · Relationships & Modeling 12 · Metrics 20 · Genie Agents 16 · Domains & Stewardship 10 · Adoption & Activity 5.
 - **Overall** = weighted average of the pillar scores (an unavailable pillar
   contributes 0). Map it to a maturity **level** (0-4) and a **readiness stage**.
 - **Prioritized gaps** = each pillar's gaps, ordered lowest-score / highest-weight
   first, top 6.
+<!-- END GENERATED: at-a-glance -->
 
 Full formulas, level/stage tables, and the scorecard template are in
 `references/scoring-and-output.md`. Read both reference files before running.
