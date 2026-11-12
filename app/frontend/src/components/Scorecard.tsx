@@ -34,6 +34,7 @@ import type {
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
+import { defaultTrendScope, resolveTrendScope, scopeDetail, scopeLabel, scopeOptions, trendRuns } from '../utils/scope';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
@@ -338,15 +339,23 @@ export default function Scorecard({
     [config.pillars, pillarsByKey]
   );
 
+  // "Readiness over time" only plots runs with the SAME scope (#89): a run on
+  // catalog A next to one on A+B isn't a trend. Default to the scope of the run on
+  // screen; the picker switches to another saved scope. Runs saved before scopes
+  // were recorded (no scope_hash) are left out.
+  const trendScopes = useMemo(() => scopeOptions(history), [history]);
+  const autoTrendScope = useMemo(() => defaultTrendScope(history, currentId), [history, currentId]);
+  const [pickedTrendScope, setPickedTrendScope] = useState<string | null>(null);
+  // A pick lasts until a different run is shown (then follow that run's scope).
+  useEffect(() => setPickedTrendScope(null), [currentId]);
+  const trendScope = resolveTrendScope(pickedTrendScope, trendScopes, autoTrendScope);
   const trendData = useMemo(
     () =>
-      [...history]
-        .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-        .map((h) => ({
-          date: new Date(h.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-          score: h.overall_score,
-        })),
-    [history]
+      trendRuns(history, trendScope).map((h) => ({
+        date: new Date(h.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+        score: h.overall_score,
+      })),
+    [history, trendScope]
   );
 
   async function run() {
@@ -472,9 +481,11 @@ export default function Scorecard({
                   <span className="text-base font-bold tabular-nums w-8 text-center shrink-0" style={{ color: scoreColor(h.overall_score) }}>
                     {Math.round(h.overall_score)}
                   </span>
-                  <span className="flex-1 min-w-0">
+                  <span className="flex-1 min-w-0" title={scopeDetail(h.scope)}>
                     <span className="block text-xs font-medium text-ink-700 truncate">{fmtWhen(h.created_at)}</span>
-                    <span className="block text-[11px] text-ink-400">Readiness score</span>
+                    <span className="block text-[11px] text-ink-400 truncate" data-testid="history-scope">
+                      {scopeLabel(h.scope)}
+                    </span>
                   </span>
                   {loadingId === h.id && <Loader2 size={13} className="animate-spin text-ink-400 shrink-0" />}
                 </button>
@@ -689,20 +700,43 @@ export default function Scorecard({
             </ResponsiveContainer>
           </div>
 
-          {config.lakebase_enabled && trendData.length > 1 && (
+          {config.lakebase_enabled && trendScopes.some((o) => o.runs > 1) && (
             <div className="card p-5">
               <div className="flex items-center gap-2 mb-2">
                 <TrendingUp size={15} className="text-databricks-500" />
                 <h3 className="text-sm font-semibold text-ink-700">Readiness over time</h3>
+                {trendScopes.length > 1 ? (
+                  <select
+                    value={trendScope ?? ''}
+                    onChange={(e) => setPickedTrendScope(e.target.value || null)}
+                    data-testid="trend-scope"
+                    title="Only runs with the same scope are compared"
+                    className="ml-auto max-w-[180px] rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-ink-600"
+                  >
+                    {trendScopes.map((o) => (
+                      <option key={o.hash} value={o.hash}>{`${o.label} (${o.runs})`}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="ml-auto text-[11px] text-ink-400 truncate">
+                    {scopeLabel(history.find((h) => h.scope_hash === trendScope)?.scope)}
+                  </span>
+                )}
               </div>
-              <ResponsiveContainer width="100%" height={140}>
-                <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="score" stroke="#FF3621" strokeWidth={2} dot={{ r: 3 }} />
-                </LineChart>
-              </ResponsiveContainer>
+              {trendData.length > 1 ? (
+                <ResponsiveContainer width="100%" height={140}>
+                  <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#97afb2' }} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#97afb2' }} />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="score" stroke="#FF3621" strokeWidth={2} dot={{ r: 3 }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-xs text-ink-400 py-6 text-center" data-testid="trend-single-run">
+                  Only one run has this scope so far. Run again with the same catalogs to see a trend.
+                </p>
+              )}
             </div>
           )}
         </div>

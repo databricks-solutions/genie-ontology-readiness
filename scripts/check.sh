@@ -9,12 +9,13 @@
 #   3. frontend build-artifact assertion
 #   4. python lint (ruff)
 #   5. python tests (pytest)
-#   6. compliance / secrets-and-raw-data scan
-#   7. cross-cloud doc-link coverage (OPT-IN — makes network calls, so it is off
+#   6. skill docs in sync with the App's signal spec (render_skill.py --check)
+#   7. compliance / secrets-and-raw-data scan
+#   8. cross-cloud doc-link coverage (OPT-IN — makes network calls, so it is off
 #      by default to keep this gate hermetic/offline; enable when cutting a release)
 #
 # Usage:  bash scripts/check.sh
-#         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 7 (needs network)
+#         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 8 (needs network)
 # Exits non-zero on the first failing gate.
 set -euo pipefail
 
@@ -40,7 +41,7 @@ step "Backend: install deps (app requirements + tooling)"
 # provision them before collecting — mirror the frontend's `npm ci`. Best-effort
 # so a machine without a writable pip env degrades to the skips below rather than
 # aborting; use a venv/uv if this warns (e.g. PEP 668 externally-managed).
-python3 -m pip install -q -r app/requirements.txt ruff pytest httpx || \
+python3 -m pip install -q -r requirements-dev.txt || \
   echo "  (warning) backend dep install failed — ruff/pytest may be skipped below" >&2
 
 step "Backend: ruff lint"
@@ -60,6 +61,11 @@ else
     echo "pytest not installed — 'pip install pytest'. Skipping tests." >&2
   }
 fi
+
+step "Skill: generated docs match the App spec"
+# skills/genie-ontology-readiness/ is rendered in part from app/server/pillars.py +
+# signal_spec.py (#108). Fails with a diff when someone edits one side only.
+python3 scripts/render_skill.py --check
 
 step "Compliance: secrets / raw-data scan"
 bash scripts/__tests__/compliance_scan.test.sh

@@ -165,12 +165,23 @@ export interface Scorecard {
   top_gaps: TopGap[];
 }
 
+// What a run covered (#89). Lower-cased, sorted names; [] catalogs = all catalogs,
+// [] workspace_ids = all workspaces. null on snapshots saved before scopes existed.
+export interface AssessmentScope {
+  catalogs: string[];
+  schemas: string[];
+  workspace_mode: 'include' | 'exclude' | null;
+  workspace_ids: string[];
+}
+
 export interface HistorySnapshot {
   id: string | number;
   created_at: string;
   created_by: string;
   overall_score: number;
   overall_level: number;
+  scope?: AssessmentScope | null;
+  scope_hash?: string | null;
 }
 
 export interface HistoryResponse {
@@ -242,6 +253,7 @@ export interface CompareEndpoint {
   id: number | string | null;
   created_at: string | null;
   overall: ScorecardOverall;
+  scope?: AssessmentScope | null;
 }
 
 export interface CompareResult {
@@ -257,6 +269,9 @@ export interface CompareResult {
     removed: number;
     unavailable: number;
   };
+  // #89: false when the two runs covered different catalogs/schemas/workspaces;
+  // null when either run predates saved scopes.
+  same_scope?: boolean | null;
 }
 
 export interface PlanListItem {
