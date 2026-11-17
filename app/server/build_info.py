@@ -27,7 +27,11 @@ from server.user_agent import PRODUCT_VERSION, with_ua
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = aiohttp.ClientTimeout(total=5)
+# A lookup that found no commit is retried after this long (a transient Apps
+# API failure at startup must not hide the commit until the next restart).
+_RETRY_SECONDS = 60.0
 _cached: Optional[dict] = None
+_cached_at = 0.0
 _lock = asyncio.Lock()
 
 
@@ -50,8 +54,10 @@ def _git_sha() -> Optional[str]:
 async def _active_deployment(app_name: str) -> dict:
     """The app's own active deployment, or {} (no access, not on Apps, timeout)."""
     try:
-        url = f"{get_workspace_host()}/api/2.0/apps/{app_name}"
-        headers = get_auth_headers(force_sp=True)
+        # Both can do blocking network I/O (SDK host/token resolution): off the loop.
+        host = await asyncio.to_thread(get_workspace_host)
+        headers = await asyncio.to_thread(get_auth_headers, True)
+        url = f"{host}/api/2.0/apps/{app_name}"
         async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=with_ua()) as s:
             async with s.get(url, headers=headers) as r:
                 if r.status != 200:
@@ -80,30 +86,39 @@ async def _resolve() -> dict:
     if app_name:
         dep = await _active_deployment(app_name)
         git = dep.get("git_source") or {}
-        info.update(
-            deployment_id=dep.get("deployment_id"),
-            deployed_at=dep.get("update_time") or dep.get("create_time"),
-            ref=git.get("tag") or git.get("branch"),
-        )
-        if not info["commit"]:
-            sha = git.get("resolved_commit") or git.get("commit")
-            if sha:
-                info.update(commit=sha, source="deployment")
+        dep_sha = git.get("resolved_commit") or git.get("commit")
+        info.update(deployment_id=dep.get("deployment_id"),
+                    deployed_at=dep.get("update_time") or dep.get("create_time"))
+        if not info["commit"] and dep_sha:
+            info.update(commit=dep_sha, source="deployment")
+        if info["source"] == "deployment":
+            # The branch/tag describes the deployment's commit, so only pair them then.
+            info["ref"] = git.get("tag") or git.get("branch")
+        elif env_sha and dep_sha and not dep_sha.startswith(env_sha) and not env_sha.startswith(dep_sha):
+            logger.warning("build info: GOR_GIT_SHA %s differs from the deployed commit %s", env_sha, dep_sha)
     if not info["commit"]:
-        sha = _git_sha()
+        sha = await asyncio.to_thread(_git_sha)
         if sha:
             info.update(commit=sha, source="git")
     info["commit_short"] = _short(info["commit"])
     return info
 
 
+def _fresh(now: float) -> bool:
+    # A result with a commit is final for the process (a deploy restarts it);
+    # one without is retried after _RETRY_SECONDS.
+    return _cached is not None and (_cached["commit"] is not None or now - _cached_at < _RETRY_SECONDS)
+
+
 async def get_build_info() -> dict:
-    """Resolved once per process (a deploy restarts the app), then cached."""
-    global _cached
-    if _cached is None:
+    """The running build, resolved lazily and cached (see ``_fresh``)."""
+    global _cached, _cached_at
+    loop = asyncio.get_running_loop()
+    if not _fresh(loop.time()):
         async with _lock:
-            if _cached is None:
+            if not _fresh(loop.time()):
                 _cached = await _resolve()
+                _cached_at = loop.time()
                 logger.info("Build: %s (commit %s from %s, deployment %s)", build_label(_cached),
                             _cached["commit"], _cached["source"], _cached["deployment_id"])
     return _cached

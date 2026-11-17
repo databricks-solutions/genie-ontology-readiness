@@ -14,6 +14,7 @@ import {
 } from 'recharts';
 import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows } from 'lucide-react';
 import { apiDeleteQuiet, apiGet } from '../hooks/useApi';
+import { useCopy } from '../hooks/useCopy';
 import { AssessRunError, runAssessment, serverErrorDetails } from '../utils/assessRun';
 import type { PendingPillar } from '../utils/assessRun';
 import type {
@@ -44,18 +45,9 @@ import { buildLines } from './BuildWatermark';
 
 /** Error line plus optional expandable detail lines (with a copy button). */
 function ErrorNotice({ message, details, centered }: { message: string; details?: string[]; centered?: boolean }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, copyText] = useCopy();
   const hasDetails = !!details && details.length > 0;
-  const copy = () => {
-    const text = [message, ...(details || [])].join('\n');
-    navigator.clipboard?.writeText(text).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      },
-      () => undefined
-    );
-  };
+  const copy = () => copyText([message, ...(details || [])].join('\n'));
   return (
     <div className={`mt-4 text-sm text-red-600 ${centered ? 'mx-auto max-w-2xl' : ''}`} role="alert">
       <p className={`flex items-center gap-1.5 ${centered ? 'justify-center' : ''}`}>
@@ -415,8 +407,8 @@ export default function Scorecard({
         .filter((cp) => !collected[cp.key])
         .map((cp) => ({ name: cp.name, progress: progress[cp.key] }));
     const showError = (message: string, lines: string[]) => {
-      // The build goes into every report, so a copied error says which deploy it came from.
-      const all = lines.length ? [...lines, ...buildLines(config.build)] : [];
+      // The build goes into every run error, so a copied report says which deploy it came from.
+      const all = [...lines, ...buildLines(config.build)];
       setError(message);
       setErrorDetails(all.length ? { message, lines: all } : null);
     };

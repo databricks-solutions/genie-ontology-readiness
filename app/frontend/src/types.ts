@@ -29,7 +29,6 @@ export interface AppConfig {
   history_ready?: boolean;
   genie_space_configured: boolean;
   assess_catalogs: string[];
-  version?: string;
   build?: BuildInfo;
 }
 

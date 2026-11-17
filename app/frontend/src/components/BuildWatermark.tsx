@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCopy } from '../hooks/useCopy';
 import type { BuildInfo } from '../types';
 
 /** Detail lines describing the running build (tooltip, copy, error reports). */
@@ -14,17 +14,10 @@ export function buildLines(build?: BuildInfo | null): string[] {
 /** Small, low-contrast build label pinned to the bottom-right corner. Hover for
  * the full commit and deployment; click to copy them (for bug reports). */
 export default function BuildWatermark({ build }: { build?: BuildInfo | null }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, copyText] = useCopy();
   if (!build?.label) return null;
   const details = buildLines(build).join('\n');
-  const copy = () =>
-    navigator.clipboard?.writeText(details).then(
-      () => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      },
-      () => undefined
-    );
+  const copy = () => copyText(details);
   return (
     <button
       type="button"
