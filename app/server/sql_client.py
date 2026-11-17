@@ -142,6 +142,15 @@ class StatementTimeout(Exception):
     """A statement did not finish within its poll budget (it was cancelled)."""
 
 
+class _TransientRead(Exception):
+    """A status read the proxy/gateway answered with a retryable HTTP status."""
+
+
+# Proxy/gateway statuses worth retrying on a status read; any other 4xx/5xx
+# (e.g. an expired token's 401/403) fails the statement at once.
+_TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+
+
 async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
                       record: bool = True, poll_seconds: int = DEFAULT_POLL_SECONDS,
                       wait_seconds: int = 50) -> list[dict]:
@@ -336,11 +345,17 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
             try:
                 async with session.get(url, headers=auth_headers,
                                        timeout=aiohttp.ClientTimeout(total=min(30.0, remaining))) as resp:
+                    code = getattr(resp, "status", 200)
+                    if code in _TRANSIENT_HTTP:
+                        raise _TransientRead(f"HTTP {code}")
+                    if code >= 400:
+                        raise Exception(f"SQL Warehouse error ({code}) reading statement {statement_id}")
                     result = await resp.json()
-            except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as e:
+            except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+                    _TransientRead) as e:
                 if last:
                     break
-                logger.info(f"status read for statement {statement_id} failed ({type(e).__name__}); retrying")
+                logger.info(f"status read for statement {statement_id} failed ({type(e).__name__}: {e}); retrying")
                 continue
             state = result.get("status", {}).get("state", "")
             if state == "SUCCEEDED":

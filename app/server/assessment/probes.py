@@ -659,12 +659,14 @@ async def _column_coverage_chunked(
     # Floor: even a one-batch scan can retry one timed-out batch catalog by catalog.
     retry_budget = max(_METADATA_RETRY_BUDGET_PER_BATCH * len(batches), 2 * _METADATA_BATCH_SIZE)
     # ORIGINAL-batch failures before the first success are held, not retried. When
-    # the queue drains with nothing read yet, up to 3 single catalogs from the held
-    # batches are tried as a canary. If any reads, every held batch is released and
-    # retried normally; if none does, the failure is systemic (warehouse down,
-    # access lost) and the scan ends with "all failed": 3 extra queries, no fan-out.
+    # the queue drains with nothing read yet, up to 6 single catalogs (evenly spread
+    # over the held batches) are tried as a canary. Once every canary has returned:
+    # if any read, the held batches are released and retried normally (minus the
+    # canaries, so nothing is counted twice); if none did, the failure is systemic
+    # (warehouse down, access lost) and the scan ends with "all failed".
     held: list[tuple[list[str], Exception]] = []
     canary_used = False
+    canaries_in_flight: set[str] = set()
     settled: set[str] = set()  # catalogs already read or skipped (never re-counted)
     per_schema: dict[tuple[str, str], tuple[int, int]] = {}
     skipped: list[str] = []
@@ -701,6 +703,8 @@ async def _column_coverage_chunked(
             failed: list[tuple[list[str], Exception]] = []
             for d in done:
                 batch, original, rows, err = d.result()
+                if len(batch) == 1:
+                    canaries_in_flight.discard(batch[0])
                 if err is not None:
                     (held if original and ok_cats == 0 else failed).append((batch, err))
                     continue
@@ -714,12 +718,14 @@ async def _column_coverage_chunked(
                     cat, sch = r.get("cat"), r.get("sch")
                     if cat and sch:
                         per_schema[(cat, sch)] = (t, c)
-            if ok_cats > 0 and held:
+            if ok_cats > 0 and held and not canaries_in_flight:
                 failed, held = held + failed, []
             elif ok_cats == 0 and held and not pending and not failed and not canary_used:
                 canary_used = True
                 flat = [c for b, _ in held for c in b]
-                for c in dict.fromkeys([flat[0], flat[len(flat) // 2], flat[-1]]):
+                n = min(_METADATA_SCAN_CONCURRENCY, len(flat))
+                for c in dict.fromkeys(flat[(i * len(flat)) // n] for i in range(n)):
+                    canaries_in_flight.add(c)
                     pending.add(asyncio.ensure_future(_query([c], False)))
             for batch, err in failed:
                 batch = [c for c in batch if c not in settled]  # e.g. a canary already read it

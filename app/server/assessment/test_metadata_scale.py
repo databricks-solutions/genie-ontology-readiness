@@ -57,7 +57,7 @@ class ColumnScanTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(probes, "execute_sql", execute), patch.object(probes, "_emit_progress"):
             with self.assertRaises(RuntimeError):
                 await probes._column_coverage_chunked(cats, system_ok=False)
-        self.assertLessEqual(execute.await_count, 20 + 3)  # originals + a 3-query canary, no fan-out
+        self.assertLessEqual(execute.await_count, 20 + probes._METADATA_SCAN_CONCURRENCY)  # originals + canary, no fan-out
 
     async def test_scan_queries_get_a_budget_below_the_no_progress_stop(self):
         execute = AsyncMock(return_value=_rows_for(["a"]))
@@ -145,7 +145,7 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skipped, ["huge"])
         self.assertEqual(seen[0], 9)
         self.assertTrue(all(n == 1 for n in seen[1:]))  # no halving rounds of the slow catalog
-        self.assertLessEqual(len(seen), 1 + 3 + 9)       # original + canary + singles
+        self.assertLessEqual(len(seen), 1 + probes._METADATA_SCAN_CONCURRENCY + 9)  # original + canary + singles
 
     async def test_a_remote_connection_timeout_message_is_split_not_fanned_out(self):
         # A federated "Connection timed out" error is not a statement timeout.
@@ -195,6 +195,24 @@ class CanaryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skipped, ["c00"])
         self.assertEqual(len(per_schema), 24)
         self.assertEqual((total, commented), (240, 120))  # each catalog counted once
+
+
+class CanaryTimingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_canaries_finishing_at_different_times_are_counted_once(self):
+        cats = [f"c{i:02d}" for i in range(25)]  # ONE batch; c00 broken
+
+        async def fake(query, *a, **k):
+            found = _cats_in(query, cats)
+            if "c00" in found:
+                raise Exception("[FAILED_JDBC.CONNECTION] remote down")
+            if found == ["c24"]:
+                await asyncio.sleep(0.05)  # the last canary returns late
+            return _rows_for(found)
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            total, commented, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(skipped, ["c00"])
+        self.assertEqual((total, commented, len(per_schema)), (240, 120, 24))
 
 
 class ReadabilityShapeTest(unittest.IsolatedAsyncioTestCase):

@@ -109,6 +109,29 @@ class CancelAndPlumbingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.gets, 1)
         self.assertEqual(session.posts, ["https://h/api/2.0/sql/statements/st-7/cancel"])
 
+    async def test_transient_proxy_pages_are_retried_but_401_is_not(self):
+        class _Seq(_Session):
+            def __init__(self, codes):
+                super().__init__()
+                self.codes = list(codes)
+
+            def get(self, url, headers=None, timeout=None):
+                self.gets += 1
+                code = self.codes.pop(0)
+                r = _Resp({"status": {"state": "SUCCEEDED"}})
+                r.status = code
+                return r
+
+        ok = _Seq([502, 429, 200])
+        result = await sql_client._poll_statement(ok, "https://h", {}, "st-8", poll_seconds=10)
+        self.assertEqual(result["status"]["state"], "SUCCEEDED")
+        self.assertEqual(ok.gets, 3)
+
+        denied = _Seq([401])
+        with self.assertRaisesRegex(Exception, r"\(401\)"):
+            await sql_client._poll_statement(denied, "https://h", {}, "st-9", poll_seconds=10)
+        self.assertEqual(denied.posts, ["https://h/api/2.0/sql/statements/st-9/cancel"])
+
     async def test_one_slow_status_read_is_retried_not_fatal(self):
         session = _FlakySession()
         result = await sql_client._poll_statement(session, "https://h", {}, "st-5", poll_seconds=10)
