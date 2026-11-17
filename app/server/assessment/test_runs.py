@@ -187,6 +187,18 @@ class LimitsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evs, [{"type": "pillar", "pillar": {"key": "k"}}])
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
+    async def test_ui_run_does_not_replace_a_legacy_stream_run(self):
+        legacy = await self._slow_run("a@x", replace_existing=False)
+        ui = await self._slow_run("a@x")
+        self.assertFalse(legacy.done)
+        self.assertFalse(ui.done)
+        # A second UI run still replaces the first UI run.
+        await self._slow_run("a@x")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertTrue(ui.done)
+        self.assertFalse(legacy.done)
+
     async def test_legacy_stream_disconnect_cancels_the_run(self):
         run = await self._slow_run("a@x", replace_existing=False)
         agen = runs.stream_whole_run(run)

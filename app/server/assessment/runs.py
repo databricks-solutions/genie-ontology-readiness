@@ -59,6 +59,9 @@ class AssessmentRun:
     finished_at: Optional[float] = None
     events: list[dict] = field(default_factory=list)
     task: Optional[asyncio.Task] = None
+    # UI runs replace each other (one at a time per user). Legacy one-request
+    # streams are not exclusive: they never replace, and are never replaced.
+    exclusive: bool = True
     # Readers attached now, and when one was last attached (abandonment check).
     readers: int = 0
     last_read: float = field(default_factory=time.monotonic)
@@ -178,17 +181,18 @@ def start_run(
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
-    With ``replace_existing`` (the UI), a user's earlier run that is still
+    With ``replace_existing`` (the UI), a user's earlier UI run that is still
     working is cancelled first: the UI shows one run at a time, and leftover
-    runs would compete for the warehouse."""
+    runs would compete for the warehouse. A legacy stream run is never
+    cancelled this way (it stops when its own client disconnects)."""
     _ensure_sweeper()
     _sweep()
     if replace_existing:
         for other in list(_runs.values()):
-            if other.principal == principal and not other.done:
+            if other.principal == principal and other.exclusive and not other.done:
                 _cancel(other, "replaced by a new run")
 
-    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal)
+    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=replace_existing)
     _runs[run.id] = run
     run.task = asyncio.create_task(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
