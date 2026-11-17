@@ -1,8 +1,8 @@
 """Assessment endpoints — run the readiness scorecard, manage per-user history,
 and export a scorecard as a branded PDF."""
 
-import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from server.assessment.compare import compare_snapshots
-from server.assessment.scoring import run_assessment, run_assessment_stream
+from server.assessment import runs
+from server.assessment.scoring import run_assessment
 from server.routes._shared import _cache_get, _cache_set, current_principal
 from server.config import set_user_token
 from server.pdf import (
@@ -21,7 +22,6 @@ from server.pdf import (
     render_pdf_response,
 )
 from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
-from server.security import safe_error
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -89,55 +89,77 @@ async def assess_get(
     return result
 
 
+def _scope_from(req: Optional[AssessRequest]) -> tuple[Optional[dict], Optional[list[str]], Optional[list[str]]]:
+    wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
+    cat_scope = list(req.catalogs) if req and req.catalogs else None
+    sch_scope = list(req.schemas) if req and req.schemas else None
+    return wsf, cat_scope, sch_scope
+
+
+# SSE responses must reach the browser as they are written, not buffered.
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+@router.post("/assess/runs")
+async def assess_run_start(
+    req: AssessRequest = Body(default=AssessRequest()),
+    principal: str = Depends(current_principal),
+    x_forwarded_access_token: Optional[str] = Header(default=None),
+):
+    """Start an assessment in the background. Returns ``{"run_id": ...}``.
+
+    Read its events with ``GET /assess/runs/{run_id}/events``. The run is not tied
+    to one request, so it survives the Apps proxy's ~300s cut on streamed
+    responses. Every completed run is auto-saved to the user's history (when
+    Lakebase is enabled)."""
+    wsf, cat_scope, sch_scope = _scope_from(req)
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope)
+    return {"run_id": run.id}
+
+
+@router.get("/assess/runs/{run_id}/events")
+async def assess_run_events(run_id: str, after: int = 0, principal: str = Depends(current_principal)):
+    """SSE window of a run's events, from event ``after`` on. Sends a keepalive
+    comment every few seconds. Ends with ``{"type":"end"}`` when the run is done,
+    or ``{"type":"reconnect","next":n}`` when the client must reconnect with
+    ``after=n``."""
+    run = runs.get_run(run_id, principal)
+    if run is None:
+        return JSONResponse(
+            {"error": "This assessment run is no longer available. It expired, or the app restarted. "
+                      "Start a new assessment."},
+            status_code=404,
+        )
+    return StreamingResponse(runs.stream_events(run, after), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@router.delete("/assess/runs/{run_id}")
+async def assess_run_cancel(run_id: str, principal: str = Depends(current_principal)):
+    """Cancel a run that is still working (no-op if it already finished)."""
+    if not runs.cancel_run(run_id, principal):
+        return JSONResponse({"error": "Assessment run not found."}, status_code=404)
+    return {"cancelled": True}
+
+
 @router.post("/assess/stream")
 async def assess_stream(
     req: AssessRequest = Body(default=AssessRequest()),
     principal: str = Depends(current_principal),
     x_forwarded_access_token: Optional[str] = Header(default=None),
 ):
-    """Stream the assessment: one SSE event per pillar as it completes, then a
-    final 'complete' event with the overall score + top gaps. Every completed run
-    is auto-saved to the user's history (when Lakebase is enabled).
+    """One-request stream of a whole assessment (kept for headless callers).
+
+    Same events as the runs API, with keepalives, in a single response. Behind the
+    Apps proxy a long run can still be cut at ~300s; the UI uses
+    ``/assess/runs`` instead, which reconnects.
 
     Body: {"workspace_filter": {"mode": "include"|"exclude", "workspace_ids": [...]}}
     scopes the activity-based signals; omit / empty for all workspaces."""
-
-    wsf = req.workspace_filter.model_dump() if req and req.workspace_filter else None
-    cat_scope = list(req.catalogs) if req and req.catalogs else None
-    sch_scope = list(req.schemas) if req and req.schemas else None
-
-    async def gen():
-        # Set inside the generator too: the streaming body may run in a fresh
-        # context, so re-establish the OBO token + workspace/catalog/schema scope
-        # here (contextvars set here propagate to the probe tasks created downstream).
-        set_user_token(x_forwarded_access_token)
-        set_workspace_filter(wsf)
-        set_catalog_scope(cat_scope)
-        set_schema_scope(sch_scope)
-        try:
-            async for event in run_assessment_stream():
-                if event.get("type") == "complete":
-                    scorecard = {
-                        "overall": event["overall"],
-                        "pillars": event["pillars"],
-                        "top_gaps": event["top_gaps"],
-                    }
-                    try:
-                        sid = await snapshots.save_snapshot(scorecard, created_by=principal)
-                        event["snapshot_id"] = sid
-                        event["snapshot_saved"] = sid is not None
-                    except Exception as e:
-                        logger.warning(f"snapshot save failed: {e}")
-                        event["snapshot_saved"] = False
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            # Assessment failures wrap SQL Warehouse errors, which quote the failing
-            # statement and the object names involved — never return that verbatim.
-            reference, message = safe_error(e, "assessment stream", logger)
-            yield f"data: {json.dumps({'type': 'error', 'error': message, 'reference': reference})}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    wsf, cat_scope, sch_scope = _scope_from(req)
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope)
+    return StreamingResponse(
+        runs.stream_events(run, 0, window=math.inf), media_type="text/event-stream", headers=_SSE_HEADERS
+    )
 
 
 @router.get("/assess/history")
