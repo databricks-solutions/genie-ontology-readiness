@@ -297,29 +297,46 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
 
 async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_headers: dict, statement_id: str,
                           poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict:
-    """Poll for statement completion for up to ``poll_seconds``; on timeout, cancel
-    the statement so it doesn't keep running on the warehouse."""
+    """Poll for statement completion until a ``poll_seconds`` wall-clock deadline.
+
+    If the statement doesn't finish (deadline passed, or the calling task was
+    cancelled: a stalled scan, the run cap, an abandoned run), it is cancelled on
+    the warehouse so it doesn't keep running there."""
     url = f"{host}/api/2.0/sql/statements/{statement_id}"
-
-    for _ in range(max(1, int(poll_seconds))):
-        await asyncio.sleep(1)
-        async with session.get(url, headers=auth_headers) as resp:
-            result = await resp.json()
-            state = result.get("status", {}).get("state", "")
-            if state == "SUCCEEDED":
-                return result
-            elif state == "FAILED":
-                error_msg = result.get("status", {}).get("error", {}).get("message", "Unknown")
-                raise Exception(f"SQL query failed: {error_msg}")
-            elif state in ("CANCELED", "CLOSED"):
-                raise Exception(f"SQL query {state.lower()}")
-
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, float(poll_seconds))
+    finished = False
     try:
-        async with session.post(f"{url}/cancel", headers=auth_headers) as resp:
-            await resp.read()
-    except Exception as e:  # best effort; the timeout below is what matters
-        logger.info(f"could not cancel timed-out statement {statement_id}: {type(e).__name__}")
-    raise Exception(f"SQL query timed out after {int(poll_seconds)} seconds")
+        while loop.time() < deadline:
+            await asyncio.sleep(1)
+            async with session.get(url, headers=auth_headers) as resp:
+                result = await resp.json()
+                state = result.get("status", {}).get("state", "")
+                if state == "SUCCEEDED":
+                    finished = True
+                    return result
+                elif state == "FAILED":
+                    finished = True
+                    error_msg = result.get("status", {}).get("error", {}).get("message", "Unknown")
+                    raise Exception(f"SQL query failed: {error_msg}")
+                elif state in ("CANCELED", "CLOSED"):
+                    finished = True
+                    raise Exception(f"SQL query {state.lower()}")
+        raise Exception(f"SQL query timed out after {int(poll_seconds)} seconds")
+    finally:
+        if not finished:
+            await _cancel_statement(session, url, auth_headers, statement_id)
+
+
+async def _cancel_statement(session: aiohttp.ClientSession, url: str, auth_headers: dict, statement_id: str) -> None:
+    """Best-effort cancel; bounded so a cancelled task isn't held up by it."""
+    try:
+        async def _post():
+            async with session.post(f"{url}/cancel", headers=auth_headers) as resp:
+                await resp.read()
+        await asyncio.wait_for(_post(), timeout=5)
+    except BaseException as e:  # includes a second CancelledError; never mask the original exit
+        logger.info(f"could not cancel statement {statement_id}: {type(e).__name__}")
 
 
 def _parse_result(result: dict) -> list[dict]:

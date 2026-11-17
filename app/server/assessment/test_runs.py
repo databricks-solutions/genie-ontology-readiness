@@ -300,11 +300,12 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
 
 class RunCapConfigTest(unittest.TestCase):
     def test_env_override_and_bad_values(self):
+        from server.config import env_seconds
         with patch.dict("os.environ", {"GOR_MAX_RUN_SECONDS": "7200"}):
-            self.assertEqual(runs._env_seconds("GOR_MAX_RUN_SECONDS", 10), 7200)
-        for bad in ("abc", "-5", "0", ""):
+            self.assertEqual(env_seconds("GOR_MAX_RUN_SECONDS", 10), 7200)
+        for bad in ("abc", "-5", "0", "", "inf", "Infinity", "nan"):
             with patch.dict("os.environ", {"GOR_MAX_RUN_SECONDS": bad}):
-                self.assertEqual(runs._env_seconds("GOR_MAX_RUN_SECONDS", 10), 10)
+                self.assertEqual(env_seconds("GOR_MAX_RUN_SECONDS", 10), 10, bad)
         self.assertGreaterEqual(runs.MAX_RUN_SECONDS, 3 * 60 * 60)
 
 

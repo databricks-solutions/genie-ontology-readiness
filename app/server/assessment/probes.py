@@ -101,7 +101,7 @@ def _reason_for(exc: Exception) -> str:
 _DIMENSION_KEYS = ("workspace", "catalog", "schema", "agent")
 
 
-def _drill(title: str, columns: list[dict], rows: list[dict]) -> dict | None:
+def _drill(title: str, columns: list[dict], rows: list[dict], total_rows: int | None = None) -> dict | None:
     """Uniform per-asset drill-down payload, or None when there's nothing to show.
     ``columns`` is [{key,label,unit?}]; ``rows`` are dicts keyed by column key.
     ``dimensions`` (auto-derived from the columns) names the columns the UI can
@@ -109,7 +109,10 @@ def _drill(title: str, columns: list[dict], rows: list[dict]) -> dict | None:
     if not rows:
         return None
     dimensions = [c["key"] for c in columns if c["key"] in _DIMENSION_KEYS]
-    return {"title": title, "columns": columns, "rows": rows, "dimensions": dimensions}
+    out = {"title": title, "columns": columns, "rows": rows, "dimensions": dimensions}
+    if total_rows is not None and total_rows > len(rows):
+        out["total_rows"] = total_rows  # rows were capped server-side (UI says so)
+    return out
 
 
 def _failed(exc: Exception, what: str, remedy: str = "") -> dict:
@@ -323,6 +326,9 @@ async def _do_resolve_sources() -> dict:
     # ASSESS_CATALOGS), prefer per-catalog reads even if system is readable, so we
     # scope precisely and never depend on system grants we can't assume.
     use_system = system_ok and explicit is None
+    # Catalogs dropped because their information_schema couldn't be read (or isn't
+    # UC-shaped). Reported on the Metadata pillar when the user chose them.
+    excluded: list[str] = []
 
     # In per-catalog mode, SHOW CATALOGS may list catalogs the SP can only
     # BROWSE (not SELECT) — querying their information_schema would fail and
@@ -337,13 +343,21 @@ async def _do_resolve_sources() -> dict:
         async def _readable(c: str) -> bool:
             async with _sem:
                 try:
-                    await execute_sql(f"SELECT 1 FROM {quote_ident(c)}.information_schema.tables LIMIT 1")
+                    # Name UC columns (not SELECT 1): a Lakebase database catalog has a
+                    # Postgres-shaped information_schema (no `comment`, other columns,
+                    # missing views), which would break every `SELECT * … UNION ALL`
+                    # source below and take down whole pillars.
+                    await execute_sql(
+                        "SELECT table_catalog, table_schema, table_name, table_type, comment "
+                        f"FROM {quote_ident(c)}.information_schema.tables LIMIT 1"
+                    )
                     return True
                 except Exception:
                     return False
         checks = await asyncio.gather(*(_readable(c) for c in catalogs))
         accessible = [c for c, ok in zip(catalogs, checks) if ok]
         if accessible:
+            excluded = [c for c, ok in zip(catalogs, checks) if not ok]
             catalogs = accessible
         logger.info(f"accessible catalogs: {len(catalogs)} of {len(checks)} discovered")
 
@@ -353,7 +367,8 @@ async def _do_resolve_sources() -> dict:
     schemas = get_schema_scope()
     if schemas and len(catalogs) != 1:
         schemas = None
-    sources = {"system_ok": use_system, "catalogs": catalogs, "schemas": schemas}
+    sources = {"system_ok": use_system, "catalogs": catalogs, "schemas": schemas,
+               "excluded": excluded if explicit is not None else []}
     logger.info(
         f"assessment sources: system_ok={use_system}, catalogs={len(catalogs)}, "
         f"schemas={len(schemas) if schemas else 'all'}"
@@ -564,12 +579,15 @@ _METADATA_SCAN_CONCURRENCY = 6
 _METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
 # Time budget for ONE column-coverage query (after the 50 s initial wait). Longer
 # than the client default (120 s) so a batch of large catalogs can finish, and
-# below the no-progress stop. A query past it is cancelled and its catalogs retried
-# alone (see _column_coverage_chunked).
-_METADATA_QUERY_POLL_SECONDS = 240
+# below the no-progress stop. A query past it is cancelled and its batch split
+# (see _column_coverage_chunked).
+_METADATA_QUERY_POLL_SECONDS = 190  # + the 50 s initial wait = 240 s per query, < the 300 s stop
 # The per-schema drill-down keeps the worst N schemas. One row per schema is
 # unbounded on a large metastore (2,000 catalogs ≈ 23k rows ≈ 3 MB per event).
-_METADATA_DRILL_MAX_ROWS = 500
+_METADATA_DRILL_MAX_ROWS = 2000
+# Stop retrying when this many queries failed before ANY succeeded: the failure is
+# systemic (warehouse down, access lost), not one bad catalog.
+_METADATA_CIRCUIT_FAILURES = _METADATA_SCAN_CONCURRENCY
 
 _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
@@ -606,7 +624,7 @@ async def _column_coverage_chunked(
     catalogs: list[str],
     system_ok: bool,
     schemas: list[str] | None = None,
-) -> tuple[int, int, dict]:
+) -> tuple[int, int, dict, list[str]]:
     """(columns, commented-columns, per_schema, skipped) computed in per-catalog
     batches with bounded concurrency, where per_schema maps (catalog, schema) ->
     (columns, commented) and skipped lists the catalogs that could not be read.
@@ -627,42 +645,28 @@ async def _column_coverage_chunked(
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = 0
+    successes = failures = 0
     per_schema: dict[tuple[str, str], tuple[int, int]] = {}
     skipped: list[str] = []
 
-    async def _query(batch: list[str]) -> list[dict]:
+    async def _query(batch: list[str]) -> tuple[list[str], list[dict] | None, Exception | None]:
         async with sem:
-            # record=False: the per-batch queries differ only in their catalog
-            # list, so ONE representative is recorded above for "View SQL".
-            return await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False,
-                                     poll_seconds=_METADATA_QUERY_POLL_SECONDS)
+            try:
+                # record=False: the per-batch queries differ only in their catalog
+                # list, so ONE representative is recorded above for "View SQL".
+                rows = await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False,
+                                         poll_seconds=_METADATA_QUERY_POLL_SECONDS)
+                return batch, rows, None
+            except Exception as e:
+                return batch, None, e
 
-    async def _one(batch: list[str]) -> tuple[int, list[dict], list[str]]:
-        """(catalogs read, rows, catalogs skipped) for one batch.
-
-        A batch is one UNION/IN query, so a single bad catalog (a federated
-        catalog whose remote is down, a catalog too big for the time budget)
-        fails it. Then each catalog is retried alone, and only the ones that
-        still fail are skipped: one broken catalog must not drop 24 good ones."""
-        try:
-            return len(batch), await _query(batch), []
-        except Exception as e:
-            logger.warning(f"metadata column batch failed ({len(batch)} catalogs): {str(e)[:100]}")
-            if len(batch) == 1:
-                return 0, [], list(batch)
-        results = await asyncio.gather(*(_query([c]) for c in batch), return_exceptions=True)
-        rows: list[dict] = []
-        bad: list[str] = []
-        for c, r in zip(batch, results):
-            if isinstance(r, BaseException):
-                logger.warning(f"metadata column scan skipped catalog {c!r}: {str(r)[:100]}")
-                bad.append(c)
-            else:
-                rows.extend(r)
-        return len(batch) - len(bad), rows, bad
-
-    tasks = [asyncio.ensure_future(_one(b)) for b in batches]
-    pending = set(tasks)
+    # Work queue: every query is its own task, so the no-progress stop counts each
+    # query (a retry never hides inside a long-running task). A batch is one
+    # UNION/IN query, so one bad catalog (an unreachable federated remote, a
+    # catalog too big for the time budget) fails all of it. A failed batch is split
+    # in half and both halves re-queued, down to single catalogs; only a catalog
+    # that fails alone is skipped. One bad catalog in 25 costs ~10 extra queries.
+    pending: set[asyncio.Future] = {asyncio.ensure_future(_query(b)) for b in batches}
     _emit_progress("metadata", 0, total_cats, f"Scanning column metadata across {total_cats} catalogs…")
     try:
         while pending:
@@ -671,31 +675,47 @@ async def _column_coverage_chunked(
             )
             if not done:
                 raise TimeoutError(
-                    f"metadata column scan stalled — no batch completed in "
+                    f"metadata column scan stalled — no query completed in "
                     f"{_METADATA_NO_PROGRESS_TIMEOUT}s ({scanned}/{total_cats} catalogs scanned)"
                 )
             for d in done:
-                nread, rows, bad = d.result()
-                scanned += nread + len(bad)
-                ok_cats += nread
-                skipped.extend(bad)
-                for r in rows:
-                    t, c = int(r.get("total") or 0), int(r.get("commented") or 0)
-                    c_total += t
-                    c_commented += c
-                    cat, sch = r.get("cat"), r.get("sch")
-                    if cat and sch:
-                        per_schema[(cat, sch)] = (t, c)
-                _emit_progress("metadata", scanned, total_cats,
-                               f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented"
-                               + (f" · {len(skipped)} skipped" if skipped else ""))
+                batch, rows, err = d.result()
+                if err is None:
+                    successes += 1
+                    scanned += len(batch)
+                    ok_cats += len(batch)
+                    for r in rows:
+                        t, c = int(r.get("total") or 0), int(r.get("commented") or 0)
+                        c_total += t
+                        c_commented += c
+                        cat, sch = r.get("cat"), r.get("sch")
+                        if cat and sch:
+                            per_schema[(cat, sch)] = (t, c)
+                    continue
+                failures += 1
+                if successes == 0 and failures >= _METADATA_CIRCUIT_FAILURES:
+                    # Systemic: don't fan out retries against a failing warehouse.
+                    raise RuntimeError(
+                        f"column coverage scan failed: the first {failures} queries failed ({str(err)[:120]})"
+                    )
+                if len(batch) > 1:
+                    logger.warning(f"metadata column batch failed ({len(batch)} catalogs), splitting: {str(err)[:100]}")
+                    mid = len(batch) // 2
+                    pending.add(asyncio.ensure_future(_query(batch[:mid])))
+                    pending.add(asyncio.ensure_future(_query(batch[mid:])))
+                else:
+                    logger.warning(f"metadata column scan skipped catalog {batch[0]!r}: {str(err)[:100]}")
+                    skipped.append(batch[0])
+                    scanned += 1
+            _emit_progress("metadata", scanned, total_cats,
+                           f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented"
+                           + (f" · {len(skipped)} skipped" if skipped else ""))
     finally:
-        # Cancel any still-pending batches (timeout path) and await them so the
-        # cancellations settle — no orphaned tasks or unretrieved-exception warnings.
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel any still-pending queries (stall / circuit paths) and await them so
+        # the cancellations settle (their statements are cancelled on the warehouse).
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     # Every catalog failed → this is an access/infra failure, not real 0% coverage.
     # Raise so probe_metadata marks the pillar unavailable (pre-chunking behavior).
@@ -766,6 +786,18 @@ async def probe_metadata() -> dict:
             else:
                 c_total = c_commented = 0
 
+        # Catalogs whose column metadata couldn't be read are left out of BOTH halves
+        # of the score (and the drill-down), so table and column coverage describe
+        # the same set of catalogs.
+        skipped_set = set(skipped_cats)
+        if skipped_set:
+            for (cat, sch), (tot, com) in list(table_per_schema.items()):
+                if cat in skipped_set:
+                    t_total -= tot
+                    t_commented -= com
+                    del table_per_schema[(cat, sch)]
+        skipped_cats = sorted(skipped_set | set(s.get("excluded") or []))
+
         tagged_tables = None
         tt = _src("table_tags", s)
         if tt is not None:
@@ -795,9 +827,10 @@ async def probe_metadata() -> dict:
         if tagged_tables is not None:
             signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
         if skipped_cats:
-            names = ", ".join(sorted(skipped_cats)[:10]) + (f" (+{len(skipped_cats) - 10} more)" if len(skipped_cats) > 10 else "")
+            names = ", ".join(skipped_cats[:10]) + (f" (+{len(skipped_cats) - 10} more)" if len(skipped_cats) > 10 else "")
             signals.append({"label": "Catalogs skipped", "value": len(skipped_cats),
-                            "detail": f"Column metadata could not be read, so coverage excludes: {names}"})
+                            "detail": "Metadata could not be read (no access, an unreachable federated source, "
+                                      f"or a Lakebase database catalog), so coverage excludes: {names}"})
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
@@ -834,6 +867,7 @@ async def probe_metadata() -> dict:
                  {"key": "table_comment_pct", "label": "Tables commented", "unit": "%"},
                  {"key": "column_comment_pct", "label": "Columns commented", "unit": "%"}],
                 drill_rows,
+                total_rows=drill_total,
             ),
         }
     except Exception as e:

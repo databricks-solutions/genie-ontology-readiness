@@ -77,6 +77,8 @@ export interface DrillDown {
   rows: Record<string, string | number | null>[];
   // Column keys the drill-down modal offers as slice-by filters (workspace/catalog/schema/agent).
   dimensions?: string[];
+  // Set when the server kept only the first `rows.length` of `total_rows` rows.
+  total_rows?: number;
 }
 
 // A catalog accessible to the selected workspaces, for the pre-run catalog filter.
