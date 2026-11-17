@@ -1,0 +1,13 @@
+# Dev and test tooling for scripts/check.sh and the test suite. The App's runtime
+# pins live in app/requirements.txt, which this file includes.
+-r app/requirements.txt
+
+# Starlette's TestClient (tests/test_user_agent.py) needs httpx.
+httpx~=0.28.1
+
+# Lint and tests.
+ruff
+pytest
+
+# Runs the Genie audit query against an in-memory table (app/server/assessment/test_spec_pillars.py).
+duckdb>=1.2
