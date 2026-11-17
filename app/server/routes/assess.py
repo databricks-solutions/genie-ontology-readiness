@@ -13,7 +13,7 @@ from server.assessment.compare import compare_snapshots
 from server.assessment import runs
 from server.assessment.scoring import run_assessment
 from server.routes._shared import _cache_get, _cache_set, current_principal
-from server.config import set_user_token
+from server.config import ASSESS_CATALOGS, set_user_token
 from server.pdf import (
     build_pdf_document,
     markdown_to_safe_html,
@@ -21,6 +21,7 @@ from server.pdf import (
     render_pdf_response,
 )
 from server.workspace_filter import set_workspace_filter, set_catalog_scope, set_schema_scope
+from server.scope import normalize_scope
 from server import snapshots
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,15 @@ def _scope_from(req: Optional[AssessRequest]) -> tuple[Optional[dict], Optional[
     return wsf, cat_scope, sch_scope
 
 
+def _run_scope(wsf: Optional[dict], cat_scope: Optional[list[str]], sch_scope: Optional[list[str]]) -> dict:
+    """The scope saved with the snapshot, so the trend and Compare line up
+    like-for-like runs (#89). The scope as requested and resolved by config (request
+    catalogs > workspace bindings, captured by the workspace ids > ASSESS_CATALOGS >
+    all), not the final readable-catalog list, which would change whenever a catalog
+    is created."""
+    return normalize_scope(cat_scope, sch_scope, wsf, env_catalogs=ASSESS_CATALOGS)
+
+
 # SSE responses must reach the browser as they are written, not buffered.
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -112,7 +122,8 @@ async def assess_run_start(
     responses. Every completed run is auto-saved to the user's history (when
     Lakebase is enabled)."""
     wsf, cat_scope, sch_scope = _scope_from(req)
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope)
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
+                         scope=_run_scope(wsf, cat_scope, sch_scope))
     return {"run_id": run.id}
 
 
@@ -156,7 +167,8 @@ async def assess_stream(
     scopes the activity-based signals; omit / empty for all workspaces."""
     wsf, cat_scope, sch_scope = _scope_from(req)
     # Not exclusive: a script must not cancel the same user's run in the browser.
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, replace_existing=False)
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, replace_existing=False,
+                         scope=_run_scope(wsf, cat_scope, sch_scope))
     return StreamingResponse(runs.stream_whole_run(run), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 

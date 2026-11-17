@@ -70,7 +70,7 @@ class ColumnScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(probes._METADATA_QUERY_POLL_SECONDS + 30 + 5, probes._METADATA_NO_PROGRESS_TIMEOUT)
 
     async def test_per_catalog_union_names_its_columns(self):
-        q = probes._coverage_query("columns", ["a", "b"], system_ok=False)
+        q = probes.column_coverage_batch_sql(["a", "b"], system_ok=False)
         self.assertNotIn("SELECT *", q)
         self.assertIn("SELECT table_catalog, table_schema, comment FROM `a`.information_schema.columns", q)
 

@@ -38,6 +38,8 @@ from server.signal_spec import (
     COLUMN_COMMENT_TARGET_PCT,
     METADATA_TABLE_WEIGHT,
     METADATA_COLUMN_WEIGHT,
+    METADATA_COLUMN_BATCH_SIZE,
+    METADATA_NO_PROGRESS_TIMEOUT_S,
     gap_text,
     render_sql,
 )
@@ -581,11 +583,13 @@ async def probe_uc_foundation() -> dict:
 # per-catalog batches with bounded concurrency, accumulating coverage and emitting
 # progress as batches land. Tuned against a 1068-catalog workspace (a 30-catalog
 # batch returns in ~7s): 25/batch × 6 concurrent finishes ~1068 catalogs in <1 min.
-_METADATA_BATCH_SIZE = 25
+# Batch size and the no-progress timeout live in signal_spec, so the skill's
+# documented batching (#112) matches this scan.
+_METADATA_BATCH_SIZE = METADATA_COLUMN_BATCH_SIZE
 _METADATA_SCAN_CONCURRENCY = 6
 # Stall only if NO batch completes within this window (not a fixed total deadline),
 # so a slow-but-progressing scan of a huge metastore is allowed to finish.
-_METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
+_METADATA_NO_PROGRESS_TIMEOUT = METADATA_NO_PROGRESS_TIMEOUT_S
 # Time budget for ONE column-coverage query, longer than the client default (120 s)
 # so a batch of large catalogs can finish. Scan queries submit without waiting (a
 # <=30 s call that returns the statement id, so it is always cancellable), then
@@ -608,36 +612,35 @@ _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
 
 
-def _coverage_query(
-    view: str,
+def column_coverage_batch_sql(
     catalogs_batch: list[str],
     system_ok: bool,
     schemas: list[str] | None = None,
 ) -> str:
-    """Per-catalog comment-coverage query for an information_schema ``view``
-    (tables/columns) scoped to a batch of catalogs, grouped by ``table_catalog``.
+    """Column comment coverage for one batch of catalogs, grouped by catalog/schema.
 
-    system_ok: filter the metastore-wide view by ``table_catalog IN (...)`` (prunes
-    to just these catalogs). Per-catalog: UNION each catalog's own view. Grouping by
-    catalog lets the scan both total up coverage AND retain a per-catalog breakdown
-    for the drill-down, in one pass.
+    The SQL is the shared spec query (``signal_spec.METADATA`` ``column_comments``,
+    #112), so the skill runs the identical per-batch statement. system_ok: the
+    metastore-wide view, pruned by ``table_catalog IN (...)``. Per-catalog: a UNION of
+    just this batch's catalog views (the IN filter is then a no-op). Grouping by
+    schema gives both the totals AND the drill-down rows in one pass.
     """
-    cov = ("COUNT(*) AS total, "
-           "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented")
-    schema_sql = schema_predicate(schemas)
+    q = METADATA_SPEC["queries_by_id"]["column_comments"]
     if system_ok:
-        in_list = ", ".join(quote_literal(c) for c in catalogs_batch)
-        return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM system.information_schema.{view} "
-                f"WHERE table_catalog IN ({in_list}) AND {schema_sql} "
-                f"GROUP BY table_catalog, table_schema")
-    # Name the three columns used (not SELECT *): a catalog whose information_schema
-    # has other columns can then no longer break the UNION for the whole batch.
-    union = " UNION ALL ".join(
-        f"SELECT table_catalog, table_schema, comment FROM {quote_ident(c)}.information_schema.{view}"
-        for c in catalogs_batch
-    )
-    return (f"SELECT table_catalog AS cat, table_schema AS sch, {cov} FROM ({union}) AS _c "
-            f"WHERE {schema_sql} GROUP BY table_catalog, table_schema")
+        source = "system.information_schema.columns"
+    else:
+        # Name the three columns used (not SELECT *): a catalog whose information_schema
+        # has other columns can then no longer break the UNION for the whole batch.
+        union = " UNION ALL ".join(
+            f"SELECT table_catalog, table_schema, comment FROM {quote_ident(c)}.information_schema.columns"
+            for c in catalogs_batch
+        )
+        source = f"({union}) AS _c"
+    # information_schema stores catalog names in lower case, and the comparison is
+    # case-sensitive, so a configured name like "Sales" must match as 'sales'.
+    in_list = ", ".join(quote_literal(c.lower()) for c in catalogs_batch)
+    return render_sql(q["sql"], {"<COLUMNS>": source, "<CATALOG_BATCH>": in_list},
+                      schema_filter=schema_predicate(schemas)).rstrip(";")
 
 
 async def _column_coverage_chunked(
@@ -657,11 +660,10 @@ async def _column_coverage_chunked(
     # shows the query shape once rather than one near-identical row per batch.
     _cov_view = "system.information_schema.columns" if system_ok else "<catalog>.information_schema.columns"
     record_query(
-        "SELECT table_catalog AS cat, table_schema AS sch, COUNT(*) AS total, "
-        "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented "
-        f"FROM {_cov_view} WHERE table_catalog IN (:catalogs) "
-        f"AND {schema_predicate(schemas)} GROUP BY table_catalog, table_schema",
-        {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches"},
+        render_sql(METADATA_SPEC["queries_by_id"]["column_comments"]["sql"],
+                   {"<COLUMNS>": _cov_view, "<CATALOG_BATCH>": ":catalogs"},
+                   schema_filter=schema_predicate(schemas)).rstrip(";"),
+        {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches of {_METADATA_BATCH_SIZE}"},
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = 0
@@ -685,7 +687,7 @@ async def _column_coverage_chunked(
             try:
                 # record=False: the per-batch queries differ only in their catalog
                 # list, so ONE representative is recorded above for "View SQL".
-                rows = await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False,
+                rows = await execute_sql(column_coverage_batch_sql(batch, system_ok, schemas), record=False,
                                          poll_seconds=_METADATA_QUERY_POLL_SECONDS, wait_seconds=0)
                 return batch, original, rows, None
             except Exception as e:
@@ -816,13 +818,13 @@ async def probe_metadata() -> dict:
         # scan). In system mode the metastore-wide tables view also spans internal
         # catalogs (system/samples/…), but column coverage below is scoped to the
         # enumerated non-internal catalogs; exclude the same internal catalogs here
-        # so both halves of the 50/50 score measure the same population. (Per-catalog
-        # _src is already scoped to that list.)
+        # so both halves of the 50/50 score measure the same population. That means
+        # the named internal catalogs AND any __-prefixed one (#109), the same rule as
+        # the tag count below and the skill's Source resolution. (Per-catalog _src is
+        # already scoped to that list.)
         if system_ok:
-            internal_list = ", ".join(quote_literal(c) for c in _INTERNAL_CATALOGS)
             tables_src, tables_where = ("system.information_schema.tables",
-                                        f"WHERE {_schema_sql(s)} "
-                                        f"AND table_catalog NOT IN ({internal_list})")
+                                        f"WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}".rstrip())
         else:
             tables_src, tables_where = tbl, f"WHERE {_schema_sql(s)}"
         trows = await execute_sql(
@@ -863,6 +865,7 @@ async def probe_metadata() -> dict:
         # Catalogs whose column metadata couldn't be read are left out of BOTH halves
         # of the score (and the drill-down), so table and column coverage describe
         # the same set of catalogs.
+        col_failed = len(skipped_cats)  # column-scan skips (#113's "over N of M catalogs")
         skipped_set = set(skipped_cats)
         if skipped_set:
             for (cat, sch), (tot, com) in list(table_per_schema.items()):
@@ -901,7 +904,8 @@ async def probe_metadata() -> dict:
             {"label": label["table_comments"], "value": table_pct, "unit": "%",
              "detail": f"{t_commented} of {t_total} tables"},
             {"label": label["column_comments"], "value": col_pct, "unit": "%",
-             "detail": f"{c_commented} of {c_total} columns"},
+             "detail": f"{c_commented} of {c_total} columns"
+                       + (f" (over {len(catalogs) - col_failed} of {len(catalogs)} catalogs)" if col_failed else "")},
         ]
         if tagged_tables is not None:
             signals.append({"label": label["tagged_tables"], "value": tagged_tables,
@@ -936,7 +940,10 @@ async def probe_metadata() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
-            "note": None,
+            # #112: the same disclosure the skill gives when some batches fail, so a
+            # score computed over part of the estate isn't read as complete.
+            "note": (f"Column coverage over {len(catalogs) - col_failed} of {len(catalogs)} catalogs "
+                     f"({col_failed} could not be read).") if col_failed else None,
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
             "drill_down": _drill(
                 "Comment coverage by schema (worst first)" if drill_total <= _METADATA_DRILL_MAX_ROWS
