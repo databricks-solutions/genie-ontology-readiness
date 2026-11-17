@@ -1339,7 +1339,8 @@ async def _genie_audit_counts() -> dict:
     Single bounded scan: prune the account-level audit table to the workspaces in
     scope (the runtime filter) and the full lookback window, then group by space_id and
     derive per-space "trashed" and "active in last 30 days" flags in one pass. The
-    bounds keep this probe below the app gateway's streaming timeout on large accounts.
+    scan has its own poll budget (_GENIE_AUDIT_POLL_SECONDS); a background run isn't
+    bound by the Apps proxy's stream cut (#128).
     Returns total / active_30d (each None if the audit table isn't readable).
     """
     try:
