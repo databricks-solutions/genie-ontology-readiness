@@ -12,7 +12,7 @@ export class ApiError extends Error {
   }
 }
 
-async function parseError(res: Response): Promise<string> {
+export async function parseError(res: Response): Promise<string> {
   const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`;
   let raw = '';
   try {
@@ -39,7 +39,7 @@ async function parseError(res: Response): Promise<string> {
  * Each browser words this differently. */
 export function isNetworkError(e: unknown): boolean {
   if (!(e instanceof TypeError)) return false;
-  return /network|failed to fetch|load failed|fetch/i.test(e.message);
+  return /network|failed to fetch|load failed/i.test(e.message);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {

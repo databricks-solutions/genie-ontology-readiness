@@ -142,6 +142,8 @@ app/
     assessment/
       probes.py              — read-only SQL/REST probes (graceful degradation)
       scoring.py             — combine technical + self-assessment → scorecard
+      runs.py                — background assessment runs + reconnectable SSE windows
+                               (outlives the Apps proxy's ~300s stream cut)
     content/library.py       — embedded technical+business enablement content
     content/accelerators.py  — runnable accelerators that lift a pillar's score
     content/methodology.py   — build methodology (5 phases); grounds the Plan LLM

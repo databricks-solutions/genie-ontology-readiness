@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,11 @@ FINISHED_TTL_SECONDS = 15 * 60
 # A run still working after this long is cancelled. The metadata scan has its
 # own no-progress timeout, so this only catches a run that is truly stuck.
 MAX_RUN_SECONDS = 45 * 60
+# A working run with no reader for this long is abandoned (tab closed, network
+# gone) and is cancelled. Longer than the client's full reconnect backoff.
+ABANDON_SECONDS = 90.0
+# How often the sweeper enforces the limits above.
+SWEEP_INTERVAL_SECONDS = 15.0
 
 
 @dataclass
@@ -53,6 +59,9 @@ class AssessmentRun:
     finished_at: Optional[float] = None
     events: list[dict] = field(default_factory=list)
     task: Optional[asyncio.Task] = None
+    # Readers attached now, and when one was last attached (abandonment check).
+    readers: int = 0
+    last_read: float = field(default_factory=time.monotonic)
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -71,6 +80,9 @@ class AssessmentRun:
             self.finished_at = time.monotonic()
         self._notify()
 
+    def has_error(self) -> bool:
+        return any(e.get("type") == "error" for e in self.events)
+
     def _notify(self) -> None:
         # Wake every reader waiting on the current event, then arm a fresh one.
         # asyncio is single-threaded and readers take the event with no await
@@ -88,16 +100,42 @@ class AssessmentRun:
 
 
 _runs: dict[str, AssessmentRun] = {}
+_sweeper: Optional[asyncio.Task] = None
 
 
-def _sweep() -> None:
-    """Forget finished runs past their TTL and cancel runs past the hard cap."""
-    now = time.monotonic()
+def _cancel(run: AssessmentRun, why: str) -> None:
+    if run.task and not run.task.done():
+        logger.info("cancelling assessment run %s: %s", run.id, why)
+        run.task.cancel()
+
+
+def _sweep(now: Optional[float] = None) -> None:
+    """Forget finished runs past their TTL; cancel runs past the hard cap or
+    with no reader for ABANDON_SECONDS."""
+    now = time.monotonic() if now is None else now
     for run_id, run in list(_runs.items()):
-        if run.done and now - (run.finished_at or now) > FINISHED_TTL_SECONDS:
-            _runs.pop(run_id, None)
-        elif not run.done and now - run.started_at > MAX_RUN_SECONDS and run.task:
-            run.task.cancel()
+        if run.done:
+            if now - (run.finished_at or now) > FINISHED_TTL_SECONDS:
+                _runs.pop(run_id, None)
+        elif now - run.started_at > MAX_RUN_SECONDS:
+            _cancel(run, "past the run time cap")
+        elif run.readers == 0 and now - run.last_read > ABANDON_SECONDS:
+            _cancel(run, "no reader attached")
+
+
+async def _sweep_forever() -> None:
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        try:
+            _sweep()
+        except Exception:  # never let the sweeper die
+            logger.exception("assessment run sweep failed")
+
+
+def _ensure_sweeper() -> None:
+    global _sweeper
+    if _sweeper is None or _sweeper.done():
+        _sweeper = asyncio.create_task(_sweep_forever(), name="assessment-run-sweeper")
 
 
 def get_run(run_id: str, principal: str) -> Optional[AssessmentRun]:
@@ -113,9 +151,21 @@ def cancel_run(run_id: str, principal: str) -> bool:
     run = get_run(run_id, principal)
     if run is None:
         return False
-    if run.task and not run.task.done():
-        run.task.cancel()
+    _cancel(run, "cancelled by the user")
     return True
+
+
+def _on_task_done(run: AssessmentRun, task: asyncio.Task) -> None:
+    # Runs even when the task was cancelled before _drive's first step (then its
+    # try/finally never ran), so a run can never stay "working" forever.
+    if not run.done:
+        if not run.has_error():
+            reason = "cancelled" if task.cancelled() else "failed"
+            run.append(_error_event(run, "The assessment was cancelled." if task.cancelled()
+                                    else "The assessment stopped unexpectedly.", reason=reason))
+        run.finish()
+    # Drop the task (and the context that holds the user's token).
+    run.task = None
 
 
 def start_run(
@@ -124,15 +174,19 @@ def start_run(
     workspace_filter: Optional[dict],
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
+    replace_existing: bool = True,
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
-    A user's earlier run that is still working is cancelled first: the UI shows
-    one run at a time, and leftover runs would compete for the warehouse."""
+    With ``replace_existing`` (the UI), a user's earlier run that is still
+    working is cancelled first: the UI shows one run at a time, and leftover
+    runs would compete for the warehouse."""
+    _ensure_sweeper()
     _sweep()
-    for other in _runs.values():
-        if other.principal == principal and not other.done and other.task:
-            other.task.cancel()
+    if replace_existing:
+        for other in list(_runs.values()):
+            if other.principal == principal and not other.done:
+                _cancel(other, "replaced by a new run")
 
     run = AssessmentRun(id=uuid.uuid4().hex, principal=principal)
     _runs[run.id] = run
@@ -140,6 +194,7 @@ def start_run(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
         name=f"assessment-{run.id[:8]}",
     )
+    run.task.add_done_callback(lambda t: _on_task_done(run, t))
     return run
 
 
@@ -170,6 +225,7 @@ async def _drive(
         reference, message = safe_error(e, f"assessment run {run.id}", logger)
         run.append(_error_event(run, message, reason="failed", reference=reference, error_type=type(e).__name__))
     finally:
+        set_user_token(None)
         run.finish()
 
 
@@ -211,31 +267,53 @@ async def stream_events(
     after: int = 0,
     window: Optional[float] = None,
     heartbeat: Optional[float] = None,
+    legacy: bool = False,
 ) -> AsyncIterator[str]:
     """SSE for one window of ``run``, starting at event ``after``.
 
     Each event carries ``seq`` (its index). The window ends with
     ``{"type": "end"}`` + ``[DONE]`` when the run is finished, or with
     ``{"type": "reconnect", "next": n}`` when the window time is up and the
-    client must reconnect with ``after=n``."""
+    client must reconnect with ``after=n``.
+
+    ``legacy`` keeps the old ``/assess/stream`` shape: no ``seq``, no ``end``
+    event, just ``[DONE]`` at the end."""
     window = STREAM_WINDOW_SECONDS if window is None else window
     heartbeat = HEARTBEAT_SECONDS if heartbeat is None else heartbeat
     loop = asyncio.get_running_loop()
     deadline = loop.time() + window
     nxt = max(0, after)
-    # Send bytes at once so the proxy sees the response start.
-    yield ": connected\n\n"
-    while True:
-        while nxt < len(run.events):
-            yield sse({**run.events[nxt], "seq": nxt})
-            nxt += 1
-        if run.done:
-            yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-            yield "data: [DONE]\n\n"
-            return
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-            return
-        if not await run.wait_for_change(min(heartbeat, remaining)):
-            yield ": keepalive\n\n"
+    run.readers += 1
+    run.last_read = time.monotonic()
+    try:
+        # Send bytes at once so the proxy sees the response start.
+        yield ": connected\n\n"
+        while True:
+            while nxt < len(run.events):
+                yield sse(run.events[nxt] if legacy else {**run.events[nxt], "seq": nxt})
+                nxt += 1
+            if run.done:
+                if not legacy:
+                    yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+                yield "data: [DONE]\n\n"
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+                return
+            if not await run.wait_for_change(min(heartbeat, remaining)):
+                yield ": keepalive\n\n"
+    finally:
+        run.readers -= 1
+        run.last_read = time.monotonic()
+
+
+async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
+    """The legacy one-request stream: the whole run in one response, and the run
+    is cancelled as soon as the client disconnects (as before)."""
+    try:
+        async for chunk in stream_events(run, 0, window=math.inf, legacy=True):
+            yield chunk
+    finally:
+        if not run.done:
+            _cancel(run, "legacy stream client disconnected")

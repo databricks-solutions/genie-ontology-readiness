@@ -194,6 +194,15 @@ export default function Scorecard({
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // The background run in progress, so closing or reloading the tab can cancel it.
+  const runIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const onPageHide = () => {
+      if (runIdRef.current) void apiDeleteQuiet(`/assess/runs/${runIdRef.current}`);
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+  }, []);
 
   // Workspace scope (#25/#10): activity-based signals count within the deployed
   // workspace only, so they're never account-wide. The scope is fixed to the
@@ -419,6 +428,7 @@ export default function Scorecard({
         pending,
         onRunId: (id) => {
           runId = id;
+          runIdRef.current = id;
         },
         onEvent: (ev) => {
           if (ev.type === 'pillar') {
@@ -452,6 +462,7 @@ export default function Scorecard({
       }
     } finally {
       abortRef.current = null;
+      runIdRef.current = null;
     }
   }
 

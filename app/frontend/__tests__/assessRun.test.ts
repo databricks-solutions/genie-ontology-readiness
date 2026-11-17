@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { AssessRunError, runAssessment, serverErrorDetails } from '../src/utils/assessRun';
-import { ApiError } from '../src/hooks/useApi';
+import { AssessRunError, abortableSleep, runAssessment, serverErrorDetails } from '../src/utils/assessRun';
+import { ApiError, isNetworkError, parseError } from '../src/hooks/useApi';
 
 // Hermetic tests for the reconnecting run client: the start + stream calls are
 // injected, so no backend or network is involved.
@@ -98,6 +98,104 @@ describe('runAssessment', () => {
     expect(err).toBeInstanceOf(AssessRunError);
     expect(err.message).toMatch(/lost on the server/);
     expect(err.details[0]).toContain('HTTP 404');
+  });
+});
+
+describe('runAssessment edge cases', () => {
+  it('backs off and gives up when the stream keeps closing with no marker', async () => {
+    const { stream, paths } = scripted([[], [], []]);
+    const sleeps: number[] = [];
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => ({ run_id: 'r' }),
+      stream,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      maxRetries: 2,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(AssessRunError);
+    expect(err.message).toMatch(/closed the progress stream/);
+    expect(sleeps).toEqual([1000, 2000]);
+    expect(paths).toHaveLength(3);
+  });
+
+  it('does not retry a bug in the event handler and keeps the event number', async () => {
+    const { stream, paths } = scripted([[{ type: 'pillar', pillar: { key: 'x' }, seq: 4 }]]);
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => ({ run_id: 'r' }),
+      stream,
+      sleep: async () => undefined,
+      onEvent: () => {
+        throw new TypeError("Cannot read properties of undefined (reading 'fetch')");
+      },
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(AssessRunError);
+    expect(err.message).toMatch(/could not show an assessment update/);
+    expect(err.details).toContain('Event: pillar #4');
+    expect(paths).toHaveLength(1);
+  });
+
+  it('reports the HTTP status once', async () => {
+    const { stream } = scripted([[new ApiError('HTTP 502 Bad Gateway: proxy', 502)]]);
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => ({ run_id: 'r' }),
+      stream,
+      sleep: async () => undefined,
+      maxRetries: 0,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(err.details[0]).toBe('Cause: HTTP 502 Bad Gateway: proxy');
+  });
+
+  it('abortableSleep stops at once on abort', async () => {
+    const c = new AbortController();
+    const p = abortableSleep(60_000, c.signal);
+    c.abort();
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+describe('parseError and isNetworkError', () => {
+  it('uses the JSON error field', async () => {
+    const res = new Response(JSON.stringify({ error: 'run not found' }), { status: 404 });
+    expect(await parseError(res)).toBe('run not found');
+  });
+
+  it('explains proxy timeout pages', async () => {
+    const res = new Response('<html><body>upstream request timeout</body></html>', {
+      status: 504,
+      statusText: 'Gateway Timeout',
+    });
+    expect(await parseError(res)).toBe(
+      'HTTP 504 Gateway Timeout: the Databricks Apps proxy did not get a reply from the app in time.'
+    );
+  });
+
+  it('strips HTML and caps other non-JSON bodies', async () => {
+    expect(await parseError(new Response('<b>Forbidden</b> by policy', { status: 403, statusText: 'Forbidden' }))).toBe(
+      'HTTP 403 Forbidden: Forbidden by policy'
+    );
+    expect(await parseError(new Response('x'.repeat(500), { status: 400, statusText: 'Bad Request' }))).toBe(
+      'HTTP 400 Bad Request'
+    );
+  });
+
+  it('recognises browser network errors only', () => {
+    expect(isNetworkError(new TypeError('network error'))).toBe(true);
+    expect(isNetworkError(new TypeError('Failed to fetch'))).toBe(true);
+    expect(isNetworkError(new TypeError('Load failed'))).toBe(true);
+    expect(isNetworkError(new TypeError('NetworkError when attempting to fetch resource.'))).toBe(true);
+    expect(isNetworkError(new TypeError("Cannot read properties of undefined (reading 'fetch')"))).toBe(false);
+    expect(isNetworkError(new Error('network error'))).toBe(false);
   });
 });
 

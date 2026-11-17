@@ -2,7 +2,6 @@
 and export a scorecard as a branded PDF."""
 
 import logging
-import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -149,17 +148,16 @@ async def assess_stream(
 ):
     """One-request stream of a whole assessment (kept for headless callers).
 
-    Same events as the runs API, with keepalives, in a single response. Behind the
-    Apps proxy a long run can still be cut at ~300s; the UI uses
-    ``/assess/runs`` instead, which reconnects.
+    Same events as before, now with keepalives. The run stops when the client
+    disconnects. Behind the Apps proxy a long run can still be cut at ~300s; the
+    UI uses ``/assess/runs`` instead, which reconnects.
 
     Body: {"workspace_filter": {"mode": "include"|"exclude", "workspace_ids": [...]}}
     scopes the activity-based signals; omit / empty for all workspaces."""
     wsf, cat_scope, sch_scope = _scope_from(req)
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope)
-    return StreamingResponse(
-        runs.stream_events(run, 0, window=math.inf), media_type="text/event-stream", headers=_SSE_HEADERS
-    )
+    # Not exclusive: a script must not cancel the same user's run in the browser.
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, replace_existing=False)
+    return StreamingResponse(runs.stream_whole_run(run), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.get("/assess/history")

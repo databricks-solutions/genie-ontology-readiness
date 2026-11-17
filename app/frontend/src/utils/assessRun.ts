@@ -63,7 +63,7 @@ export interface RunAssessmentOptions {
   // Injection points for tests.
   start?: (body: unknown) => Promise<{ run_id: string }>;
   stream?: (path: string, signal: AbortSignal) => AsyncIterable<WireEvent>;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   now?: () => number;
 }
 
@@ -72,7 +72,21 @@ export interface RunAssessmentResult {
   reconnects: number;
 }
 
-const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Sleep that ends early (with an AbortError) when `signal` aborts. */
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+    const t = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 export function formatDuration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -81,7 +95,8 @@ export function formatDuration(ms: number): string {
 }
 
 function describeCause(e: unknown): string {
-  if (e instanceof ApiError) return `${e.message} (HTTP ${e.status})`;
+  // parseError already starts proxy/HTTP messages with "HTTP <status>".
+  if (e instanceof ApiError) return e.message.startsWith('HTTP ') ? e.message : `${e.message} (HTTP ${e.status})`;
   if (e instanceof Error) return `${e.name}: ${e.message}`;
   return String(e);
 }
@@ -104,7 +119,7 @@ const HINT =
 export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAssessmentResult> {
   const start = opts.start ?? ((body: unknown) => apiPost<{ run_id: string }>('/assess/runs', body));
   const stream = opts.stream ?? ((path: string, signal: AbortSignal) => streamGetEvents<WireEvent>(path, signal));
-  const sleep = opts.sleep ?? defaultSleep;
+  const sleep = opts.sleep ?? abortableSleep;
   const now = opts.now ?? (() => Date.now());
   const maxRetries = opts.maxRetries ?? 5;
   const pending = opts.pending ?? (() => []);
@@ -150,10 +165,18 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
           windowClosed = true;
           break;
         }
+        try {
+          opts.onEvent(ev as AssessEvent);
+        } catch (handlerError) {
+          // A bug in the page, not a connection problem: don't retry it.
+          throw fail('The page could not show an assessment update.', handlerError, runId, [
+            `Event: ${ev.type}${typeof ev.seq === 'number' ? ` #${ev.seq}` : ''}`,
+          ]);
+        }
         if (typeof ev.seq === 'number') next = ev.seq + 1;
-        opts.onEvent(ev as AssessEvent);
       }
     } catch (e) {
+      if (e instanceof AssessRunError) throw e;
       if (opts.signal.aborted || (e as Error)?.name === 'AbortError') throw e;
       if (e instanceof ApiError && e.status === 404) {
         throw fail('The assessment run was lost on the server.', e, runId);
@@ -165,7 +188,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
           : 'Could not read the assessment progress from the app.';
         throw fail(what, e, runId, [`Reconnect attempts: ${failures - 1} (gave up)`]);
       }
-      await sleep(Math.min(1000 * 2 ** (failures - 1), 10_000));
+      await sleep(Math.min(1000 * 2 ** (failures - 1), 10_000), opts.signal);
       reconnects += 1;
       continue;
     }
@@ -181,7 +204,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
           [`Reconnect attempts: ${failures - 1} (gave up)`]
         );
       }
-      await sleep(Math.min(1000 * 2 ** (failures - 1), 10_000));
+      await sleep(Math.min(1000 * 2 ** (failures - 1), 10_000), opts.signal);
     }
     reconnects += 1;
   }
