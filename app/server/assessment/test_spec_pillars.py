@@ -501,3 +501,36 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+class GenieAuditBudgetTest(unittest.TestCase):
+    """The 90-day audit scan gets a longer poll budget, and a timeout isn't reported
+    as a missing grant (live finding while merging #119 after #128)."""
+
+    def test_audit_queries_get_the_long_budget(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from server.assessment import probes
+        execute = AsyncMock(return_value=[{"total": 3, "active_30d": 1}])
+        with patch.object(probes, "execute_sql", execute):
+            asyncio.run(probes._genie_audit_counts())
+            asyncio.run(probes._genie_audit_rows())
+        budgets = [c.kwargs.get("poll_seconds") for c in execute.await_args_list]
+        self.assertEqual(budgets, [probes._GENIE_AUDIT_POLL_SECONDS] * 2)
+        self.assertGreater(probes._GENIE_AUDIT_POLL_SECONDS, 180)
+
+    def test_a_timeout_is_not_reported_as_a_missing_grant(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        from server.assessment import probes
+        with patch.object(probes, "execute_sql",
+                          AsyncMock(side_effect=probes.StatementTimeout("timed out after 600 seconds"))):
+            audit = asyncio.run(probes._genie_audit_counts())
+            self.assertTrue(audit.get("timed_out"))
+            with patch.object(probes, "_genie_audit_counts", AsyncMock(return_value=audit)):
+                out = asyncio.run(probes.probe_genie_agents())
+        self.assertFalse(out["available"])
+        self.assertIn("timed out", out["note"])
+        self.assertNotIn("needs SELECT", out["note"])

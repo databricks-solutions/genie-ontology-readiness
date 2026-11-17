@@ -1258,6 +1258,11 @@ _GENIE_AUDIT_LOOKBACK_DAYS = GENIE_AUDIT_LOOKBACK_DAYS  # the spec's window (its
 # over a wider window so an actively-queried but not-recently-edited space still
 # shows a readable name (falling back to its space id when none is in the window).
 _GENIE_NAME_LOOKBACK_DAYS = 90
+# Poll budget for the audit-log scans (system.access.audit over the lookback). On a
+# busy, large account the 90-day scan can run well past the 180 s default, more so
+# while other pillars load the same warehouse. Background runs (#128) aren't bound
+# by the Apps proxy's stream cut, so give these queries room; the run cap still applies.
+_GENIE_AUDIT_POLL_SECONDS = 600
 
 
 def _count(serialized: dict, *path: str) -> int:
@@ -1343,12 +1348,16 @@ async def _genie_audit_counts() -> dict:
             render_sql(GENIE_SPEC["queries_by_id"]["audit_counts"]["sql"],
                        workspace_filter=workspace_filter).rstrip(";"),
             parameters=parameters or None,
+            poll_seconds=_GENIE_AUDIT_POLL_SECONDS,
         )
         row = rows[0] if rows else {}
         return {
             "total": int(row.get("total") or 0),
             "active_30d": int(row.get("active_30d") or 0),
         }
+    except StatementTimeout:
+        logger.warning("Genie audit scan timed out after %ss", _GENIE_AUDIT_POLL_SECONDS)
+        return {"total": None, "active_30d": None, "timed_out": True}
     except Exception:
         return {"total": None, "active_30d": None}
 
@@ -1393,6 +1402,7 @@ async def _genie_audit_rows() -> list[dict]:
             ") a LEFT JOIN names nm ON a.space_id = nm.space_id" + ws_join + " "
             "WHERE a.trashed = 0 ORDER BY a.events DESC LIMIT 200",
             parameters=wparams or None,
+            poll_seconds=_GENIE_AUDIT_POLL_SECONDS,
         )
         out = []
         for r in rows:
@@ -1432,6 +1442,11 @@ async def probe_genie_agents() -> dict:
     audit = await _genie_audit_counts()
     total, active = audit.get("total"), audit.get("active_30d")
     if total is None and active is None:
+        if audit.get("timed_out"):
+            # Not a permission problem: don't send the user to fix grants they have.
+            return _empty(f"Genie usage couldn't be read in time — the {_GENIE_AUDIT_LOOKBACK_DAYS}-day audit-log "
+                          "scan timed out. Run the assessment again, or use a larger SQL warehouse.",
+                          reason="scan_failed")
         return _empty("Genie usage can't be read — the assessing identity needs SELECT on system.access.audit.",
                       reason="insufficient_permission")
     total, active = total or 0, active or 0
