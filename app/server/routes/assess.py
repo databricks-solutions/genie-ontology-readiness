@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from server.assessment.compare import compare_snapshots
 from server.assessment import runs
 from server.assessment.scoring import run_assessment
+from server.impact import OVERALL_FRAMING, pillar_impact
 from server.routes._shared import _cache_get, _cache_set, current_principal
 from server.config import ASSESS_CATALOGS, set_user_token
 from server.pdf import (
@@ -218,6 +219,11 @@ def _fmt_signal(sig: dict) -> str:
     return f"{head} — {detail}" if detail else head
 
 
+def _impact_label(text: str) -> str:
+    """An impact statement with its label, e.g. ``*Impact for Genie Ontology:* ...``."""
+    return f"*Impact for Genie Ontology:* {text}"
+
+
 def _assessment_markdown(sc: dict) -> str:
     """A deterministic Markdown readout of the scorecard: overall + stage, the
     per-pillar table (score / level / weight), top gaps, then per-pillar detail
@@ -255,6 +261,9 @@ def _assessment_markdown(sc: dict) -> str:
     if detail:
         lines.append(detail)
         lines.append("")
+    # Frames the score as Genie Ontology readiness (Private Preview; fixed text).
+    lines.append(overall.get("readiness_framing") or OVERALL_FRAMING)
+    lines.append("")
 
     # Per-pillar scorecard table.
     if pillars:
@@ -277,6 +286,8 @@ def _assessment_markdown(sc: dict) -> str:
         lines.append("")
         for g in top_gaps:
             lines.append(f"- **{g.get('pillar')}** — {g.get('gap')}")
+            if g.get("impact"):
+                lines.append(f"    - {_impact_label(g['impact'])}")
         lines.append("")
 
     # Per-pillar detail.
@@ -303,6 +314,15 @@ def _assessment_markdown(sc: dict) -> str:
                 lines.append(summary)
                 lines.append("")
 
+            # Pillar-level impact, under the same rule as scoring. Legacy snapshots have
+            # no stored impact, so the rule is applied to the stored scores instead.
+            impact = p.get("impact") or pillar_impact(
+                p.get("key") or "", score=p.get("score") or 0.0,
+                has_gaps=bool(p.get("gaps")), available=p.get("available", True))
+            if impact:
+                lines.append(_impact_label(impact))
+                lines.append("")
+
             identity = p.get("identity") or {}
             if identity.get("label"):
                 lines.append(f"*Assessed as: {identity.get('label')}.*")
@@ -320,8 +340,12 @@ def _assessment_markdown(sc: dict) -> str:
             if gaps:
                 lines.append("**Gaps**")
                 lines.append("")
-                for g in gaps:
+                gap_impacts = p.get("gap_impacts") or []
+                for i, g in enumerate(gaps):
                     lines.append(f"- {g}")
+                    gi = gap_impacts[i] if i < len(gap_impacts) else None
+                    if gi:
+                        lines.append(f"    - {_impact_label(gi)}")
                 lines.append("")
 
             practices = p.get("best_practices") or []
