@@ -64,9 +64,86 @@ class ColumnScanTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(probes, "execute_sql", execute), patch.object(probes, "_emit_progress"):
             await probes._column_coverage_chunked(["a"], system_ok=True)
         self.assertEqual(execute.await_args.kwargs["poll_seconds"], probes._METADATA_QUERY_POLL_SECONDS)
+        self.assertEqual(execute.await_args.kwargs["wait_seconds"], 0)  # cancellable from the start
         self.assertGreater(probes._METADATA_QUERY_POLL_SECONDS, 120)
-        # 50 s initial statement wait + the poll budget must end before the stall stop.
-        self.assertLess(50 + probes._METADATA_QUERY_POLL_SECONDS, probes._METADATA_NO_PROGRESS_TIMEOUT)
+        # Budget + one bounded final status read (30 s) + the cancel (5 s) < the stall stop.
+        self.assertLess(probes._METADATA_QUERY_POLL_SECONDS + 30 + 5, probes._METADATA_NO_PROGRESS_TIMEOUT)
+
+    async def test_per_catalog_union_names_its_columns(self):
+        q = probes._coverage_query("columns", ["a", "b"], system_ok=False)
+        self.assertNotIn("SELECT *", q)
+        self.assertIn("SELECT table_catalog, table_schema, comment FROM `a`.information_schema.columns", q)
+
+
+class ColumnScanEdgeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_one_fast_failing_catalog_in_a_single_batch_does_not_trip_the_breaker(self):
+        cats = [f"c{i:02d}" for i in range(25)]  # ONE original batch
+
+        async def fake(query, *a, **k):
+            if "c00" in query:
+                raise Exception("[CANNOT_ESTABLISH_CONNECTION_SERVERLESS] remote down")  # fails fast
+            await asyncio.sleep(0.05)  # good halves are slower
+            return _rows_for(_cats_in(query, cats))
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            _, _, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(skipped, ["c00"])
+        self.assertEqual(len(per_schema), 24)
+
+    async def test_a_stall_raises_and_cancels_every_pending_query(self):
+        started, cancelled = [], []
+
+        async def hang(query, *a, **k):
+            started.append(query)
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(query)
+                raise
+
+        cats = [f"c{i:03d}" for i in range(60)]  # 3 batches, all hang
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=hang)), \
+             patch.object(probes, "_emit_progress"), \
+             patch.object(probes, "_METADATA_NO_PROGRESS_TIMEOUT", 0.1):
+            with self.assertRaises(TimeoutError):
+                await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(len(started), 3)
+        self.assertEqual(sorted(cancelled), sorted(started))
+
+
+class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
+    async def test_breaker_trips_mid_scan_after_a_success(self):
+        cats = [f"c{i:03d}" for i in range(500)]  # 20 batches
+        state = {"n": 0}
+
+        async def fake(query, *a, **k):
+            state["n"] += 1
+            if state["n"] == 1:
+                return _rows_for(_cats_in(query, cats))  # first batch fine
+            raise Exception("warehouse saturated")      # then everything fails
+
+        execute = AsyncMock(side_effect=fake)
+        with patch.object(probes, "execute_sql", execute), patch.object(probes, "_emit_progress"):
+            with self.assertRaises(RuntimeError):
+                await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertLess(execute.await_count, 60)  # no ~1,000-query retry storm
+
+    async def test_a_timed_out_batch_goes_straight_to_single_catalogs(self):
+        cats = [f"c{i:02d}" for i in range(8)] + ["huge"]
+        seen = []
+
+        async def fake(query, *a, **k):
+            seen.append(len(_cats_in(query, cats)))
+            if "huge" in query:
+                raise Exception("SQL query timed out after 230 seconds")
+            return _rows_for(_cats_in(query, cats))
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            _, _, _, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(skipped, ["huge"])
+        self.assertEqual(seen[0], 9)
+        self.assertTrue(all(n == 1 for n in seen[1:]))  # no halving rounds of the slow catalog
+        self.assertEqual(len(seen), 1 + 9)
 
 
 class ReadabilityShapeTest(unittest.IsolatedAsyncioTestCase):

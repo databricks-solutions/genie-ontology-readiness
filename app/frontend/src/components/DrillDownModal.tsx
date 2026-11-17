@@ -109,8 +109,8 @@ export default function DrillDownModal({
               <>
                 {drill.total_rows && drill.total_rows > drill.rows.length && (
                   <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                    Showing the {drill.rows.length.toLocaleString()} lowest-scoring of{' '}
-                    {drill.total_rows.toLocaleString()} rows. Filters and the CSV export cover these rows only.
+                    Filters and the CSV export cover these {drill.rows.length.toLocaleString()} rows only
+                    (of {drill.total_rows.toLocaleString()}).
                   </p>
                 )}
                 {/* Slice-by filters + CSV export + View SQL */}
