@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -41,9 +42,20 @@ STREAM_WINDOW_SECONDS = 240.0
 HEARTBEAT_SECONDS = 8.0
 # How long a finished run stays readable (for a late reconnect).
 FINISHED_TTL_SECONDS = 15 * 60
-# A run still working after this long is cancelled. The metadata scan has its
-# own no-progress timeout, so this only catches a run that is truly stuck.
-MAX_RUN_SECONDS = 45 * 60
+# A run still working after this long is cancelled. Scan time grows with the
+# number of columns, so a very large metastore can legitimately take most of an
+# hour; the no-progress and no-reader stops catch stuck or abandoned runs much
+# sooner. Override with GOR_MAX_RUN_SECONDS.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        logger.warning("%s is not a number; using %s", name, default)
+        return default
+    return value if value > 0 else default
+
+
+MAX_RUN_SECONDS = _env_seconds("GOR_MAX_RUN_SECONDS", 3 * 60 * 60)
 # A working run with no reader for this long is abandoned (tab closed, network
 # gone) and is cancelled. Longer than the client's full reconnect backoff.
 ABANDON_SECONDS = 90.0

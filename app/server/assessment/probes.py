@@ -562,6 +562,14 @@ _METADATA_SCAN_CONCURRENCY = 6
 # Stall only if NO batch completes within this window (not a fixed total deadline),
 # so a slow-but-progressing scan of a huge metastore is allowed to finish.
 _METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
+# Time budget for ONE column-coverage query (after the 50 s initial wait). Longer
+# than the client default (120 s) so a batch of large catalogs can finish, and
+# below the no-progress stop. A query past it is cancelled and its catalogs retried
+# alone (see _column_coverage_chunked).
+_METADATA_QUERY_POLL_SECONDS = 240
+# The per-schema drill-down keeps the worst N schemas. One row per schema is
+# unbounded on a large metastore (2,000 catalogs ≈ 23k rows ≈ 3 MB per event).
+_METADATA_DRILL_MAX_ROWS = 500
 
 _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
@@ -599,8 +607,9 @@ async def _column_coverage_chunked(
     system_ok: bool,
     schemas: list[str] | None = None,
 ) -> tuple[int, int, dict]:
-    """(columns, commented-columns, per_schema) computed in per-catalog batches with
-    bounded concurrency, where per_schema maps (catalog, schema) -> (columns, commented).
+    """(columns, commented-columns, per_schema, skipped) computed in per-catalog
+    batches with bounded concurrency, where per_schema maps (catalog, schema) ->
+    (columns, commented) and skipped lists the catalogs that could not be read.
     Emits pillar_progress as each batch lands and raises TimeoutError only if no
     batch completes within _METADATA_NO_PROGRESS_TIMEOUT."""
     batches = [catalogs[i:i + _METADATA_BATCH_SIZE] for i in range(0, len(catalogs), _METADATA_BATCH_SIZE)]
@@ -617,26 +626,40 @@ async def _column_coverage_chunked(
         {"catalogs": f"the {total_cats} catalog(s) in scope, scanned in batches"},
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
-    c_total = c_commented = scanned = ok_cats = failed_cats = 0
+    c_total = c_commented = scanned = ok_cats = 0
     per_schema: dict[tuple[str, str], tuple[int, int]] = {}
+    skipped: list[str] = []
 
-    async def _one(batch: list[str]) -> tuple[int, int, int, bool, list[dict]]:
+    async def _query(batch: list[str]) -> list[dict]:
         async with sem:
-            try:
-                # record=False: the per-batch queries differ only in their catalog
-                # list, so we record ONE representative below instead of one row per
-                # batch in the "View SQL" disclosure.
-                rows = await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False)
-                bt = sum(int(r.get("total") or 0) for r in rows)
-                bc = sum(int(r.get("commented") or 0) for r in rows)
-                return len(batch), bt, bc, True, rows
-            except Exception as e:
-                # An isolated bad batch (e.g. one unreadable catalog) shouldn't sink
-                # the whole scan — record it as failed (not as real 0% coverage). If
-                # EVERY batch fails (permissions lost, warehouse down) we raise below
-                # so the pillar degrades to "unavailable" rather than a fake 0%.
-                logger.warning(f"metadata column batch failed ({len(batch)} catalogs): {str(e)[:100]}")
-                return len(batch), 0, 0, False, []
+            # record=False: the per-batch queries differ only in their catalog
+            # list, so ONE representative is recorded above for "View SQL".
+            return await execute_sql(_coverage_query("columns", batch, system_ok, schemas), record=False,
+                                     poll_seconds=_METADATA_QUERY_POLL_SECONDS)
+
+    async def _one(batch: list[str]) -> tuple[int, list[dict], list[str]]:
+        """(catalogs read, rows, catalogs skipped) for one batch.
+
+        A batch is one UNION/IN query, so a single bad catalog (a federated
+        catalog whose remote is down, a catalog too big for the time budget)
+        fails it. Then each catalog is retried alone, and only the ones that
+        still fail are skipped: one broken catalog must not drop 24 good ones."""
+        try:
+            return len(batch), await _query(batch), []
+        except Exception as e:
+            logger.warning(f"metadata column batch failed ({len(batch)} catalogs): {str(e)[:100]}")
+            if len(batch) == 1:
+                return 0, [], list(batch)
+        results = await asyncio.gather(*(_query([c]) for c in batch), return_exceptions=True)
+        rows: list[dict] = []
+        bad: list[str] = []
+        for c, r in zip(batch, results):
+            if isinstance(r, BaseException):
+                logger.warning(f"metadata column scan skipped catalog {c!r}: {str(r)[:100]}")
+                bad.append(c)
+            else:
+                rows.extend(r)
+        return len(batch) - len(bad), rows, bad
 
     tasks = [asyncio.ensure_future(_one(b)) for b in batches]
     pending = set(tasks)
@@ -652,20 +675,20 @@ async def _column_coverage_chunked(
                     f"{_METADATA_NO_PROGRESS_TIMEOUT}s ({scanned}/{total_cats} catalogs scanned)"
                 )
             for d in done:
-                ncat, t, c, ok, rows = d.result()
-                scanned += ncat
-                if ok:
-                    ok_cats += ncat
+                nread, rows, bad = d.result()
+                scanned += nread + len(bad)
+                ok_cats += nread
+                skipped.extend(bad)
+                for r in rows:
+                    t, c = int(r.get("total") or 0), int(r.get("commented") or 0)
                     c_total += t
                     c_commented += c
-                    for r in rows:
-                        cat, sch = r.get("cat"), r.get("sch")
-                        if cat and sch:
-                            per_schema[(cat, sch)] = (int(r.get("total") or 0), int(r.get("commented") or 0))
-                else:
-                    failed_cats += ncat
+                    cat, sch = r.get("cat"), r.get("sch")
+                    if cat and sch:
+                        per_schema[(cat, sch)] = (t, c)
                 _emit_progress("metadata", scanned, total_cats,
-                               f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented")
+                               f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented"
+                               + (f" · {len(skipped)} skipped" if skipped else ""))
     finally:
         # Cancel any still-pending batches (timeout path) and await them so the
         # cancellations settle — no orphaned tasks or unretrieved-exception warnings.
@@ -674,14 +697,14 @@ async def _column_coverage_chunked(
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Every batch failed → this is an access/infra failure, not real 0% coverage.
+    # Every catalog failed → this is an access/infra failure, not real 0% coverage.
     # Raise so probe_metadata marks the pillar unavailable (pre-chunking behavior).
     if ok_cats == 0:
         raise RuntimeError(f"column coverage scan failed for all {total_cats} catalogs")
-    if failed_cats:
-        logger.warning(f"metadata scan: {failed_cats}/{total_cats} catalogs unreadable; "
+    if skipped:
+        logger.warning(f"metadata scan: {len(skipped)}/{total_cats} catalogs unreadable; "
                        f"coverage computed over the {ok_cats} readable")
-    return c_total, c_commented, per_schema
+    return c_total, c_commented, per_schema, skipped
 
 
 async def probe_metadata() -> dict:
@@ -727,8 +750,9 @@ async def probe_metadata() -> dict:
         # metastore fills in progressively instead of timing out on one big scan.
         # Fall back to a single query only when there's no catalog list to chunk by.
         col_per_schema: dict[tuple[str, str], tuple[int, int]] = {}
+        skipped_cats: list[str] = []
         if catalogs:
-            c_total, c_commented, col_per_schema = await _column_coverage_chunked(
+            c_total, c_commented, col_per_schema, skipped_cats = await _column_coverage_chunked(
                 catalogs, system_ok, s.get("schemas")
             )
         else:
@@ -770,6 +794,10 @@ async def probe_metadata() -> dict:
         ]
         if tagged_tables is not None:
             signals.append({"label": "Tagged tables", "value": tagged_tables, "detail": "Tables with ≥1 governed tag"})
+        if skipped_cats:
+            names = ", ".join(sorted(skipped_cats)[:10]) + (f" (+{len(skipped_cats) - 10} more)" if len(skipped_cats) > 10 else "")
+            signals.append({"label": "Catalogs skipped", "value": len(skipped_cats),
+                            "detail": f"Column metadata could not be read, so coverage excludes: {names}"})
 
         # Per-schema drill-down (#10): comment coverage by schema, worst first, so a
         # domain lead sees which schemas drag the score down (sliceable by catalog/schema).
@@ -787,6 +815,8 @@ async def probe_metadata() -> dict:
                 "tables": t_tot,
             })
         drill_rows.sort(key=lambda r: (r["table_comment_pct"] + r["column_comment_pct"]))
+        drill_total = len(drill_rows)
+        drill_rows = drill_rows[:_METADATA_DRILL_MAX_ROWS]
 
         return {
             "available": True,
@@ -796,7 +826,8 @@ async def probe_metadata() -> dict:
             "note": None,
             "metrics": {"table_comment_pct": table_pct, "column_comment_pct": col_pct, "tagged_tables": tagged_tables},
             "drill_down": _drill(
-                "Comment coverage by schema (worst first)",
+                "Comment coverage by schema (worst first)" if drill_total <= _METADATA_DRILL_MAX_ROWS
+                else f"Comment coverage by schema (worst {_METADATA_DRILL_MAX_ROWS} of {drill_total})",
                 [{"key": "catalog", "label": "Catalog"},
                  {"key": "schema", "label": "Schema"},
                  {"key": "tables", "label": "Tables"},

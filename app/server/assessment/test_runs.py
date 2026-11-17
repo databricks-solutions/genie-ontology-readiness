@@ -298,5 +298,15 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 404)
 
 
+class RunCapConfigTest(unittest.TestCase):
+    def test_env_override_and_bad_values(self):
+        with patch.dict("os.environ", {"GOR_MAX_RUN_SECONDS": "7200"}):
+            self.assertEqual(runs._env_seconds("GOR_MAX_RUN_SECONDS", 10), 7200)
+        for bad in ("abc", "-5", "0", ""):
+            with patch.dict("os.environ", {"GOR_MAX_RUN_SECONDS": bad}):
+                self.assertEqual(runs._env_seconds("GOR_MAX_RUN_SECONDS", 10), 10)
+        self.assertGreaterEqual(runs.MAX_RUN_SECONDS, 3 * 60 * 60)
+
+
 if __name__ == "__main__":
     unittest.main()

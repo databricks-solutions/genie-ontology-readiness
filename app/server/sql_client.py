@@ -131,7 +131,12 @@ def resolved_identity() -> Optional[dict]:
             "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
-async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False, record: bool = True) -> list[dict]:
+# How long to poll a statement that is still running after the initial 50 s wait.
+DEFAULT_POLL_SECONDS = 120
+
+
+async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
+                      record: bool = True, poll_seconds: int = DEFAULT_POLL_SECONDS) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
     Identity model — every signal defaults to on-behalf-of-user (OBO):
@@ -162,25 +167,25 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
     if force_sp or FORCE_SP:
         record_identity("sp_forced_env" if FORCE_SP else "sp_forced_call")
-        return await _execute_once(query, parameters, force_sp=True)
+        return await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds)
 
     # No forwarded viewer token → nothing to run OBO as; go straight to the SP.
     if not get_user_token():
         record_identity("sp_no_token")
-        return await _execute_once(query, parameters, force_sp=True)
+        return await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds)
 
     # Default: try OBO (as the viewer). Fall back to the SP only when the failure
     # looks like an AUTHORIZATION gap (the case the SP can actually cover). Other
     # failures (timeout, bad SQL, warehouse down) would fail identically as the SP,
     # so re-raise them instead of doubling latency with a pointless retry.
     try:
-        rows = await _execute_once(query, parameters, force_sp=False)
+        rows = await _execute_once(query, parameters, force_sp=False, poll_seconds=poll_seconds)
     except Exception as obo_err:
         if not _is_authz_error(obo_err):
             raise
         logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
         try:
-            sp_rows = await _execute_once(query, parameters, force_sp=True)
+            sp_rows = await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds)
         except Exception as sp_err:
             # The SP fallback failed too (neither the viewer nor the app SP can
             # read this). Chain the original OBO denial so it stays visible in the
@@ -220,7 +225,8 @@ def _is_authz_error(exc: Exception) -> bool:
     return any(m in msg for m in _AUTHZ_MARKERS)
 
 
-async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool) -> list[dict]:
+async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool,
+                        poll_seconds: int = DEFAULT_POLL_SECONDS) -> list[dict]:
     """Run the query once with a single resolved identity (OBO or SP)."""
     host = get_workspace_host()
     auth_headers = get_auth_headers(force_sp=force_sp)
@@ -284,16 +290,18 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
             # Handle PENDING/RUNNING -- poll until complete
             if status in ("PENDING", "RUNNING"):
                 statement_id = result.get("statement_id")
-                result = await _poll_statement(session, host, auth_headers, statement_id)
+                result = await _poll_statement(session, host, auth_headers, statement_id, poll_seconds)
 
             return _parse_result(result)
 
 
-async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_headers: dict, statement_id: str) -> dict:
-    """Poll for statement completion."""
+async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_headers: dict, statement_id: str,
+                          poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict:
+    """Poll for statement completion for up to ``poll_seconds``; on timeout, cancel
+    the statement so it doesn't keep running on the warehouse."""
     url = f"{host}/api/2.0/sql/statements/{statement_id}"
 
-    for _ in range(120):  # up to 2 minutes
+    for _ in range(max(1, int(poll_seconds))):
         await asyncio.sleep(1)
         async with session.get(url, headers=auth_headers) as resp:
             result = await resp.json()
@@ -306,7 +314,12 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
             elif state in ("CANCELED", "CLOSED"):
                 raise Exception(f"SQL query {state.lower()}")
 
-    raise Exception("SQL query timed out after 120 seconds")
+    try:
+        async with session.post(f"{url}/cancel", headers=auth_headers) as resp:
+            await resp.read()
+    except Exception as e:  # best effort; the timeout below is what matters
+        logger.info(f"could not cancel timed-out statement {statement_id}: {type(e).__name__}")
+    raise Exception(f"SQL query timed out after {int(poll_seconds)} seconds")
 
 
 def _parse_result(result: dict) -> list[dict]:
