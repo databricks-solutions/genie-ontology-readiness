@@ -148,7 +148,7 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(seen), 1 + probes._METADATA_SCAN_CONCURRENCY + 9)  # original + canary + singles
 
     async def test_a_remote_connection_timeout_message_is_split_not_fanned_out(self):
-        # A federated "Connection timed out" error is not a statement timeout.
+        # A federated "Connection timed out" error is not a statement timeout: halve.
         cats = [f"c{i:02d}" for i in range(8)]
         seen = []
 
@@ -158,10 +158,13 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
                 raise Exception("[CANNOT_ESTABLISH_CONNECTION] Connection timed out")
             return _rows_for(_cats_in(query, cats))
 
-        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"), \
+             self.assertLogs(probes.logger, "WARNING") as logs:
             _, _, _, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
         self.assertEqual(skipped, ["c00"])
-        self.assertLess(seen.count(1), 8)       # halved, not fanned out to 8 singles
+        text = "\n".join(logs.output)
+        self.assertNotIn("retrying each alone", text)
+        self.assertLessEqual(len(seen), 1 + probes._METADATA_SCAN_CONCURRENCY + 6)
 
 
 class HeldFailuresTest(unittest.IsolatedAsyncioTestCase):
@@ -213,6 +216,28 @@ class CanaryTimingTest(unittest.IsolatedAsyncioTestCase):
             total, commented, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
         self.assertEqual(skipped, ["c00"])
         self.assertEqual((total, commented, len(per_schema)), (240, 120, 24))
+
+
+class CanaryFailureOrderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_canary_failing_in_the_releasing_set_is_not_also_counted(self):
+        cats = [f"c{i:02d}" for i in range(25)]  # ONE batch; c00 broken; canary c20 fails ONCE
+        flaky = {"c20": 1}
+
+        async def fake(query, *a, **k):
+            found = _cats_in(query, cats)
+            if "c00" in found:
+                raise Exception("[FAILED_JDBC.CONNECTION] remote down")
+            if found == ["c20"] and flaky["c20"]:
+                flaky["c20"] -= 1
+                raise Exception("transient")
+            return _rows_for(found)
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            total, commented, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        counted = {c for c, _ in per_schema}
+        self.assertFalse(counted & set(skipped))           # never both skipped and counted
+        self.assertEqual(len(counted) + len(skipped), 25)  # every catalog settled exactly once
+        self.assertEqual(total, 10 * len(counted))
 
 
 class ReadabilityShapeTest(unittest.IsolatedAsyncioTestCase):

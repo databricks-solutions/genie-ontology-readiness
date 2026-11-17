@@ -719,7 +719,9 @@ async def _column_coverage_chunked(
                     if cat and sch:
                         per_schema[(cat, sch)] = (t, c)
             if ok_cats > 0 and held and not canaries_in_flight:
-                failed, held = held + failed, []
+                # Current failures (e.g. a canary that just failed) first, so they are
+                # settled before the held batches are filtered against `settled`.
+                failed, held = failed + held, []
             elif ok_cats == 0 and held and not pending and not failed and not canary_used:
                 canary_used = True
                 flat = [c for b, _ in held for c in b]
