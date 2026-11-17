@@ -33,7 +33,7 @@ import logging
 import aiohttp
 
 from server.security import quote_ident, quote_literal, safe_error
-from server.sql_client import execute_sql, record_query, record_rest_identity, _is_authz_error
+from server.sql_client import StatementTimeout, execute_sql, record_query, record_rest_identity, _is_authz_error
 from server.user_agent import with_ua
 from server.config import (
     get_workspace_host,
@@ -577,21 +577,25 @@ _METADATA_SCAN_CONCURRENCY = 6
 # Stall only if NO batch completes within this window (not a fixed total deadline),
 # so a slow-but-progressing scan of a huge metastore is allowed to finish.
 _METADATA_NO_PROGRESS_TIMEOUT = 300  # seconds
-# Time budget for ONE column-coverage query (after the 50 s initial wait). Longer
-# than the client default (120 s) so a batch of large catalogs can finish, and
-# below the no-progress stop. A query past it is cancelled and its batch split
-# (see _column_coverage_chunked).
-# Scan queries submit without waiting (statement id at once, so always cancellable)
-# and then poll: 230 s + at most a 30 s final status read + a 5 s cancel ≈ 265 s,
-# below the 300 s no-progress stop.
+# Time budget for ONE column-coverage query, longer than the client default (120 s)
+# so a batch of large catalogs can finish. Scan queries submit without waiting (a
+# <=30 s call that returns the statement id, so it is always cancellable), then
+# poll: 30 s submit + 230 s + a <=30 s last status read + a 5 s cancel ≈ 295 s, at
+# or under the 300 s no-progress stop. A query past it is cancelled and its
+# catalogs retried alone (see _column_coverage_chunked).
 _METADATA_QUERY_POLL_SECONDS = 230
 # The per-schema drill-down keeps the worst N schemas. One row per schema is
 # unbounded on a large metastore (2,000 catalogs ≈ 23k rows ≈ 3 MB per event).
 _METADATA_DRILL_MAX_ROWS = 500
-# Stop the scan when this many ORIGINAL batches fail in a row (any success resets
-# the count): the failure is systemic (warehouse down or saturated, access lost),
-# not one bad catalog, so splitting and retrying would only add load.
+# Stop the scan when this many ORIGINAL batches failed before any query succeeded:
+# the failure is systemic (warehouse down, access lost), not one bad catalog.
 _METADATA_CIRCUIT_FAILURES = _METADATA_SCAN_CONCURRENCY
+# Retries (split halves + single-catalog queries) per original batch, summed over
+# the scan. This bounds the extra load when failures are widespread mid-scan (a
+# saturated warehouse); once spent, a failed batch's catalogs are skipped. One bad
+# catalog in a batch of 25 costs <= 10 retries, a timed-out batch 25. The budget
+# has a floor of two batches' worth, so a small scan can still retry fully.
+_METADATA_RETRY_BUDGET_PER_BATCH = 2
 
 _COV_SELECT = ("SELECT COUNT(*) AS total, "
                "SUM(CASE WHEN comment IS NOT NULL AND comment <> '' THEN 1 ELSE 0 END) AS commented FROM ")
@@ -654,7 +658,9 @@ async def _column_coverage_chunked(
     )
     sem = asyncio.Semaphore(_METADATA_SCAN_CONCURRENCY)
     c_total = c_commented = scanned = ok_cats = 0
-    failures_in_a_row = 0
+    original_failures = 0
+    # Floor: even a one-batch scan can retry one timed-out batch catalog by catalog.
+    retry_budget = max(_METADATA_RETRY_BUDGET_PER_BATCH * len(batches), 2 * _METADATA_BATCH_SIZE)
     per_schema: dict[tuple[str, str], tuple[int, int]] = {}
     skipped: list[str] = []
 
@@ -687,10 +693,11 @@ async def _column_coverage_chunked(
                     f"metadata column scan stalled — no query completed in "
                     f"{_METADATA_NO_PROGRESS_TIMEOUT}s ({scanned}/{total_cats} catalogs scanned)"
                 )
-            for d in done:
+            # Successes first: queries that finish together must not trip the
+            # breaker on their failures before their successes are counted.
+            for d in sorted(done, key=lambda t: t.result()[3] is not None):
                 batch, original, rows, err = d.result()
                 if err is None:
-                    failures_in_a_row = 0
                     scanned += len(batch)
                     ok_cats += len(batch)
                     for r in rows:
@@ -701,28 +708,35 @@ async def _column_coverage_chunked(
                         if cat and sch:
                             per_schema[(cat, sch)] = (t, c)
                     continue
-                # Only ORIGINAL batches count toward the breaker: the halves of one
-                # bad catalog's split chain fail by design and must not trip it.
+                why = f"{type(err).__name__}: {str(err)[:100]}"
+                # Only ORIGINAL batches count toward the breaker, and only before any
+                # success: a split chain fails by design, and data already collected
+                # is never thrown away by a later failure.
                 if original:
-                    failures_in_a_row += 1
-                    if failures_in_a_row >= _METADATA_CIRCUIT_FAILURES:
+                    original_failures += 1
+                    if ok_cats == 0 and original_failures >= _METADATA_CIRCUIT_FAILURES:
                         # Systemic: don't fan out retries against a failing warehouse.
-                        raise RuntimeError(f"column coverage scan failed: {failures_in_a_row} batches in a row "
-                                           f"failed ({str(err)[:120]})")
-                if len(batch) > 1:
-                    timed_out = "timed out" in str(err).lower()
+                        raise RuntimeError(f"column coverage scan failed: the first {original_failures} "
+                                           f"batches failed ({why})")
+                # A timeout usually means one catalog is too big for the budget:
+                # halving would re-run it (for the whole budget) at every level, so
+                # go straight to single catalogs. Other errors: split in half.
+                timed_out = isinstance(err, (StatementTimeout, asyncio.TimeoutError))
+                parts = ([[c] for c in batch] if timed_out else
+                         [batch[:len(batch) // 2], batch[len(batch) // 2:]]) if len(batch) > 1 else []
+                if parts and len(parts) <= retry_budget:
+                    retry_budget -= len(parts)
                     logger.warning(f"metadata column batch failed ({len(batch)} catalogs), "
-                                   f"{'retrying each alone' if timed_out else 'splitting'}: {str(err)[:100]}")
-                    # A timeout usually means one catalog is too big for the budget:
-                    # halving would re-run it (for the whole budget) at every level,
-                    # so go straight to single catalogs. Other errors: split in half.
-                    parts = [[c] for c in batch] if timed_out else [batch[:len(batch) // 2], batch[len(batch) // 2:]]
+                                   f"{'retrying each alone' if timed_out else 'splitting'}: {why}")
                     for part in parts:
                         pending.add(asyncio.ensure_future(_query(part, False)))
                 else:
-                    logger.warning(f"metadata column scan skipped catalog {batch[0]!r}: {str(err)[:100]}")
-                    skipped.append(batch[0])
-                    scanned += 1
+                    if parts:
+                        logger.warning(f"metadata retry budget spent; skipping {len(batch)} catalogs: {why}")
+                    else:
+                        logger.warning(f"metadata column scan skipped catalog {batch[0]!r}: {why}")
+                    skipped.extend(batch)
+                    scanned += len(batch)
             _emit_progress("metadata", scanned, total_cats,
                            f"Scanned {scanned}/{total_cats} catalogs · {c_commented}/{c_total} columns commented"
                            + (f" · {len(skipped)} skipped" if skipped else ""))

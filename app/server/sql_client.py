@@ -135,6 +135,10 @@ def resolved_identity() -> Optional[dict]:
 DEFAULT_POLL_SECONDS = 120
 
 
+class StatementTimeout(Exception):
+    """A statement did not finish within its poll budget (it was cancelled)."""
+
+
 async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
                       record: bool = True, poll_seconds: int = DEFAULT_POLL_SECONDS,
                       wait_seconds: int = 50) -> list[dict]:
@@ -277,7 +281,10 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
     # this session for up to two minutes of polling.
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=90)
     async with aiohttp.ClientSession(timeout=timeout, headers=with_ua()) as session:
-        async with session.post(url, json=payload, headers=headers) as response:
+        # A 0 s submit returns at once, so bound it tightly; a waiting submit keeps the
+        # session's per-read limit (the server itself holds it up to wait_timeout).
+        submit_timeout = aiohttp.ClientTimeout(total=30) if wait_seconds <= 0 else None
+        async with session.post(url, json=payload, headers=headers, timeout=submit_timeout) as response:
             if response.status != 200:
                 error_text = await response.text()
                 # Truncated for the log only; the exception keeps the full text so
@@ -315,24 +322,31 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
     try:
         while loop.time() < deadline:
             await asyncio.sleep(1)
-            # Bound each status read by the time left, so one slow read can't carry
-            # the query far past its deadline (the session allows 90 s per read).
-            remaining = max(1.0, deadline - loop.time())
-            async with session.get(url, headers=auth_headers,
-                                   timeout=aiohttp.ClientTimeout(total=min(30.0, remaining))) as resp:
-                result = await resp.json()
-                state = result.get("status", {}).get("state", "")
-                if state == "SUCCEEDED":
-                    finished = True
-                    return result
-                elif state == "FAILED":
-                    finished = True
-                    error_msg = result.get("status", {}).get("error", {}).get("message", "Unknown")
-                    raise Exception(f"SQL query failed: {error_msg}")
-                elif state in ("CANCELED", "CLOSED"):
-                    finished = True
-                    raise Exception(f"SQL query {state.lower()}")
-        raise Exception(f"SQL query timed out after {int(poll_seconds)} seconds")
+            # Bound each status read by the time left (the session allows 90 s per
+            # read), so a query ends near its deadline. A slow or failed read is
+            # retried on the next pass; it doesn't fail a statement that may be fine.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                async with session.get(url, headers=auth_headers,
+                                       timeout=aiohttp.ClientTimeout(total=min(30.0, max(2.0, remaining)))) as resp:
+                    result = await resp.json()
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                logger.info(f"status read for statement {statement_id} failed ({type(e).__name__}); retrying")
+                continue
+            state = result.get("status", {}).get("state", "")
+            if state == "SUCCEEDED":
+                finished = True
+                return result
+            elif state == "FAILED":
+                finished = True
+                error_msg = result.get("status", {}).get("error", {}).get("message", "Unknown")
+                raise Exception(f"SQL query failed: {error_msg}")
+            elif state in ("CANCELED", "CLOSED"):
+                finished = True
+                raise Exception(f"SQL query {state.lower()}")
+        raise StatementTimeout(f"SQL query timed out after {int(poll_seconds)} seconds")
     finally:
         if not finished:
             await _cancel_statement(session, url, auth_headers, statement_id)

@@ -5,6 +5,8 @@ from server import sql_client
 
 
 class _Resp:
+    status = 200
+
     def __init__(self, body):
         self._body = body
 
@@ -40,11 +42,10 @@ class PollBudgetTest(unittest.IsolatedAsyncioTestCase):
         session = _Session()
         import time
         t0 = time.monotonic()
-        with self.assertRaisesRegex(Exception, "timed out after 1 seconds"):
+        with self.assertRaises(sql_client.StatementTimeout):
             await sql_client._poll_statement(session, "https://h", {}, "st-1", poll_seconds=1)
         # The budget is wall-clock time, not loop passes.
         self.assertLess(time.monotonic() - t0, 3)
-        self.assertGreaterEqual(session.gets, 1)
         self.assertEqual(session.posts, ["https://h/api/2.0/sql/statements/st-1/cancel"])
 
     async def test_default_budget_is_unchanged(self):
@@ -62,7 +63,57 @@ class _DoneSession(_Session):
         return _Resp({"status": {"state": self.state, "error": {"message": "boom"}}})
 
 
+class _FlakySession(_Session):
+    """First status read times out, the next one says SUCCEEDED."""
+
+    def get(self, url, headers=None, timeout=None):
+        import asyncio
+        self.gets += 1
+        if self.gets == 1:
+            class _Slow:
+                async def __aenter__(self_inner):
+                    raise asyncio.TimeoutError()
+
+                async def __aexit__(self_inner, *a):
+                    return False
+            return _Slow()
+        return _Resp({"status": {"state": "SUCCEEDED"}})
+
+
 class CancelAndPlumbingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_one_slow_status_read_is_retried_not_fatal(self):
+        session = _FlakySession()
+        result = await sql_client._poll_statement(session, "https://h", {}, "st-5", poll_seconds=10)
+        self.assertEqual(result["status"]["state"], "SUCCEEDED")
+        self.assertEqual(session.posts, [])  # not cancelled
+
+    async def test_submit_payload_wait_timeout(self):
+        sent = []
+
+        class _Submit:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            def post(self, url, json=None, headers=None, timeout=None):
+                sent.append((json["wait_timeout"], timeout))
+                return _Resp({"status": {"state": "SUCCEEDED"}, "manifest": {"schema": {"columns": []}},
+                              "result": {"data_array": []}})
+
+        with patch.object(sql_client.aiohttp, "ClientSession", _Submit), \
+             patch.object(sql_client, "get_workspace_host", return_value="https://h"), \
+             patch.object(sql_client, "get_auth_headers", return_value={"Authorization": "Bearer t"}):
+            for wait in (0, 3, 50, 99):
+                await sql_client._execute_once("q", None, force_sp=True, wait_seconds=wait)
+        self.assertEqual([w for w, _ in sent], ["0s", "5s", "50s", "50s"])
+        self.assertIsNotNone(sent[0][1])   # a 0 s submit is bounded
+        self.assertIsNone(sent[2][1])      # a waiting submit keeps the session limits
+
     async def test_a_finished_statement_is_not_cancelled(self):
         for state in ("SUCCEEDED", "FAILED", "CANCELED"):
             session = _DoneSession(state)

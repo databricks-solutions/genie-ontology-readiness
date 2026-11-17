@@ -40,7 +40,7 @@ class ColumnScanTest(unittest.IsolatedAsyncioTestCase):
         async def fake(query, *a, **k):
             if "huge" in query:
                 await asyncio.sleep(0.2)  # each attempt uses its whole budget, then times out
-                raise Exception("SQL query timed out after 190 seconds")
+                raise probes.StatementTimeout("SQL query timed out after 230 seconds")
             return _rows_for(_cats_in(query, cats))
 
         with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), \
@@ -112,7 +112,7 @@ class ColumnScanEdgeTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
-    async def test_breaker_trips_mid_scan_after_a_success(self):
+    async def test_widespread_failures_mid_scan_keep_collected_data_and_stay_bounded(self):
         cats = [f"c{i:03d}" for i in range(500)]  # 20 batches
         state = {"n": 0}
 
@@ -124,9 +124,11 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
 
         execute = AsyncMock(side_effect=fake)
         with patch.object(probes, "execute_sql", execute), patch.object(probes, "_emit_progress"):
-            with self.assertRaises(RuntimeError):
-                await probes._column_coverage_chunked(cats, system_ok=True)
-        self.assertLess(execute.await_count, 60)  # no ~1,000-query retry storm
+            _, _, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(len(per_schema), 25)       # the first batch's data is kept
+        self.assertEqual(len(skipped), 475)          # the rest is reported, not retried forever
+        budget = max(probes._METADATA_RETRY_BUDGET_PER_BATCH * 20, 2 * probes._METADATA_BATCH_SIZE)
+        self.assertLessEqual(execute.await_count, 20 + budget)
 
     async def test_a_timed_out_batch_goes_straight_to_single_catalogs(self):
         cats = [f"c{i:02d}" for i in range(8)] + ["huge"]
@@ -135,7 +137,7 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         async def fake(query, *a, **k):
             seen.append(len(_cats_in(query, cats)))
             if "huge" in query:
-                raise Exception("SQL query timed out after 230 seconds")
+                raise probes.StatementTimeout("SQL query timed out after 230 seconds")
             return _rows_for(_cats_in(query, cats))
 
         with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
@@ -144,6 +146,22 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[0], 9)
         self.assertTrue(all(n == 1 for n in seen[1:]))  # no halving rounds of the slow catalog
         self.assertEqual(len(seen), 1 + 9)
+
+    async def test_a_remote_connection_timeout_message_is_split_not_fanned_out(self):
+        # A federated "Connection timed out" error is not a statement timeout.
+        cats = [f"c{i:02d}" for i in range(8)]
+        seen = []
+
+        async def fake(query, *a, **k):
+            seen.append(len(_cats_in(query, cats)))
+            if "c00" in query:
+                raise Exception("[CANNOT_ESTABLISH_CONNECTION] Connection timed out")
+            return _rows_for(_cats_in(query, cats))
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            _, _, _, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(skipped, ["c00"])
+        self.assertEqual(seen[:3], [8, 4, 4])  # halved, not 8 singles
 
 
 class ReadabilityShapeTest(unittest.IsolatedAsyncioTestCase):
