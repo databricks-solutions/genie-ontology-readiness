@@ -26,7 +26,7 @@ class _Warehouse:
     def __init__(self, *routes):
         self._routes = routes
 
-    async def __call__(self, query, parameters=None, force_sp=False, record=True):
+    async def __call__(self, query, parameters=None, force_sp=False, record=True, **_client_options):
         for match, answer in self._routes:
             if match(query):
                 if isinstance(answer, Exception):
