@@ -1,5 +1,6 @@
 """Config endpoint — describes pillars, questions, models, and app capabilities to the UI."""
 
+import asyncio
 import os
 from fastapi import APIRouter
 
@@ -7,6 +8,7 @@ from server.pillars import PILLARS, LEVEL_LABELS
 from server.routes._shared import list_available_models, resolve_default_model
 from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, WAREHOUSE_ID, ASSESS_CATALOGS, get_cloud_provider
 from server import lakebase_client
+from server.build_info import build_label, get_build_info
 
 router = APIRouter()
 
@@ -15,7 +17,8 @@ router = APIRouter()
 async def get_config():
     """Everything the frontend needs to render the app shell."""
     # Fetch live available models from workspace serving endpoints
-    ai_models = await list_available_models()
+    # The build lookup runs beside the model listing, not after it.
+    ai_models, build = await asyncio.gather(list_available_models(), get_build_info())
     default_model = await resolve_default_model(ai_models)
 
     return {
@@ -45,6 +48,9 @@ async def get_config():
         # Cloud the app is deployed on (aws|azure|gcp); documentation links are
         # routed to this cloud's docs server-side.
         "cloud": get_cloud_provider(),
+        # Which build is running (watermark + error reports): release version,
+        # Git commit, and the Apps deployment it came from.
+        "build": {**build, "label": build_label(build)},
     }
 
 

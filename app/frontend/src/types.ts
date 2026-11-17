@@ -29,6 +29,19 @@ export interface AppConfig {
   history_ready?: boolean;
   genie_space_configured: boolean;
   assess_catalogs: string[];
+  build?: BuildInfo;
+}
+
+/** The running build, from /api/config (version + Git commit + deployment). */
+export interface BuildInfo {
+  label: string;
+  version: string;
+  commit: string | null;
+  commit_short: string | null;
+  ref: string | null;
+  deployment_id: string | null;
+  deployed_at: string | null;
+  source: 'env' | 'deployment' | 'git' | null;
 }
 
 export interface Signal {
@@ -64,6 +77,8 @@ export interface DrillDown {
   rows: Record<string, string | number | null>[];
   // Column keys the drill-down modal offers as slice-by filters (workspace/catalog/schema/agent).
   dimensions?: string[];
+  // Set when the server kept only the first `rows.length` of `total_rows` rows.
+  total_rows?: number;
 }
 
 // A catalog accessible to the selected workspaces, for the pre-run catalog filter.

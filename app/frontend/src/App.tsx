@@ -14,6 +14,7 @@ import CapabilityExplainer from './components/CapabilityExplainer';
 import PlanWizard from './components/PlanWizard';
 import ModelPickerModal from './components/ModelPickerModal';
 import HelpButton from './components/HelpButton';
+import BuildWatermark from './components/BuildWatermark';
 import Spinner from './components/Spinner';
 
 type Tab = 'assess' | 'plan' | 'learn';
@@ -128,6 +129,7 @@ export default function App() {
       </main>
 
       <HelpButton config={config} />
+      <BuildWatermark build={config.build} />
 
       {modelPickerOpen && (
         <ModelPickerModal

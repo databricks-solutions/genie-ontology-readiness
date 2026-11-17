@@ -18,6 +18,7 @@ Auth is on-behalf-of-user (OBO) by default:
     the SP directly.
 """
 
+import math
 import os
 import logging
 import contextvars
@@ -78,6 +79,27 @@ ASSESS_CATALOGS = [
 # via the FORCE_SP env in app.yaml, e.g. to guarantee consistent, workspace-wide
 # system-table signals regardless of the viewer's grants.
 FORCE_SP = os.environ.get("FORCE_SP", "false").lower() == "true"
+
+
+def env_seconds(name: str, default: float) -> float:
+    """A positive, finite number of seconds from env ``name``, else ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("%s=%r is not a positive, finite number of seconds; using %s", name, raw, default)
+        return default
+    return value
+
+
+# Hard cap on one background assessment run (see assessment/runs.py). Scan time
+# grows with the number of columns, so a very large metastore can take most of an
+# hour; the no-progress and no-reader stops end stuck or abandoned runs sooner.
+MAX_RUN_SECONDS = env_seconds("GOR_MAX_RUN_SECONDS", 3 * 60 * 60)
 
 # Lakebase toggle — only used to persist assessment snapshots over time.
 # Defaults OFF so the app deploys stateless into any workspace.

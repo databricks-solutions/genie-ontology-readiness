@@ -13,7 +13,10 @@ import {
   Tooltip,
 } from 'recharts';
 import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows } from 'lucide-react';
-import { apiGet, streamPostEvents } from '../hooks/useApi';
+import { apiDeleteQuiet, apiGet } from '../hooks/useApi';
+import { useCopy } from '../hooks/useCopy';
+import { AssessRunError, runAssessment, serverErrorDetails } from '../utils/assessRun';
+import type { PendingPillar } from '../utils/assessRun';
 import type {
   AppConfig,
   Scorecard as ScorecardType,
@@ -38,12 +41,34 @@ import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
+import { buildLines } from './BuildWatermark';
 
-type AssessEvent =
-  | { type: 'pillar'; pillar: PillarScore }
-  | { type: 'pillar_progress'; key: string; done: number; total: number; detail: string }
-  | { type: 'complete'; overall: ScorecardOverall; pillars: PillarScore[]; top_gaps: TopGap[]; snapshot_id?: number | null }
-  | { type: 'error'; error: string };
+/** Error line plus optional expandable detail lines (with a copy button). */
+function ErrorNotice({ message, details, centered }: { message: string; details?: string[]; centered?: boolean }) {
+  const [copied, copyText] = useCopy();
+  const hasDetails = !!details && details.length > 0;
+  const copy = () => copyText([message, ...(details || [])].join('\n'));
+  return (
+    <div className={`mt-4 text-sm text-red-600 ${centered ? 'mx-auto max-w-2xl' : ''}`} role="alert">
+      <p className={`flex items-center gap-1.5 ${centered ? 'justify-center' : ''}`}>
+        <AlertTriangle size={14} className="shrink-0" /> {message}
+      </p>
+      {hasDetails && (
+        <details className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-left text-xs text-red-800">
+          <summary className="cursor-pointer select-none font-medium">Details</summary>
+          <ul className="mt-2 space-y-1 break-words">
+            {details!.map((d, i) => (
+              <li key={i}>{d}</li>
+            ))}
+          </ul>
+          <button type="button" onClick={copy} className="mt-2 underline hover:no-underline">
+            {copied ? 'Copied' : 'Copy details'}
+          </button>
+        </details>
+      )}
+    </div>
+  );
+}
 
 function Gauge({ score, color }: { score: number; color: string }) {
   const radius = 52;
@@ -154,11 +179,23 @@ export default function Scorecard({
   const [overall, setOverall] = useState<ScorecardOverall | null>(scorecard?.overall ?? null);
   const [topGaps, setTopGaps] = useState<TopGap[]>(scorecard?.top_gaps ?? []);
   const [error, setError] = useState<string | null>(null);
+  // Detail lines that belong to one error message (ignored once the message changes).
+  const [errorDetails, setErrorDetails] = useState<{ message: string; lines: string[] } | null>(null);
+  const shownDetails = error && errorDetails?.message === error ? errorDetails.lines : undefined;
   const [expanded, setExpanded] = useState<string | null>(null);
   const [history, setHistory] = useState<HistorySnapshot[]>([]);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // The background run in progress, so closing or reloading the tab can cancel it.
+  const runIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const onPageHide = () => {
+      if (runIdRef.current) void apiDeleteQuiet(`/assess/runs/${runIdRef.current}`);
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+  }, []);
 
   // Workspace scope (#25/#10): activity-based signals count within the deployed
   // workspace only, so they're never account-wide. The scope is fixed to the
@@ -362,44 +399,82 @@ export default function Scorecard({
     abortRef.current = controller;
 
     const collected: Record<string, PillarScore> = {};
+    const progress: Record<string, string> = {};
     let completed = false;
+    let runId: string | null = null;
+    const pending = (): PendingPillar[] =>
+      config.pillars
+        .filter((cp) => !collected[cp.key])
+        .map((cp) => ({ name: cp.name, progress: progress[cp.key] }));
+    const showError = (message: string, lines: string[]) => {
+      // The build goes into every run error, so a copied report says which deploy it came from.
+      const all = [...lines, ...buildLines(config.build)];
+      setError(message);
+      setErrorDetails(all.length ? { message, lines: all } : null);
+    };
     try {
-      for await (const ev of streamPostEvents<AssessEvent>(
-        '/assess/stream',
-        {
+      await runAssessment({
+        body: {
           workspace_filter: wsFilter,
           catalogs: catFilter,
           schemas: schemaFilter ? [schemaFilter] : [],
         },
-        undefined,
-        controller.signal
-      )) {
-        if (ev.type === 'pillar') {
-          collected[ev.pillar.key] = ev.pillar;
-          setPillarsByKey({ ...collected });
-        } else if (ev.type === 'pillar_progress') {
-          setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
-        } else if (ev.type === 'complete') {
-          completed = true;
-          setOverall(ev.overall);
-          setTopGaps(ev.top_gaps);
-          setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
-          setPhase('done');
-          if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
-          refreshHistory();
-        } else if (ev.type === 'error') {
-          setError(ev.error);
-        }
-      }
+        signal: controller.signal,
+        pending,
+        onRunId: (id) => {
+          runId = id;
+          runIdRef.current = id;
+        },
+        onEvent: (ev) => {
+          if (ev.type === 'pillar') {
+            collected[ev.pillar.key] = ev.pillar;
+            setPillarsByKey({ ...collected });
+          } else if (ev.type === 'pillar_progress') {
+            progress[ev.key] = ev.detail;
+            setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
+          } else if (ev.type === 'complete') {
+            completed = true;
+            setOverall(ev.overall);
+            setTopGaps(ev.top_gaps);
+            setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
+            setPhase('done');
+            if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
+            refreshHistory();
+          } else if (ev.type === 'error') {
+            showError(ev.error, serverErrorDetails(ev, pending()));
+          }
+        },
+      });
       if (!completed) setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') {
-        setError((e as Error).message);
+      if ((e as Error).name === 'AbortError') {
+        // Unmount / navigation: stop the server-side run too.
+        if (runId) void apiDeleteQuiet(`/assess/runs/${runId}`);
+      } else {
+        if (e instanceof AssessRunError) showError(e.message, e.details);
+        else showError((e as Error).message, []);
         setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
       }
     } finally {
       abortRef.current = null;
+      runIdRef.current = null;
     }
+  }
+
+  // "New assessment": go back to the intro page so the user can set the scope
+  // (catalogs / schema) before running. It does not start a run by itself.
+  // The last completed scorecard stays in the parent, so the Plan tab keeps it.
+  function startNew() {
+    if (phase === 'running') return;
+    setError(null);
+    setErrorDetails(null);
+    setPillarsByKey({});
+    setProgressByKey({});
+    setOverall(null);
+    setTopGaps([]);
+    setCurrentId(null);
+    setExpanded(null);
+    setPhase('idle');
   }
 
   async function loadSnapshot(id: number) {
@@ -429,7 +504,7 @@ export default function Scorecard({
   const sidebar = (
     <aside className="lg:sticky lg:top-6 self-start space-y-3">
       <button
-        onClick={run}
+        onClick={startNew}
         disabled={running}
         className="btn-primary w-full flex items-center justify-center gap-1.5 text-sm"
       >
@@ -569,11 +644,7 @@ export default function Scorecard({
       </div>
 
       <div className="text-center">
-        {error && (
-          <p className="mt-4 text-sm text-red-600 flex items-center justify-center gap-1.5">
-            <AlertTriangle size={14} /> {error}
-          </p>
-        )}
+        {error && <ErrorNotice message={error} details={shownDetails} centered />}
         <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
           <Play size={16} /> Run assessment
         </button>
@@ -625,7 +696,7 @@ export default function Scorecard({
                         {pdfBusy ? 'Exporting…' : 'Export PDF'}
                       </button>
                       <button
-                        onClick={run}
+                        onClick={startNew}
                         disabled={running}
                         className="btn-primary py-1 px-3 flex items-center gap-1.5 text-xs"
                       >
@@ -795,11 +866,7 @@ export default function Scorecard({
         })}
       </div>
 
-      {error && (
-        <p className="text-sm text-red-600 flex items-center gap-1.5">
-          <AlertTriangle size={14} /> {error}
-        </p>
-      )}
+      {error && <ErrorNotice message={error} details={shownDetails} />}
     </div>
   );
 

@@ -12,13 +12,34 @@ export class ApiError extends Error {
   }
 }
 
-async function parseError(res: Response): Promise<string> {
+export async function parseError(res: Response): Promise<string> {
+  const status = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`;
+  let raw = '';
   try {
-    const data = await res.json();
-    return data?.error || data?.detail || res.statusText;
+    raw = await res.text();
   } catch {
-    return res.statusText;
+    return status;
   }
+  try {
+    const data = JSON.parse(raw);
+    const msg = data?.error || data?.detail;
+    if (typeof msg === 'string' && msg) return msg;
+  } catch {
+    // Not JSON. The Databricks Apps proxy answers timeouts with an HTML or
+    // plain-text page, which never reaches the app's own logs.
+  }
+  if (res.status === 502 || res.status === 503 || res.status === 504) {
+    return `${status}: the Databricks Apps proxy did not get a reply from the app in time.`;
+  }
+  const text = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  return text && text.length <= 200 ? `${status}: ${text}` : status;
+}
+
+/** True when the browser dropped the connection (no HTTP response to read).
+ * Each browser words this differently. */
+export function isNetworkError(e: unknown): boolean {
+  if (!(e instanceof TypeError)) return false;
+  return /network|failed to fetch|load failed/i.test(e.message);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
@@ -43,26 +64,9 @@ export async function apiPost<T>(
   return res.json() as Promise<T>;
 }
 
-/**
- * POST to an SSE endpoint and yield each parsed JSON `data:` object as it
- * streams in. Terminates on `data: [DONE]`. Generic over the event shape.
- */
-export async function* streamPostEvents<T = unknown>(
-  path: string,
-  body: unknown,
-  model?: string,
-  signal?: AbortSignal
-): AsyncGenerator<T, void, unknown> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (model) headers['X-AI-Model'] = model;
-
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
+/** Read an SSE response and yield each parsed JSON `data:` object. Stops on
+ * `data: [DONE]`. Comment lines (`: keepalive`) are skipped. */
+async function* readSseEvents<T>(res: Response): AsyncGenerator<T, void, unknown> {
   if (!res.ok) throw new ApiError(await parseError(res), res.status);
   if (!res.body) throw new ApiError('No response body', 500);
 
@@ -92,6 +96,46 @@ export async function* streamPostEvents<T = unknown>(
         // Ignore non-JSON keepalive lines.
       }
     }
+  }
+}
+
+/**
+ * POST to an SSE endpoint and yield each parsed JSON `data:` object as it
+ * streams in. Terminates on `data: [DONE]`. Generic over the event shape.
+ */
+export async function* streamPostEvents<T = unknown>(
+  path: string,
+  body: unknown,
+  model?: string,
+  signal?: AbortSignal
+): AsyncGenerator<T, void, unknown> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (model) headers['X-AI-Model'] = model;
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+  yield* readSseEvents<T>(res);
+}
+
+/** GET an SSE endpoint and yield each parsed JSON `data:` object. */
+export async function* streamGetEvents<T = unknown>(
+  path: string,
+  signal?: AbortSignal
+): AsyncGenerator<T, void, unknown> {
+  const res = await fetch(`${API_BASE}${path}`, { signal, headers: { Accept: 'text/event-stream' } });
+  yield* readSseEvents<T>(res);
+}
+
+/** Best-effort DELETE (used to cancel a background run). Errors are ignored. */
+export async function apiDeleteQuiet(path: string): Promise<void> {
+  try {
+    await fetch(`${API_BASE}${path}`, { method: 'DELETE', keepalive: true });
+  } catch {
+    // The run expires on the server anyway.
   }
 }
 

@@ -131,7 +131,29 @@ def resolved_identity() -> Optional[dict]:
             "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
-async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False, record: bool = True) -> list[dict]:
+# How long (wall-clock) to poll a statement that is still running after the initial
+# 50 s wait. The old loop counted 120 passes of a 1 s sleep plus a status round-trip
+# (~160-180 s in practice); 180 s keeps that, so slow probes such as the Genie audit
+# scan on a large account don't start timing out.
+DEFAULT_POLL_SECONDS = 180
+
+
+class StatementTimeout(Exception):
+    """A statement did not finish within its poll budget (it was cancelled)."""
+
+
+class _TransientRead(Exception):
+    """A status read the proxy/gateway answered with a retryable HTTP status."""
+
+
+# Proxy/gateway statuses worth retrying on a status read; any other 4xx/5xx
+# (e.g. an expired token's 401/403) fails the statement at once.
+_TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+
+
+async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
+                      record: bool = True, poll_seconds: int = DEFAULT_POLL_SECONDS,
+                      wait_seconds: int = 50) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
     Identity model — every signal defaults to on-behalf-of-user (OBO):
@@ -162,25 +184,25 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
     if force_sp or FORCE_SP:
         record_identity("sp_forced_env" if FORCE_SP else "sp_forced_call")
-        return await _execute_once(query, parameters, force_sp=True)
+        return await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds, wait_seconds=wait_seconds)
 
     # No forwarded viewer token → nothing to run OBO as; go straight to the SP.
     if not get_user_token():
         record_identity("sp_no_token")
-        return await _execute_once(query, parameters, force_sp=True)
+        return await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds, wait_seconds=wait_seconds)
 
     # Default: try OBO (as the viewer). Fall back to the SP only when the failure
     # looks like an AUTHORIZATION gap (the case the SP can actually cover). Other
     # failures (timeout, bad SQL, warehouse down) would fail identically as the SP,
     # so re-raise them instead of doubling latency with a pointless retry.
     try:
-        rows = await _execute_once(query, parameters, force_sp=False)
+        rows = await _execute_once(query, parameters, force_sp=False, poll_seconds=poll_seconds, wait_seconds=wait_seconds)
     except Exception as obo_err:
         if not _is_authz_error(obo_err):
             raise
         logger.warning(f"OBO read denied ({str(obo_err)[:160]}); falling back to app SP")
         try:
-            sp_rows = await _execute_once(query, parameters, force_sp=True)
+            sp_rows = await _execute_once(query, parameters, force_sp=True, poll_seconds=poll_seconds, wait_seconds=wait_seconds)
         except Exception as sp_err:
             # The SP fallback failed too (neither the viewer nor the app SP can
             # read this). Chain the original OBO denial so it stays visible in the
@@ -220,8 +242,13 @@ def _is_authz_error(exc: Exception) -> bool:
     return any(m in msg for m in _AUTHZ_MARKERS)
 
 
-async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool) -> list[dict]:
-    """Run the query once with a single resolved identity (OBO or SP)."""
+async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool,
+                        poll_seconds: int = DEFAULT_POLL_SECONDS, wait_seconds: int = 50) -> list[dict]:
+    """Run the query once with a single resolved identity (OBO or SP).
+
+    ``wait_seconds`` is the server-side wait on submit (0-50). 0 returns the
+    statement id at once, so the statement can always be cancelled (a task
+    cancelled during a 50 s submit wait can't cancel what it can't name)."""
     host = get_workspace_host()
     auth_headers = get_auth_headers(force_sp=force_sp)
 
@@ -243,7 +270,8 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
         "statement": query,
         "catalog": CATALOG,
         "schema": SCHEMA,
-        "wait_timeout": "50s",
+        # 0 s or 5-50 s (the API rejects 1-4 s).
+        "wait_timeout": f"{0 if wait_seconds <= 0 else min(50, max(5, int(wait_seconds)))}s",
         "disposition": "INLINE",
         "format": "JSON_ARRAY",
     }
@@ -265,7 +293,11 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
     # this session for up to two minutes of polling.
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=90)
     async with aiohttp.ClientSession(timeout=timeout, headers=with_ua()) as session:
-        async with session.post(url, json=payload, headers=headers) as response:
+        # A 0 s submit returns at once, so bound it tightly; a waiting submit keeps the
+        # session's per-read limit (the server itself holds it up to wait_timeout).
+        # (timeout=None would REMOVE the session's limits, so pass it only when set.)
+        submit_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)} if wait_seconds <= 0 else {}
+        async with session.post(url, json=payload, headers=headers, **submit_kwargs) as response:
             if response.status != 200:
                 error_text = await response.text()
                 # Truncated for the log only; the exception keeps the full text so
@@ -284,29 +316,75 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
             # Handle PENDING/RUNNING -- poll until complete
             if status in ("PENDING", "RUNNING"):
                 statement_id = result.get("statement_id")
-                result = await _poll_statement(session, host, auth_headers, statement_id)
+                result = await _poll_statement(session, host, auth_headers, statement_id, poll_seconds)
 
             return _parse_result(result)
 
 
-async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_headers: dict, statement_id: str) -> dict:
-    """Poll for statement completion."""
-    url = f"{host}/api/2.0/sql/statements/{statement_id}"
+async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_headers: dict, statement_id: str,
+                          poll_seconds: int = DEFAULT_POLL_SECONDS) -> dict:
+    """Poll for statement completion until a ``poll_seconds`` wall-clock deadline.
 
-    for _ in range(120):  # up to 2 minutes
-        await asyncio.sleep(1)
-        async with session.get(url, headers=auth_headers) as resp:
-            result = await resp.json()
+    If the statement doesn't finish (deadline passed, or the calling task was
+    cancelled: a stalled scan, the run cap, an abandoned run), it is cancelled on
+    the warehouse so it doesn't keep running there."""
+    url = f"{host}/api/2.0/sql/statements/{statement_id}"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(1.0, float(poll_seconds))
+    finished = False
+    try:
+        while True:
+            await asyncio.sleep(1)
+            # Bound each status read by the time left (the session allows 90 s per
+            # read), so a query ends near its deadline; there is always one read at
+            # or after the deadline, so a statement that just finished isn't lost.
+            # A TRANSIENT read failure (slow read, dropped connection) is retried; an
+            # HTTP error (e.g. an expired token's 401/403 page) is raised at once.
+            last = loop.time() >= deadline
+            remaining = max(2.0, deadline - loop.time())
+            try:
+                async with session.get(url, headers=auth_headers,
+                                       timeout=aiohttp.ClientTimeout(total=min(30.0, remaining))) as resp:
+                    code = getattr(resp, "status", 200)
+                    if code in _TRANSIENT_HTTP:
+                        raise _TransientRead(f"HTTP {code}")
+                    if code >= 400:
+                        raise Exception(f"SQL Warehouse error ({code}) reading statement {statement_id}")
+                    result = await resp.json()
+            except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError,
+                    _TransientRead) as e:
+                if last:
+                    break
+                logger.info(f"status read for statement {statement_id} failed ({type(e).__name__}: {e}); retrying")
+                continue
             state = result.get("status", {}).get("state", "")
             if state == "SUCCEEDED":
+                finished = True
                 return result
             elif state == "FAILED":
+                finished = True
                 error_msg = result.get("status", {}).get("error", {}).get("message", "Unknown")
                 raise Exception(f"SQL query failed: {error_msg}")
             elif state in ("CANCELED", "CLOSED"):
+                finished = True
                 raise Exception(f"SQL query {state.lower()}")
+            if last:
+                break
+        raise StatementTimeout(f"SQL query timed out after {int(poll_seconds)} seconds")
+    finally:
+        if not finished:
+            await _cancel_statement(session, url, auth_headers, statement_id)
 
-    raise Exception("SQL query timed out after 120 seconds")
+
+async def _cancel_statement(session: aiohttp.ClientSession, url: str, auth_headers: dict, statement_id: str) -> None:
+    """Best-effort cancel; bounded so a cancelled task isn't held up by it."""
+    try:
+        async def _post():
+            async with session.post(f"{url}/cancel", headers=auth_headers) as resp:
+                await resp.read()
+        await asyncio.wait_for(_post(), timeout=5)
+    except Exception as e:  # incl. asyncio.TimeoutError; a CancelledError propagates (never swallow a run cancel)
+        logger.info(f"could not cancel statement {statement_id}: {type(e).__name__}")
 
 
 def _parse_result(result: dict) -> list[dict]:
