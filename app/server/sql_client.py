@@ -131,8 +131,11 @@ def resolved_identity() -> Optional[dict]:
             "detail": "Read on-behalf-of-you; this signal reflects your own Unity Catalog grants."}
 
 
-# How long to poll a statement that is still running after the initial 50 s wait.
-DEFAULT_POLL_SECONDS = 120
+# How long (wall-clock) to poll a statement that is still running after the initial
+# 50 s wait. The old loop counted 120 passes of a 1 s sleep plus a status round-trip
+# (~160-180 s in practice); 180 s keeps that, so slow probes such as the Genie audit
+# scan on a large account don't start timing out.
+DEFAULT_POLL_SECONDS = 180
 
 
 class StatementTimeout(Exception):
@@ -283,8 +286,9 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
     async with aiohttp.ClientSession(timeout=timeout, headers=with_ua()) as session:
         # A 0 s submit returns at once, so bound it tightly; a waiting submit keeps the
         # session's per-read limit (the server itself holds it up to wait_timeout).
-        submit_timeout = aiohttp.ClientTimeout(total=30) if wait_seconds <= 0 else None
-        async with session.post(url, json=payload, headers=headers, timeout=submit_timeout) as response:
+        # (timeout=None would REMOVE the session's limits, so pass it only when set.)
+        submit_kwargs = {"timeout": aiohttp.ClientTimeout(total=30)} if wait_seconds <= 0 else {}
+        async with session.post(url, json=payload, headers=headers, **submit_kwargs) as response:
             if response.status != 200:
                 error_text = await response.text()
                 # Truncated for the log only; the exception keeps the full text so
@@ -320,19 +324,22 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
     deadline = loop.time() + max(1.0, float(poll_seconds))
     finished = False
     try:
-        while loop.time() < deadline:
+        while True:
             await asyncio.sleep(1)
             # Bound each status read by the time left (the session allows 90 s per
-            # read), so a query ends near its deadline. A slow or failed read is
-            # retried on the next pass; it doesn't fail a statement that may be fine.
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
+            # read), so a query ends near its deadline; there is always one read at
+            # or after the deadline, so a statement that just finished isn't lost.
+            # A TRANSIENT read failure (slow read, dropped connection) is retried; an
+            # HTTP error (e.g. an expired token's 401/403 page) is raised at once.
+            last = loop.time() >= deadline
+            remaining = max(2.0, deadline - loop.time())
             try:
                 async with session.get(url, headers=auth_headers,
-                                       timeout=aiohttp.ClientTimeout(total=min(30.0, max(2.0, remaining)))) as resp:
+                                       timeout=aiohttp.ClientTimeout(total=min(30.0, remaining))) as resp:
                     result = await resp.json()
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as e:
+                if last:
+                    break
                 logger.info(f"status read for statement {statement_id} failed ({type(e).__name__}); retrying")
                 continue
             state = result.get("status", {}).get("state", "")
@@ -346,6 +353,8 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
             elif state in ("CANCELED", "CLOSED"):
                 finished = True
                 raise Exception(f"SQL query {state.lower()}")
+            if last:
+                break
         raise StatementTimeout(f"SQL query timed out after {int(poll_seconds)} seconds")
     finally:
         if not finished:

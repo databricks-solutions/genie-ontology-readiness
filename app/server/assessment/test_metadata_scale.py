@@ -57,7 +57,7 @@ class ColumnScanTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(probes, "execute_sql", execute), patch.object(probes, "_emit_progress"):
             with self.assertRaises(RuntimeError):
                 await probes._column_coverage_chunked(cats, system_ok=False)
-        self.assertLessEqual(execute.await_count, 20 + probes._METADATA_CIRCUIT_FAILURES)
+        self.assertLessEqual(execute.await_count, 20 + 3)  # originals + a 3-query canary, no fan-out
 
     async def test_scan_queries_get_a_budget_below_the_no_progress_stop(self):
         execute = AsyncMock(return_value=_rows_for(["a"]))
@@ -145,7 +145,7 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skipped, ["huge"])
         self.assertEqual(seen[0], 9)
         self.assertTrue(all(n == 1 for n in seen[1:]))  # no halving rounds of the slow catalog
-        self.assertEqual(len(seen), 1 + 9)
+        self.assertLessEqual(len(seen), 1 + 3 + 9)       # original + canary + singles
 
     async def test_a_remote_connection_timeout_message_is_split_not_fanned_out(self):
         # A federated "Connection timed out" error is not a statement timeout.
@@ -161,7 +161,40 @@ class BreakerAndTimeoutTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
             _, _, _, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
         self.assertEqual(skipped, ["c00"])
-        self.assertEqual(seen[:3], [8, 4, 4])  # halved, not 8 singles
+        self.assertLess(seen.count(1), 8)       # halved, not fanned out to 8 singles
+
+
+class HeldFailuresTest(unittest.IsolatedAsyncioTestCase):
+    async def test_broken_catalogs_clustered_first_do_not_fail_a_healthy_scan(self):
+        broken = [f"aa_sf_{i:03d}" for i in range(150)]   # sort first: batches 1-6, all broken
+        healthy = [f"zz_{i:03d}" for i in range(100)]
+        cats = broken + healthy
+
+        async def fake(query, *a, **k):
+            if "aa_sf_" in query:
+                raise Exception("[CANNOT_ESTABLISH_CONNECTION_SERVERLESS] remote down")
+            return _rows_for(_cats_in(query, cats))
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            _, _, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(len(per_schema), 100)        # every healthy catalog read
+        self.assertEqual(sorted(skipped), sorted(broken))
+
+
+class CanaryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_canary_release_does_not_double_count(self):
+        cats = [f"c{i:02d}" for i in range(25)]  # ONE batch; c00 broken
+
+        async def fake(query, *a, **k):
+            if "c00" in query:
+                raise Exception("[FAILED_JDBC.CONNECTION] remote down")
+            return _rows_for(_cats_in(query, cats))
+
+        with patch.object(probes, "execute_sql", AsyncMock(side_effect=fake)), patch.object(probes, "_emit_progress"):
+            total, commented, per_schema, skipped = await probes._column_coverage_chunked(cats, system_ok=True)
+        self.assertEqual(skipped, ["c00"])
+        self.assertEqual(len(per_schema), 24)
+        self.assertEqual((total, commented), (240, 120))  # each catalog counted once
 
 
 class ReadabilityShapeTest(unittest.IsolatedAsyncioTestCase):
