@@ -29,6 +29,20 @@ export interface AppConfig {
   history_ready?: boolean;
   genie_space_configured: boolean;
   assess_catalogs: string[];
+  version?: string;
+  build?: BuildInfo;
+}
+
+/** The running build, from /api/config (version + Git commit + deployment). */
+export interface BuildInfo {
+  label: string;
+  version: string;
+  commit: string | null;
+  commit_short: string | null;
+  ref: string | null;
+  deployment_id: string | null;
+  deployed_at: string | null;
+  source: 'env' | 'deployment' | 'git' | null;
 }
 
 export interface Signal {

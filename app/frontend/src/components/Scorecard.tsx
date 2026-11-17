@@ -40,6 +40,7 @@ import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
+import { buildLines } from './BuildWatermark';
 
 /** Error line plus optional expandable detail lines (with a copy button). */
 function ErrorNotice({ message, details, centered }: { message: string; details?: string[]; centered?: boolean }) {
@@ -414,8 +415,10 @@ export default function Scorecard({
         .filter((cp) => !collected[cp.key])
         .map((cp) => ({ name: cp.name, progress: progress[cp.key] }));
     const showError = (message: string, lines: string[]) => {
+      // The build goes into every report, so a copied error says which deploy it came from.
+      const all = lines.length ? [...lines, ...buildLines(config.build)] : [];
       setError(message);
-      setErrorDetails(lines.length ? { message, lines } : null);
+      setErrorDetails(all.length ? { message, lines: all } : null);
     };
     try {
       await runAssessment({

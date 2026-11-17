@@ -7,6 +7,7 @@ from server.pillars import PILLARS, LEVEL_LABELS
 from server.routes._shared import list_available_models, resolve_default_model
 from server.config import USE_LAKEBASE, GENIE_SPACE_ID, WORKSPACE_ID, WAREHOUSE_ID, ASSESS_CATALOGS, get_cloud_provider
 from server import lakebase_client
+from server.build_info import build_label, get_build_info
 
 router = APIRouter()
 
@@ -17,6 +18,7 @@ async def get_config():
     # Fetch live available models from workspace serving endpoints
     ai_models = await list_available_models()
     default_model = await resolve_default_model(ai_models)
+    build = await get_build_info()
 
     return {
         "app_name": "Genie Ontology Readiness",
@@ -45,6 +47,10 @@ async def get_config():
         # Cloud the app is deployed on (aws|azure|gcp); documentation links are
         # routed to this cloud's docs server-side.
         "cloud": get_cloud_provider(),
+        # Which build is running (watermark + error reports): release version,
+        # Git commit, and the Apps deployment it came from.
+        "version": build["version"],
+        "build": {**build, "label": build_label(build)},
     }
 
 
