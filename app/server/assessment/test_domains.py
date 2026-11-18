@@ -173,7 +173,21 @@ class ProbeDomainsTest(unittest.TestCase):
         self.assertEqual(res["metrics"]["distinct_domains"], 2)  # both top-level domains, even if Finance is untagged
         self.assertEqual(res["metrics"]["subdomains"], 1)
         self.assertFalse(any("instr(tag_name, '/') > 1" in s for s in statements))  # no key inference needed
-        self.assertIn("Domains read from the Discover Domains API", res["note"])
+        self.assertIn("Published domains read from the Discover Domains API", res["note"])
+
+    def test_draft_domains_are_not_counted(self):
+        api = {"status": "ok", "domains": [
+            {"domain_id": "1", "tag_key": "Finance"},
+            {"domain_id": "2", "tag_key": "Sales", "effective_draft": True},
+            {"domain_id": "3", "tag_key": "Finance/Tax", "parent_domain_id": "1"},
+            {"domain_id": "4", "tag_key": "Finance/Audit", "parent_domain_id": "1", "effective_draft": True}]}
+        res, statements = _run_probe(api, [("distinct_domains", [{"distinct_domains": "1", "assignments": "3"}])])
+        self.assertEqual(res["metrics"]["distinct_domains"], 1)
+        self.assertEqual((res["metrics"]["subdomains"], res["metrics"]["draft_domains"]), (1, 2))
+        pred = next(s for s in statements if "distinct_domains" in s)
+        self.assertIn("'finance/tax'", pred)
+        self.assertNotIn("'sales'", pred)  # a draft domain's tags don't place assets in a domain
+        self.assertNotIn("'finance/audit'", pred)
 
     def test_scoped_run_counts_only_domains_with_assets_in_scope(self):
         # Domains are account-level: a run scoped to one catalog must not count every domain.

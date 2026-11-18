@@ -1590,7 +1590,11 @@ async def _discover_style_keys(views: list[str], s: dict) -> list[str]:
 
 async def probe_domains() -> dict:
     api = await _native_domains()
-    api_domains = api.get("domains") if api["status"] == "ok" else None
+    # Only published domains count: drafts are visible to curators only and are still being built
+    # (`effective_draft` also covers a subdomain under a draft parent). Their tags don't count either.
+    listed = api.get("domains") if api["status"] == "ok" else None
+    api_domains = [d for d in listed if not d.get("effective_draft")] if listed is not None else None
+    draft_domains = len(listed) - len(api_domains) if listed is not None else None
     top_level = [d for d in api_domains or [] if not d.get("parent_domain_id")]
     subdomains = len(api_domains or []) - len(top_level)
     # Domains are account-level. A scoped run counts only the domains whose tags are on assets
@@ -1608,7 +1612,8 @@ async def probe_domains() -> dict:
                                  "detail": f"Top-level domains in Discover ({subdomains} subdomains)"}],
                     "gaps": [] if n else ["No domains defined; create business-aligned domains in Discover."],
                     "note": "No readable catalogs for tag coverage; domain count only.",
-                    "metrics": {"domains": n, "subdomains": subdomains, "source": "native_api"}}
+                    "metrics": {"domains": n, "subdomains": subdomains, "draft_domains": draft_domains,
+                                "source": "native_api"}}
         return _empty("No readable catalogs for domain tags"
                       + (" in this scope" if scoped else " and the Domains API was unavailable")
                       + "; use the self-assessment.",
@@ -1803,7 +1808,8 @@ async def probe_domains() -> dict:
             "score": score,
             "signals": signals,
             "gaps": gaps,
-            "note": ("Domains read from the Discover Domains API; asset coverage from their governed tags."
+            "note": ("Published domains read from the Discover Domains API (drafts excluded); asset coverage from "
+                     "their governed tags."
                      if api_domains is not None else
                      "Domains inferred from governed tags (Discover `Domain/Subdomain` keys and `domain`-style tags) "
                      "because the Domains API "
@@ -1812,6 +1818,7 @@ async def probe_domains() -> dict:
                      "Use the self-assessment to capture domain design maturity the tags can't show."),
             "metrics": {"distinct_domains": distinct_domains, "domain_tag_assignments": assignments,
                         "subdomains": subdomains if api_domains is not None else None,
+                        "draft_domains": draft_domains,
                         "domains_api": api["status"],
                         "stewarded_assets": stewarded, "certified_assets": certified,
                         "total_tables": total_tables,

@@ -362,8 +362,10 @@ path `/api/discover/v1/domains`), following `next_page_token`. Each item has
 `tag_key` and `parent_domain_id` (empty for a top-level domain). The caller needs
 **MANAGE DISCOVER** (workspace / account admins have it by default); a 401/403
 means it's missing, so say so in a gap and continue with step 2b.
-- `top_level` = domains with no `parent_domain_id`; `subdomains` = the rest.
-- `discover_keys` = every domain's `tag_key`.
+- Count **published** domains only: drop items with `effective_draft: true` (drafts are
+  visible to curators only; `effective_draft` also covers a subdomain under a draft parent).
+- `top_level` = published domains with no `parent_domain_id`; `subdomains` = the rest.
+- `discover_keys` = every published domain's `tag_key`.
 
 **Step 2b (no API): infer Discover keys from the tags** (`<VIEW>` = table and
 schema tags):
@@ -451,7 +453,7 @@ assets (`certified`); plus Tables tagged (`pct_tagged`%), Tables in a domain
 (`pct_in_domain`%) when `total_tables > 0`; and Top accessed certified
 (`top_certified` / `top_accessed`) when available.
 
-**Note to include:** with the API, "Domains read from the Discover Domains API; asset coverage from their governed tags." Without it, domains were inferred from governed tags because the API needs MANAGE DISCOVER (403) or was unavailable, a domain with no subdomain tags may be missed, and a self-assessment can capture domain-design maturity tags can't show.
+**Note to include:** with the API, "Published domains read from the Discover Domains API (drafts excluded); asset coverage from their governed tags." Without it, domains were inferred from governed tags because the API needs MANAGE DISCOVER (403) or was unavailable, a domain with no subdomain tags may be missed, and a self-assessment can capture domain-design maturity tags can't show.
 
 **Gaps:**
 - `distinct_domains == 0` → "No domains found. Create business-aligned domains and subdomains in Discover and add their assets."
