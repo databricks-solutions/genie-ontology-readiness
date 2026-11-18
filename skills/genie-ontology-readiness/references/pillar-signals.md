@@ -370,7 +370,7 @@ schema tags):
 
 ```sql
 SELECT DISTINCT tag_name FROM <VIEW>
-WHERE instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system%';
+WHERE instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system.%';
 -- discover_keys = these `Parent/Sub` keys plus each one's `Parent` prefix
 ```
 
@@ -394,8 +394,10 @@ SELECT COUNT(DISTINCT lower(domain)) AS distinct_domains, COUNT(*) AS assignment
   UNION ALL
   SELECT <domain_label> AS domain FROM <SCHEMA_TAGS> WHERE <domain_pred>
 );
--- with the API: distinct_domains = max(distinct_domains, len(top_level)),
--- so domains defined in Discover count before their assets are tagged
+-- with the API and an unscoped run: distinct_domains = max(distinct_domains, len(top_level)),
+-- so domains defined in Discover count before their assets are tagged. Domains are
+-- account-level, so a run scoped to catalogs/schemas counts only the domains tagged on
+-- assets in scope (the query above), not len(top_level).
 
 -- stewarded assets
 SELECT COUNT(*) AS stewarded FROM <TABLE_TAGS> WHERE lower(tag_name) IN (<steward_keys>);
@@ -453,7 +455,7 @@ assets (`certified`); plus Tables tagged (`pct_tagged`%), Tables in a domain
 
 **Gaps:**
 - `distinct_domains == 0` → "No domains found. Create business-aligned domains and subdomains in Discover and add their assets."
-- Domains API returned 401/403 → "Couldn't read Discover domains: the assessing identity needs MANAGE DISCOVER, so domains were inferred from governed tags and may be undercounted."
+- Domains API returned 401/403 → "Couldn't read Discover domains: grant MANAGE DISCOVER to the identity running the assessment, so domains aren't inferred from governed tags (which can miss domains or count other tags)."
 - `stewarded == 0` → "No stewardship tags (owner/steward) found; assign a named steward per domain."
 - `certified == 0` → "No certified assets found — certify canonical gold tables so users (and Genie) know which to trust."
 - `total_tables > 0 AND pct_tagged < 50` → "Only `{pct_tagged}`% of tables carry any UC governed tag — tag eligible assets (PII, domain, certification) to power governed discovery."

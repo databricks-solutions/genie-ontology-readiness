@@ -76,7 +76,9 @@ from server.signal_spec import (
     render_sql,
 )
 from server.security import quote_ident, quote_literal, safe_error
-from server.sql_client import StatementTimeout, execute_sql, record_query, record_rest_identity, _is_authz_error
+from server.sql_client import (
+    StatementTimeout, execute_sql, record_identity, record_query, record_rest_identity, _is_authz_error,
+)
 from server.user_agent import with_ua
 from server.config import (
     get_workspace_host,
@@ -1509,16 +1511,10 @@ _STEWARD_TAG_KEYS = ("owner", "data_owner", "steward", "data_steward")
 _CERT_TAG_KEYS = ("system.certification_status", "certification_status")
 
 
-async def _native_domains() -> dict:
-    """List Discover domains and subdomains via the Domains API.
+async def _list_domains(host: str, headers: dict) -> tuple[str, list]:
+    """List Discover domains and subdomains as one identity, following next_page_token.
 
-    Returns {"status": "ok", "domains": [...]} on success, {"status": "forbidden"} when the
-    caller lacks MANAGE DISCOVER (401/403), else {"status": "unavailable"}.
-    """
-    host = get_workspace_host()
-    headers = get_auth_headers()  # viewer token if present; the tag proxy is the user-scoped fallback
-    if not host or not headers:
-        return {"status": "unavailable"}
+    Returns ("ok", domains), ("forbidden", []) on 401/403, else ("unavailable", [])."""
     status = "unavailable"
     for path in _DOMAINS_API_PATHS:
         domains, token = [], None
@@ -1536,13 +1532,37 @@ async def _native_domains() -> dict:
                     domains += data.get("domains") or []
                     token = data.get("next_page_token")
                     if not token:
-                        # This REST read doesn't go through execute_sql, so record its
-                        # identity via the shared helper (mirrors execute_sql's base
-                        # OBO-vs-SP decision, keeping the mode vocabulary in one place).
-                        record_rest_identity()
-                        return {"status": "ok", "domains": domains}
+                        return "ok", domains
         except Exception:
             continue
+    return status, []
+
+
+async def _native_domains() -> dict:
+    """List Discover domains and subdomains via the Domains API.
+
+    Tries the viewer first. The forwarded viewer token carries only the `sql` user scope, so the
+    Domains REST API refuses it even for a curator; on 401/403 the read is retried as the app SP
+    (like the Genie REST reads). Returns {"status": "ok", "domains": [...]} on success,
+    {"status": "forbidden"} when every identity got 401/403 (missing MANAGE DISCOVER), else
+    {"status": "unavailable"}.
+    """
+    host = get_workspace_host()
+    headers = get_auth_headers()
+    if not host or not headers:
+        return {"status": "unavailable"}
+    status, domains = await _list_domains(host, headers)
+    if status == "ok":
+        # REST reads bypass execute_sql, so record the identity via the shared helper.
+        record_rest_identity()
+        return {"status": "ok", "domains": domains}
+    if status == "forbidden" and get_user_token():
+        sp_headers = get_auth_headers(force_sp=True)
+        if sp_headers and sp_headers != headers:
+            status, domains = await _list_domains(host, sp_headers)
+            if status == "ok":
+                record_identity("sp_fallback")
+                return {"status": "ok", "domains": domains}
     return {"status": status}
 
 
@@ -1561,7 +1581,7 @@ async def _discover_style_keys(views: list[str], s: dict) -> list[str]:
     """Without the Domains API: tag keys that look like Discover domains, i.e. `Parent/Sub` keys and
     any key that is the parent of one. A top-level domain with no subdomain tags can't be told apart
     from other governed tags this way, so the probe note asks for MANAGE DISCOVER."""
-    slash = f"instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system%' {_schema_and(s, 'schema_name')}"
+    slash = f"instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system.%' {_schema_and(s, 'schema_name')}"
     rows = await execute_sql(" UNION ".join(f"SELECT DISTINCT tag_name FROM {v} WHERE {slash}" for v in views) + " LIMIT 1000")
     subs = {r.get("tag_name") for r in rows if r.get("tag_name")}
     return sorted(subs | {k.split("/", 1)[0] for k in subs})
@@ -1572,12 +1592,15 @@ async def probe_domains() -> dict:
     api_domains = api.get("domains") if api["status"] == "ok" else None
     top_level = [d for d in api_domains or [] if not d.get("parent_domain_id")]
     subdomains = len(api_domains or []) - len(top_level)
+    # Domains are account-level. A scoped run counts only the domains whose tags are on assets
+    # in scope; an unscoped run also counts domains defined before their assets are tagged.
+    scoped = bool(get_catalog_scope()) or bool(get_schema_scope()) or _has_workspace_scope()
 
     s = await _resolve_sources()
     tt = _src("table_tags", s)
     st = _src("schema_tags", s)
     if tt is None:
-        if api_domains is not None:  # domains are readable, asset coverage is not
+        if api_domains is not None and not scoped:  # domains are readable, asset coverage is not
             n = len(top_level)
             return {"available": True, "score": min(100.0, 40 + 40 * min(n, 5) / 5) if n else 0.0,
                     "signals": [{"label": "Domains (Discover)", "value": n,
@@ -1585,7 +1608,9 @@ async def probe_domains() -> dict:
                     "gaps": [] if n else ["No domains defined; create business-aligned domains in Discover."],
                     "note": "No readable catalogs for tag coverage; domain count only.",
                     "metrics": {"domains": n, "subdomains": subdomains, "source": "native_api"}}
-        return _empty("Domains API unavailable and no readable catalogs for the tag proxy; use the self-assessment.",
+        return _empty("No readable catalogs for domain tags"
+                      + (" in this scope" if scoped else " and the Domains API was unavailable")
+                      + "; use the self-assessment.",
                       reason="insufficient_permission")
     try:
         steward_keys = ", ".join(quote_literal(k) for k in _STEWARD_TAG_KEYS)
@@ -1608,7 +1633,7 @@ async def probe_domains() -> dict:
             f"FROM ({' UNION ALL '.join(parts)})"
         )
         distinct_domains = int(rows[0].get("distinct_domains") or 0)
-        if api_domains is not None:  # domains defined in Discover count even before assets are tagged
+        if api_domains is not None and not scoped:  # defined domains count before assets are tagged
             distinct_domains = max(distinct_domains, len(top_level))
         assignments = int(rows[0].get("assignments") or 0)
 
@@ -1716,8 +1741,8 @@ async def probe_domains() -> dict:
         if distinct_domains == 0:
             gaps.append("No domains found. Create business-aligned domains and subdomains in Discover and add their assets.")
         if api["status"] == "forbidden":
-            gaps.append("Couldn't read Discover domains: the assessing identity needs MANAGE DISCOVER, so domains were "
-                        "inferred from governed tags and may be undercounted.")
+            gaps.append("Couldn't read Discover domains: grant the app's service principal MANAGE DISCOVER, so domains "
+                        "aren't inferred from governed tags (which can miss domains or count other tags).")
         if stewarded == 0:
             gaps.append("No stewardship tags (owner/steward) found; assign a named steward per domain.")
         if certified == 0:
@@ -1732,7 +1757,9 @@ async def probe_domains() -> dict:
         signals = [
             {"label": "Domains (Discover)" if api_domains is not None else "Distinct domains (via tags)",
              "value": distinct_domains,
-             "detail": (f"Top-level domains in Discover ({subdomains} subdomains)" if api_domains is not None
+             "detail": (f"Discover domains with assets in this scope ({len(top_level)} top-level domains "
+                        f"and {subdomains} subdomains in the account)" if api_domains is not None and scoped
+                        else f"Top-level domains in Discover ({subdomains} subdomains)" if api_domains is not None
                         else "Domains inferred from governed tags: Discover `Domain/Subdomain` keys and `domain`-style tags")},
             {"label": "Domain-tagged assets", "value": assignments, "detail": "Assets carrying a domain tag"},
             {"label": "Stewarded assets", "value": stewarded, "detail": "Assets with an owner/steward tag"},
