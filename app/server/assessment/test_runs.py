@@ -3,7 +3,6 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from server import config
 from server.assessment import runs
 
 
@@ -226,7 +225,18 @@ class ContextHandOffTest(unittest.IsolatedAsyncioTestCase):
             yield {"type": "pillar", "pillar": {"key": "k"}}
 
         wsf = {"mode": "include", "workspace_ids": ["123"]}
-        with patch.object(runs, "run_assessment_stream", probe):
+        # Record what the run sets, calling through so the probe still sees the
+        # values. (Reading the finished task's context needs Python 3.12; the
+        # Databricks Apps runtime is 3.11.)
+        token_calls = []
+        real_set_user_token = runs.set_user_token
+
+        def recording_set_user_token(value):
+            token_calls.append(value)
+            real_set_user_token(value)
+
+        with patch.object(runs, "run_assessment_stream", probe), \
+             patch.object(runs, "set_user_token", recording_set_user_token):
             run = runs.start_run("a@x", "user-token", wsf, ["cat_a"], ["sch"])
             await asyncio.sleep(0)
             task = run.task
@@ -236,9 +246,9 @@ class ContextHandOffTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["catalogs"], ["cat_a"])
         self.assertEqual(seen["schemas"], ["sch"])
         self.assertEqual(seen["wsf"]["workspace_ids"], ["123"])
-        # The finished task no longer holds the token, and (after its done
-        # callback, one loop tick later) the run drops the task.
-        self.assertIsNone(task.get_context().get(config._user_token))
+        # The run sets the caller's token, then clears it when it ends, and (after
+        # its done callback, one loop tick later) drops the task.
+        self.assertEqual(token_calls, ["user-token", None])
         await asyncio.sleep(0)
         self.assertIsNone(run.task)
 
