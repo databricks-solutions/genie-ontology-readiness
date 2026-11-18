@@ -153,6 +153,9 @@ export interface PillarScore {
   drill_down: DrillDown | null;
   source_queries: SourceQuery[];
   unavailable_reason: UnavailableReason | null;
+  // Left out of the overall score (not a 0), with a short reason to show the user.
+  score_excluded?: boolean;
+  score_excluded_reason?: string | null;
 }
 
 // Which identity actually served a pillar's reads, so the UI can show whether the
@@ -175,7 +178,13 @@ export interface ScorecardOverall {
   assessed_at?: string;
   // Pillars left out of the overall score because the app couldn't measure them (e.g. Domains
   // without MANAGE DISCOVER). Absent on snapshots saved before this field existed.
-  excluded_pillars?: string[];
+  excluded_pillars?: ExcludedPillar[];
+}
+
+export interface ExcludedPillar {
+  key: string;
+  name: string;
+  reason?: string | null;
 }
 
 export interface TopGap {

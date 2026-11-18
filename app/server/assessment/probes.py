@@ -1611,6 +1611,10 @@ async def probe_domains() -> dict:
               "other tags, so this pillar is left out of the overall score. Use the self-assessment.",
             reason="insufficient_permission" if forbidden else "not_enabled")
         res["score_excluded"] = True
+        # Short, user-facing reason shown on the pillar card and under the overall score.
+        res["score_excluded_reason"] = (
+            "The app's service principal needs MANAGE DISCOVER to read Discover domains." if forbidden else
+            "The Discover Domains API didn't answer, so domains couldn't be read.")
         res["metrics"] = {"domains_api": api["status"]}
         return res
 

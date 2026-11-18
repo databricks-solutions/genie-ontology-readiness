@@ -39,6 +39,7 @@ import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
 import { defaultTrendScope, resolveTrendScope, scopeDetail, scopeLabel, scopeOptions, trendRuns } from '../utils/scope';
 import PillarDetail from './PillarDetail';
+import { ExcludedPillarsNote, NOT_SCORED_EXPLAINER } from './NotScored';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
@@ -370,7 +371,7 @@ export default function Scorecard({
       config.pillars.map((p) => ({
         // Use the pillar's card title (name), not its long description, so the
         // radar labels match the 7 pillar cards below.
-        pillar: p.name,
+        pillar: pillarsByKey[p.key]?.score_excluded ? `${p.name} (not scored)` : p.name,
         score: Math.round(pillarsByKey[p.key]?.score ?? 0),
       })),
     [config.pillars, pillarsByKey]
@@ -724,13 +725,7 @@ export default function Scorecard({
                   {overall.readiness_framing && (
                     <p className="text-xs text-ink-500 leading-relaxed mt-2">{overall.readiness_framing}</p>
                   )}
-                  {(overall.excluded_pillars?.length ?? 0) > 0 && (
-                    <p className="text-xs text-ink-500 leading-relaxed mt-1">
-                      Not scored: {overall.excluded_pillars!.join(', ')}. The app couldn&apos;t measure{' '}
-                      {overall.excluded_pillars!.length > 1 ? 'these pillars' : 'this pillar'}, so the overall score
-                      averages the other pillars. Open the pillar for what to grant.
-                    </p>
-                  )}
+                  <ExcludedPillarsNote excluded={overall.excluded_pillars} />
                   <div className="flex items-center gap-3 flex-wrap mt-2">
                     {config.assess_catalogs.length > 0 && (
                       <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
@@ -895,23 +890,37 @@ export default function Scorecard({
                 className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
               >
                 <div className="w-12 text-center shrink-0">
-                  <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
-                    {Math.round(p.score)}
-                  </div>
+                  {p.score_excluded ? (
+                    <div className="text-lg font-bold text-ink-400" title={NOT_SCORED_EXPLAINER}>
+                      —
+                    </div>
+                  ) : (
+                    <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
+                      {Math.round(p.score)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-ink-900">{p.name}</span>
-                    <LevelBadge level={p.level} label={p.level_label} />
-                    {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                    {!p.score_excluded && <LevelBadge level={p.level} label={p.level_label} />}
+                    {p.score_excluded ? (
+                      <span className="text-[11px] text-ink-500 italic">not scored</span>
+                    ) : (
+                      !p.available && <span className="text-[11px] text-ink-400 italic">not available</span>
+                    )}
                     {p.identity && <IdentityBadge identity={p.identity} />}
                   </div>
-                  <p className="text-xs text-ink-500 mt-0.5 truncate">{p.short}</p>
+                  <p className="text-xs text-ink-500 mt-0.5 truncate">
+                    {p.score_excluded ? p.score_excluded_reason || NOT_SCORED_EXPLAINER : p.short}
+                  </p>
                 </div>
                 <div className="hidden sm:block w-24 shrink-0">
-                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                    <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
-                  </div>
+                  {!p.score_excluded && (
+                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
+                    </div>
+                  )}
                 </div>
                 <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
               </button>

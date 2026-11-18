@@ -235,7 +235,8 @@ class ScoreExclusionTest(unittest.TestCase):
         res, _ = _run_probe({"status": "forbidden"}, [])
         out, pillars = self._scorecard(res)
         self.assertEqual(out["overall"]["score"], 50.0)  # not dragged down by a 0
-        self.assertEqual(out["overall"]["excluded_pillars"], ["Domains & Stewardship"])
+        self.assertEqual([e["name"] for e in out["overall"]["excluded_pillars"]], ["Domains & Stewardship"])
+        self.assertIn("MANAGE DISCOVER", out["overall"]["excluded_pillars"][0]["reason"])
         self.assertTrue(next(p for p in pillars if p["key"] == "domains")["score_excluded"])
 
     def test_other_unavailable_pillars_still_count_as_zero(self):

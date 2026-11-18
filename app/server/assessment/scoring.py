@@ -100,6 +100,8 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         # Domains without MANAGE DISCOVER): it is left out of the overall score instead of
         # counting as 0. Only an unavailable pillar can be excluded.
         "score_excluded": bool(probe.get("score_excluded")) and not tech_available,
+        "score_excluded_reason": (probe.get("score_excluded_reason")
+                                  if probe.get("score_excluded") and not tech_available else None),
     }
 
 
@@ -137,7 +139,8 @@ def _finalize(pillars_out: list[dict]) -> dict:
             "assessed_at": datetime.now(timezone.utc).isoformat(),
             # Pillars left out of this score (see score_excluded), so a reader knows the
             # average covers fewer pillars.
-            "excluded_pillars": [p["name"] for p in pillars_out if p.get("score_excluded")],
+            "excluded_pillars": [{"key": p["key"], "name": p["name"], "reason": p.get("score_excluded_reason")}
+                                 for p in pillars_out if p.get("score_excluded")],
         },
         "top_gaps": top_gaps,
     }

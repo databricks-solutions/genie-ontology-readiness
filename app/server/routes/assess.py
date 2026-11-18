@@ -258,11 +258,15 @@ def _assessment_markdown(sc: dict) -> str:
     elif stage:
         lines.append(f"**{stage}**")
         lines.append("")
-    excluded = overall.get("excluded_pillars") or []
+    excluded = [e if isinstance(e, dict) else {"name": str(e)} for e in (overall.get("excluded_pillars") or [])]
     if excluded:
-        lines.append(f"_Not scored: {', '.join(excluded)}. The app couldn't measure "
-                     f"{'these pillars' if len(excluded) > 1 else 'this pillar'}, so the overall score "
-                     "averages the other pillars._")
+        lines.append(f"_Not scored: {', '.join(e.get('name') or '' for e in excluded)}. The app couldn't measure "
+                     f"{'these pillars' if len(excluded) > 1 else 'this pillar'}, so "
+                     f"{'they are' if len(excluded) > 1 else 'it is'} left out of the overall score instead of "
+                     "counting as 0._")
+        for e in excluded:
+            if e.get("reason"):
+                lines.append(f"- {e.get('name')}: {e['reason']}")
         lines.append("")
     if detail:
         lines.append(detail)
@@ -306,6 +310,8 @@ def _assessment_markdown(sc: dict) -> str:
             available = p.get("available", True)
             if available:
                 lines.append(f"### {name} — {p.get('score')}/100 (L{p.get('level')} {p.get('level_label') or ''})")
+            elif p.get("score_excluded"):
+                lines.append(f"### {name} — not scored")
             else:
                 lines.append(f"### {name} — not available")
             lines.append("")
