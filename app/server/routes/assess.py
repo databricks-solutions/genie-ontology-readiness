@@ -258,6 +258,12 @@ def _assessment_markdown(sc: dict) -> str:
     elif stage:
         lines.append(f"**{stage}**")
         lines.append("")
+    excluded = overall.get("excluded_pillars") or []
+    if excluded:
+        lines.append(f"_Not scored: {', '.join(excluded)}. The app couldn't measure "
+                     f"{'these pillars' if len(excluded) > 1 else 'this pillar'}, so the overall score "
+                     "averages the other pillars._")
+        lines.append("")
     if detail:
         lines.append(detail)
         lines.append("")
@@ -272,7 +278,8 @@ def _assessment_markdown(sc: dict) -> str:
         lines.append("| Pillar | Score | Maturity | Weight |")
         lines.append("| --- | --- | --- | --- |")
         for p in pillars:
-            score_cell = str(p.get("score")) if p.get("available", True) else "n/a"
+            score_cell = (str(p.get("score")) if p.get("available", True)
+                      else "not scored" if p.get("score_excluded") else "n/a")
             lines.append(
                 f"| {_cell(p.get('name'))} | {_cell(score_cell)} "
                 f"| {_cell('L' + str(p.get('level')) + ' ' + (p.get('level_label') or ''))} "

@@ -121,7 +121,8 @@ signal) always read the account-level system tables directly — they don't use
 - 7 pillars, each scored 0-100. Pillar **weights sum to 100**:
   Unity Catalog Foundation 15 · Metadata Richness 22 · Relationships & Modeling 12 · Metrics 20 · Genie Agents 16 · Domains & Stewardship 10 · Adoption & Activity 5.
 - **Overall** = weighted average of the pillar scores (an unavailable pillar
-  contributes 0). Map it to a maturity **level** (0-4) and a **readiness stage**.
+  contributes 0, except Domains without the Domains API, which is left out).
+  Map it to a maturity **level** (0-4) and a **readiness stage**.
 - **Prioritized gaps** = each pillar's gaps, ordered lowest-score / highest-weight
   first, top 6.
 <!-- END GENERATED: at-a-glance -->

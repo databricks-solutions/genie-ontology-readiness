@@ -114,17 +114,15 @@ class NativeDomainsIdentityTest(unittest.TestCase):
 
 
 class DomainTagSqlTest(unittest.TestCase):
-    def test_legacy_keys_only(self):
-        pred, label = probes._domain_tag_sql([])
-        self.assertIn("'domain'", pred)
-        self.assertNotIn("careportal", pred)
-        self.assertIn("split(tag_name, '/')[0]", label)
-
-    def test_discover_keys_are_matched_case_insensitively(self):
-        pred, _ = probes._domain_tag_sql(["CarePortal", "CarePortal/Referrals"])
+    def test_keys_are_matched_case_insensitively(self):
+        pred, label = probes._domain_tag_sql(["CarePortal", "CarePortal/Referrals"])
         self.assertIn("'careportal'", pred)
         self.assertIn("'careportal/referrals'", pred)
-        self.assertIn("'domain'", pred)  # legacy tags still count
+        self.assertNotIn("'domain'", pred)  # no legacy `domain`-style keys
+        self.assertEqual(label, "split(tag_name, '/')[0]")
+
+    def test_no_domains_matches_nothing(self):
+        self.assertEqual(probes._domain_tag_sql([])[0], "FALSE")
 
 
 def _fake_sql(rows_by_marker):
@@ -150,78 +148,100 @@ def _run_probe(api, rows_by_marker, scalar=5, scope=None, sources=SOURCES):
         return asyncio.run(probes.probe_domains()), statements
 
 
+API = {"status": "ok", "domains": [
+    {"domain_id": "1", "tag_key": "CarePortal"},
+    {"domain_id": "2", "tag_key": "Finance"},
+    {"domain_id": "3", "tag_key": "CarePortal/Referrals", "parent_domain_id": "1"},
+    {"domain_id": "4", "tag_key": "Sales", "effective_draft": True},
+    {"domain_id": "5", "tag_key": "Finance/Audit", "parent_domain_id": "2", "effective_draft": True}]}
+USED = ("used_domains", [{"used_domains": "1", "assignments": "49"}])
+
+
 class ProbeDomainsTest(unittest.TestCase):
-    def test_discover_subdomain_tags_count_without_the_api(self):
-        # The customer case: 49 tables tagged CarePortal/<Subdomain>, no parent tag, Domains API 404.
-        res, statements = _run_probe(
-            {"status": "unavailable"},
-            [("instr(tag_name, '/') > 1", [{"tag_name": "CarePortal/Referrals"}, {"tag_name": "CarePortal/Intake"}]),
-             ("distinct_domains", [{"distinct_domains": "1", "assignments": "49"}])])
-        self.assertTrue(res["available"])
-        self.assertEqual(res["metrics"]["distinct_domains"], 1)
-        self.assertGreater(res["score"], 0)
-        self.assertIn("'careportal/referrals'", next(s for s in statements if "distinct_domains" in s))
-        self.assertEqual(res["metrics"]["source"], "tag_proxy")
+    def test_without_the_api_the_pillar_is_left_out_of_the_score(self):
+        for status, reason in (("forbidden", "insufficient_permission"), ("unavailable", "not_enabled")):
+            res, statements = _run_probe({"status": status}, [USED])
+            self.assertFalse(res["available"])
+            self.assertTrue(res["score_excluded"])
+            self.assertEqual(res["unavailable_reason"], reason)
+            self.assertEqual(statements, [])  # no tag-based guess
+            self.assertIn("left out of the overall score", res["note"])
+        self.assertIn("MANAGE DISCOVER", _run_probe({"status": "forbidden"}, [])[0]["note"])
 
-    def test_api_domains_drive_the_count(self):
-        api = {"status": "ok", "domains": [
-            {"domain_id": "1", "tag_key": "CarePortal"},
-            {"domain_id": "2", "tag_key": "Finance"},
-            {"domain_id": "3", "tag_key": "CarePortal/Referrals", "parent_domain_id": "1"}]}
-        res, statements = _run_probe(api, [("distinct_domains", [{"distinct_domains": "1", "assignments": "49"}])])
-        self.assertEqual(res["metrics"]["source"], "native_api")
-        self.assertEqual(res["metrics"]["distinct_domains"], 2)  # both top-level domains, even if Finance is untagged
-        self.assertEqual(res["metrics"]["subdomains"], 1)
-        self.assertFalse(any("instr(tag_name, '/') > 1" in s for s in statements))  # no key inference needed
-        self.assertIn("Published domains read from the Discover Domains API", res["note"])
+    def test_account_published_domains_drive_the_count(self):
+        res, statements = _run_probe(API, [USED])
+        m = res["metrics"]
+        self.assertEqual((m["distinct_domains"], m["subdomains"], m["draft_domains"]), (2, 1, 2))
+        self.assertEqual((m["used_domains"], m["domain_tag_assignments"]), (1, 49))
+        self.assertEqual(res["score"], 40 + 40 * 2 / 5 + 20)
+        used = next(s for s in statements if "used_domains" in s)
+        self.assertIn("'careportal/referrals'", used)
+        self.assertNotIn("'sales'", used)  # a draft domain's tags don't count
+        self.assertNotIn("'finance/audit'", used)
+        self.assertIn("catalog_tags", used)  # catalogs belong to domains too
 
-    def test_draft_domains_are_not_counted(self):
-        api = {"status": "ok", "domains": [
-            {"domain_id": "1", "tag_key": "Finance"},
-            {"domain_id": "2", "tag_key": "Sales", "effective_draft": True},
-            {"domain_id": "3", "tag_key": "Finance/Tax", "parent_domain_id": "1"},
-            {"domain_id": "4", "tag_key": "Finance/Audit", "parent_domain_id": "1", "effective_draft": True}]}
-        res, statements = _run_probe(api, [("distinct_domains", [{"distinct_domains": "1", "assignments": "3"}])])
-        self.assertEqual(res["metrics"]["distinct_domains"], 1)
-        self.assertEqual((res["metrics"]["subdomains"], res["metrics"]["draft_domains"]), (1, 2))
-        pred = next(s for s in statements if "distinct_domains" in s)
-        self.assertIn("'finance/tax'", pred)
-        self.assertNotIn("'sales'", pred)  # a draft domain's tags don't place assets in a domain
-        self.assertNotIn("'finance/audit'", pred)
-
-    def test_scoped_run_counts_only_domains_with_assets_in_scope(self):
-        # Domains are account-level: a run scoped to one catalog must not count every domain.
-        api = {"status": "ok", "domains": [
-            {"domain_id": "1", "tag_key": "CarePortal"}, {"domain_id": "2", "tag_key": "Finance"},
-            {"domain_id": "3", "tag_key": "Sales"}]}
-        res, _ = _run_probe(api, [("distinct_domains", [{"distinct_domains": "1", "assignments": "4"}])], scope=["cp"])
-        self.assertEqual(res["metrics"]["distinct_domains"], 1)
-        self.assertIn("with assets in this scope", res["signals"][0]["detail"])
-
-    def test_untagged_scope_scores_zero_even_with_api_domains(self):
-        api = {"status": "ok", "domains": [{"domain_id": str(i), "tag_key": f"D{i}"} for i in range(6)]}
-        res, _ = _run_probe(api, [("distinct_domains", [{"distinct_domains": "0", "assignments": "0"}])],
+    def test_scoped_run_keeps_the_account_count_and_scores_coverage_separately(self):
+        res, _ = _run_probe(API, [("used_domains", [{"used_domains": "0", "assignments": "0"}])],
                             scalar=0, scope=["cp"])
-        self.assertEqual(res["metrics"]["distinct_domains"], 0)
-        self.assertEqual(res["score"], 0.0)
+        self.assertEqual(res["metrics"]["distinct_domains"], 2)  # account-wide, same as unscoped
+        self.assertEqual(res["metrics"]["used_domains"], 0)
+        self.assertEqual(res["score"], 40 + 40 * 2 / 5)
+        self.assertTrue(any("None of the account's published domains" in g for g in res["gaps"]))
+
+    def test_tables_inherit_their_schema_and_catalog_domain(self):
+        calls = []
+        with patch.object(probes, "_native_domains", AsyncMock(return_value=API)), \
+             patch.object(probes, "_resolve_sources", AsyncMock(return_value=SOURCES)), \
+             patch.object(probes, "execute_sql", side_effect=_fake_sql([USED])[0]), \
+             patch.object(probes, "_scalar", AsyncMock(side_effect=lambda q, **k: calls.append(q) or 3)):
+            res = asyncio.run(probes.probe_domains())
+        q = next(c for c in calls if "table_catalog IN (SELECT catalog_name" in c)
+        self.assertIn("(table_catalog, table_schema) IN (SELECT catalog_name, schema_name", q)
+        self.assertEqual(res["metrics"]["domain_tagged_assets"], 3)
+
+    def test_falls_back_when_catalog_tags_are_unreadable(self):
+        async def run(sql, **kw):
+            if "used_domains" in sql and "catalog_tags" in sql:
+                raise RuntimeError("catalog_tags not readable")
+            return USED[1] if "used_domains" in sql else []
+        with patch.object(probes, "_native_domains", AsyncMock(return_value=API)), \
+             patch.object(probes, "_resolve_sources", AsyncMock(return_value=SOURCES)), \
+             patch.object(probes, "execute_sql", side_effect=run), \
+             patch.object(probes, "_scalar", AsyncMock(return_value=5)):
+            res = asyncio.run(probes.probe_domains())
+        self.assertTrue(res["available"])
+        self.assertEqual(res["metrics"]["used_domains"], 1)
 
     def test_api_count_only_when_tags_are_unreadable(self):
-        api = {"status": "ok", "domains": [
-            {"domain_id": "1", "tag_key": "Finance"}, {"domain_id": "2", "tag_key": "Sales"},
-            {"domain_id": "3", "tag_key": "Finance/Tax", "parent_domain_id": "1"}]}
         no_catalogs = {"system_ok": False, "catalogs": [], "schemas": None}
-        res, _ = _run_probe(api, [], sources=no_catalogs)
-        self.assertTrue(res["available"])
-        self.assertEqual(res["score"], 40 + 40 * 2 / 5)
-        self.assertEqual((res["metrics"]["domains"], res["metrics"]["subdomains"]), (2, 1))
-        scoped, _ = _run_probe(api, [], sources=no_catalogs, scope=["cp"])
-        self.assertFalse(scoped["available"])  # account-wide domains say nothing about this scope
+        for scope in (None, ["cp"]):
+            res, _ = _run_probe(API, [], sources=no_catalogs, scope=scope)
+            self.assertTrue(res["available"])
+            self.assertEqual(res["score"], 40 + 40 * 2 / 5)
+            self.assertEqual(res["metrics"]["distinct_domains"], 2)
 
-    def test_forbidden_api_flags_manage_discover(self):
-        res, _ = _run_probe({"status": "forbidden"}, [("distinct_domains", [{"distinct_domains": "0", "assignments": "0"}])])
-        self.assertTrue(any("MANAGE DISCOVER" in g for g in res["gaps"]))
-        self.assertIn("needs MANAGE DISCOVER", res["note"])
-        self.assertEqual(res["metrics"]["domains_api"], "forbidden")
+
+class ScoreExclusionTest(unittest.TestCase):
+    def _scorecard(self, domains_probe):
+        from server.assessment import scoring
+        from server.pillars import PILLARS
+        probes_out = {p["key"]: {"available": True, "score": 50.0, "signals": [], "gaps": ["g"], "metrics": {}}
+                      for p in PILLARS}
+        probes_out["domains"] = domains_probe
+        pillars = [scoring._assemble_pillar(p, probes_out[p["key"]]) for p in PILLARS]
+        return scoring._finalize(pillars), pillars
+
+    def test_excluded_pillar_is_left_out_of_the_overall(self):
+        res, _ = _run_probe({"status": "forbidden"}, [])
+        out, pillars = self._scorecard(res)
+        self.assertEqual(out["overall"]["score"], 50.0)  # not dragged down by a 0
+        self.assertEqual(out["overall"]["excluded_pillars"], ["Domains & Stewardship"])
+        self.assertTrue(next(p for p in pillars if p["key"] == "domains")["score_excluded"])
+
+    def test_other_unavailable_pillars_still_count_as_zero(self):
+        out, _ = self._scorecard({"available": False, "score": 0.0, "signals": [], "gaps": [], "metrics": {}})
+        self.assertLess(out["overall"]["score"], 50.0)
+        self.assertEqual(out["overall"]["excluded_pillars"], [])
 
 
 if __name__ == "__main__":

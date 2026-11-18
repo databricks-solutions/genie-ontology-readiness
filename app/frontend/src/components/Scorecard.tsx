@@ -724,6 +724,13 @@ export default function Scorecard({
                   {overall.readiness_framing && (
                     <p className="text-xs text-ink-500 leading-relaxed mt-2">{overall.readiness_framing}</p>
                   )}
+                  {(overall.excluded_pillars?.length ?? 0) > 0 && (
+                    <p className="text-xs text-ink-500 leading-relaxed mt-1">
+                      Not scored: {overall.excluded_pillars!.join(', ')}. The app couldn&apos;t measure{' '}
+                      {overall.excluded_pillars!.length > 1 ? 'these pillars' : 'this pillar'}, so the overall score
+                      averages the other pillars. Open the pillar for what to grant.
+                    </p>
+                  )}
                   <div className="flex items-center gap-3 flex-wrap mt-2">
                     {config.assess_catalogs.length > 0 && (
                       <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>

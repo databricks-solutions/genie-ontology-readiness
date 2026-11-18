@@ -173,6 +173,9 @@ export interface ScorecardOverall {
   // Fixed framing: the score is readiness for Genie Ontology (Private Preview).
   readiness_framing?: string;
   assessed_at?: string;
+  // Pillars left out of the overall score because the app couldn't measure them (e.g. Domains
+  // without MANAGE DISCOVER). Absent on snapshots saved before this field existed.
+  excluded_pillars?: string[];
 }
 
 export interface TopGap {

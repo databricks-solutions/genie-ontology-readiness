@@ -356,50 +356,44 @@ domain name (`Finance`); a subdomain is keyed `{parentTag}/{subdomain}`
 does **not** also tag it with the parent. Docs:
 [Domains and subdomains](https://docs.databricks.com/aws/en/uc-semantics/domains).
 
-**Step 1: list domains with the Domains API** (only if you can make an
-authenticated REST GET): `GET {host}/api/2.0/domains?page_size=100` (alternate
-path `/api/discover/v1/domains`), following `next_page_token`. Each item has
-`tag_key` and `parent_domain_id` (empty for a top-level domain). The caller needs
-**MANAGE DISCOVER** (workspace / account admins have it by default); a 401/403
-means it's missing, so say so in a gap and continue with step 2b.
+Domains are **account-level and catalog-agnostic**: catalogs, schemas and tables
+belong to domains, not the other way round. The domain count is the same in every
+run; coverage is what the assessed catalogs contribute.
+
+**Step 1: list domains with the Domains API** (needs an authenticated REST GET):
+`GET {host}/api/2.0/domains?page_size=100` (alternate path `/api/discover/v1/domains`),
+following `next_page_token`. Each item has `tag_key`, `parent_domain_id` (empty for a
+top-level domain) and `effective_draft`. The caller needs **MANAGE DISCOVER**
+(workspace and account admins have it by default; an account admin grants it).
+- **If the API returns 401/403 or doesn't answer: stop here.** The pillar is **not
+  scored**: report it as not available, leave it out of the overall score (see
+  scoring-and-output.md), and note that domains need MANAGE DISCOVER. **Don't infer
+  domains from tags**: tags alone can't tell domains apart from other governed tags
+  (about 50% right in testing).
 - Count **published** domains only: drop items with `effective_draft: true` (drafts are
   visible to curators only; `effective_draft` also covers a subdomain under a draft parent).
-- `top_level` = published domains with no `parent_domain_id`; `subdomains` = the rest.
-- `discover_keys` = every published domain's `tag_key`.
+- `distinct_domains` = published domains with no `parent_domain_id` (account-wide);
+  `subdomains` = the other published domains; `draft_domains` = the dropped drafts.
+- `domain_keys` = every published domain's `tag_key`, lowercased.
 
-**Step 2b (no API): infer Discover keys from the tags** (`<VIEW>` = table and
-schema tags):
-
-```sql
-SELECT DISTINCT tag_name FROM <VIEW>
-WHERE instr(tag_name, '/') > 1 AND lower(tag_name) NOT LIKE 'system.%';
--- discover_keys = these `Parent/Sub` keys plus each one's `Parent` prefix
-```
-
-A top-level domain that has no subdomain tags can't be told apart from other
-governed tags this way; the note says so.
-
-**Step 3: the governed-tag queries.** Key sets (match case-insensitively):
-- legacy domain keys (domain name in the **value**): `domain, data_domain, business_domain, subject_area, data_product`
-- Discover domain keys: `discover_keys` from step 1 or 2b (domain name in the **key**)
+**Step 2: the governed-tag queries.** Key sets (match case-insensitively):
+- domain keys: `domain_keys` from step 1 (a subdomain's key is `Parent/Sub`)
 - steward keys: `owner, data_owner, steward, data_steward`
 - cert keys: `system.certification_status, certification_status` (value `certified`)
 
-`<domain_pred>` = `lower(tag_name) IN (<legacy keys>) OR lower(tag_name) IN (<discover_keys>)`;
-`<domain_label>` = `CASE WHEN lower(tag_name) IN (<legacy keys>) THEN tag_value ELSE split(tag_name, '/')[0] END`
-(a subdomain rolls up to its top-level domain).
+`<domain_pred>` = `lower(tag_name) IN (<domain_keys>)`;
+`<domain_label>` = `split(tag_name, '/')[0]` (a subdomain rolls up to its top-level domain).
 
 ```sql
--- distinct domains + domain-tag assignments (union table + schema tags)
-SELECT COUNT(DISTINCT lower(domain)) AS distinct_domains, COUNT(*) AS assignments FROM (
-  SELECT <domain_label> AS domain FROM <TABLE_TAGS>  WHERE <domain_pred>
+-- domains used here + assignments: published domains assigned to an assessed
+-- catalog, schema or table (catalog tags have no schema_name)
+SELECT COUNT(DISTINCT lower(domain)) AS used_domains, COUNT(*) AS assignments FROM (
+  SELECT <domain_label> AS domain FROM <TABLE_TAGS>   WHERE <domain_pred>
   UNION ALL
-  SELECT <domain_label> AS domain FROM <SCHEMA_TAGS> WHERE <domain_pred>
+  SELECT <domain_label> AS domain FROM <SCHEMA_TAGS>  WHERE <domain_pred>
+  UNION ALL
+  SELECT <domain_label> AS domain FROM <CATALOG_TAGS> WHERE <domain_pred>
 );
--- with the API and an unscoped run: distinct_domains = max(distinct_domains, len(top_level)),
--- so domains defined in Discover count before their assets are tagged. Domains are
--- account-level, so a run scoped to catalogs/schemas counts only the domains tagged on
--- assets in scope (the query above), not len(top_level).
 
 -- stewarded assets
 SELECT COUNT(*) AS stewarded FROM <TABLE_TAGS> WHERE lower(tag_name) IN (<steward_keys>);
@@ -412,8 +406,12 @@ WHERE lower(tag_name) IN (<cert_keys>) AND lower(tag_value) = 'certified';
 -- governance coverage over the table footprint
 SELECT COUNT(*) AS total_tables FROM <TABLES> WHERE table_schema <> 'information_schema';
 SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS governed_tagged FROM <TABLE_TAGS>;
-SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) AS domain_tagged
-FROM <TABLE_TAGS> WHERE <domain_pred>;
+-- a table is in a domain if the table, its schema or its catalog is assigned to one
+SELECT COUNT(*) AS domain_tagged FROM <TABLES>
+WHERE table_schema <> 'information_schema' AND (
+     (table_catalog, table_schema, table_name) IN (SELECT catalog_name, schema_name, table_name FROM <TABLE_TAGS> WHERE <domain_pred>)
+  OR (table_catalog, table_schema) IN (SELECT catalog_name, schema_name FROM <SCHEMA_TAGS> WHERE <domain_pred>)
+  OR table_catalog IN (SELECT catalog_name FROM <CATALOG_TAGS> WHERE <domain_pred>));
 ```
 
 `pct_tagged = pct(governed_tagged, total_tables)`;
@@ -443,28 +441,32 @@ FROM top t LEFT JOIN cert c ON t.name = c.name ORDER BY t.n DESC;
 -- top_accessed = row count; top_certified = rows where certified = 1
 ```
 
-**Score** (start at 0):
-- if `distinct_domains > 0`: `+ 40 + 40 * min(distinct_domains, 5)/5`
+**Score** (start at 0; only when the Domains API answered):
+- if `distinct_domains > 0`: `+ 40 + 40 * min(distinct_domains, 5)/5` (account-wide count)
 - `+20` if `stewarded > 0`
 
-**Signals to display:** Domains (Discover) with the subdomain count when the API answered, else Distinct domains (via tags) (`distinct_domains`),
-Domain-tagged assets (`assignments`), Stewarded assets (`stewarded`), Certified
-assets (`certified`); plus Tables tagged (`pct_tagged`%), Tables in a domain
-(`pct_in_domain`%) when `total_tables > 0`; and Top accessed certified
+**Signals to display:** Domains (Discover) (`distinct_domains`, with `subdomains` and
+`draft_domains` not counted), Domains used here (`used_domains`), Domain assignments
+(`assignments`), Stewarded assets (`stewarded`), Certified assets (`certified`); plus
+Tables tagged (`pct_tagged`%), Tables in a domain (`pct_in_domain`%, directly or through
+the schema or catalog) when `total_tables > 0`; and Top accessed certified
 (`top_certified` / `top_accessed`) when available.
 
-**Note to include:** with the API, "Published domains read from the Discover Domains API (drafts excluded); asset coverage from their governed tags." Without it, domains were inferred from governed tags because the API needs MANAGE DISCOVER (403) or was unavailable, a domain with no subdomain tags may be missed, and a self-assessment can capture domain-design maturity tags can't show.
+**Note to include:** "Domains are account-wide: the count is the account's published
+domains from the Discover Domains API (drafts excluded), the same for every scope.
+Coverage is for the assessed catalogs: the domains used here and the tables in a domain,
+directly or through their schema or catalog."
 
 **Gaps:**
-- `distinct_domains == 0` → "No domains found. Create business-aligned domains and subdomains in Discover and add their assets."
-- Domains API returned 401/403 → "Couldn't read Discover domains: grant MANAGE DISCOVER to the identity running the assessment, so domains aren't inferred from governed tags (which can miss domains or count other tags)."
+- `distinct_domains == 0` → "No published domains in Discover. Create business-aligned domains and subdomains, publish them, and assign catalogs, schemas or tables to them."
+- `distinct_domains > 0 AND used_domains == 0` → "None of the account's published domains is assigned to the assessed catalogs, schemas or tables. Assign them to domains in Discover so their assets roll up to a business area."
 - `stewarded == 0` → "No stewardship tags (owner/steward) found; assign a named steward per domain."
 - `certified == 0` → "No certified assets found — certify canonical gold tables so users (and Genie) know which to trust."
 - `total_tables > 0 AND pct_tagged < 50` → "Only `{pct_tagged}`% of tables carry any UC governed tag — tag eligible assets (PII, domain, certification) to power governed discovery."
-- `total_tables > 0 AND pct_in_domain < 50` → "Only `{pct_in_domain}`% of tables are assigned to a domain — apply domain tags so assets roll up to business-aligned domains."
+- `total_tables > 0 AND distinct_domains > 0 AND pct_in_domain < 50` → "Only `{pct_in_domain}`% of tables are in a domain — assign their catalog, schema or the table to a domain so assets roll up to business-aligned domains."
 - `top_accessed > 0 AND top_certified < top_accessed` → "Only `{top_certified}` of your top `{top_accessed}` most-accessed resources are certified — certify high-traffic tables so Genie/ontology can trust your busiest data."
 
-**Drill-down — Governance tags by schema** (which schemas lack domain / steward / certification tags; most-covered first). Uses `<domain_pred>` for the domain column:
+**Drill-down — Governance tags by schema** (which schemas lack domain / steward / certification tags; most-covered first). Uses `<domain_pred>` for the domain column (tables tagged directly):
 
 ```sql
 SELECT catalog_name AS catalog, schema_name AS schema,

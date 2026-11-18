@@ -29,6 +29,12 @@ overall = round( sum(pillar.score * pillar.weight) / sum(pillar.weight), 1 )
 pillar contributes score 0 (it still counts in the denominator — missing
 capability legitimately lowers readiness).
 
+**One exception: Domains & Stewardship without the Domains API.** If the Domains API
+refuses the call (no `MANAGE DISCOVER`) or doesn't answer, the pillar is **not scored**:
+leave it out of both sums, so the other pillars' weights are renormalized, and say
+"Not scored: Domains & Stewardship" under the overall score. Don't guess domains from
+tags.
+
 ## Maturity level (0-4)
 
 Applies to both a single pillar score and the overall score:

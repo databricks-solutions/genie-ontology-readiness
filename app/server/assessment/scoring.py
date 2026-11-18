@@ -96,19 +96,26 @@ def _assemble_pillar(pillar_def: dict, probe: dict) -> dict:
         # When available=False, WHY (insufficient_permission / scan_failed /
         # not_enabled) so the UI can distinguish an access failure from a real 0 (#20).
         "unavailable_reason": probe.get("unavailable_reason"),
+        # The probe couldn't measure this pillar for a reason that isn't a readiness gap (e.g.
+        # Domains without MANAGE DISCOVER): it is left out of the overall score instead of
+        # counting as 0. Only an unavailable pillar can be excluded.
+        "score_excluded": bool(probe.get("score_excluded")) and not tech_available,
     }
 
 
 def _finalize(pillars_out: list[dict]) -> dict:
     """Compute the overall score + prioritized gaps from all pillar entries."""
-    weighted_sum = sum(p["score"] * p["weight"] for p in pillars_out)
-    weight_total = sum(p["weight"] for p in pillars_out)
+    # Pillars marked score_excluded are left out of the weighted average (the weights of the
+    # rest are renormalized); every other unavailable pillar still counts as 0.
+    scored = [p for p in pillars_out if not p.get("score_excluded")]
+    weighted_sum = sum(p["score"] * p["weight"] for p in scored)
+    weight_total = sum(p["weight"] for p in scored)
     overall_score = round(weighted_sum / weight_total, 1) if weight_total else 0.0
     overall_level = level_from_score(overall_score)
     stage = readiness_stage(overall_score)
 
     # Prioritized gaps: lowest-scoring pillars first, weighted by importance.
-    ranked = sorted(pillars_out, key=lambda x: (x["score"], -x["weight"]))
+    ranked = sorted(scored, key=lambda x: (x["score"], -x["weight"]))
     top_gaps = []
     for pil in ranked:
         for i, g in enumerate(pil["gaps"]):
@@ -128,6 +135,9 @@ def _finalize(pillars_out: list[dict]) -> dict:
             "readiness_detail": readiness_guidance(ranked, stage["detail"]),
             "readiness_framing": OVERALL_FRAMING,
             "assessed_at": datetime.now(timezone.utc).isoformat(),
+            # Pillars left out of this score (see score_excluded), so a reader knows the
+            # average covers fewer pillars.
+            "excluded_pillars": [p["name"] for p in pillars_out if p.get("score_excluded")],
         },
         "top_gaps": top_gaps,
     }
