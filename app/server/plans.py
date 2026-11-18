@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 _TABLE = "ontology_plans"
 
 
+def _table() -> str:
+    """The schema-qualified history table (the schema is chosen at startup)."""
+    from server.lakebase_client import history_table
+    return history_table(_TABLE)
+
+
 async def _enabled() -> bool:
     if not USE_LAKEBASE:
         return False
@@ -33,7 +39,7 @@ async def ensure_table() -> None:
         return
     async with pool.acquire() as conn:
         await conn.execute(
-            f"""CREATE TABLE IF NOT EXISTS {_TABLE} (
+            f"""CREATE TABLE IF NOT EXISTS {_table()} (
                     id BIGSERIAL PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     created_by TEXT,
@@ -62,7 +68,7 @@ async def save_plan(
             return None
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                f"INSERT INTO {_TABLE} (created_by, snapshot_id, title, model, plan_markdown) "
+                f"INSERT INTO {_table()} (created_by, snapshot_id, title, model, plan_markdown) "
                 f"VALUES ($1, $2, $3, $4, $5) RETURNING id",
                 created_by,
                 snapshot_id,
@@ -88,7 +94,7 @@ async def list_plans(created_by: str | None = None, limit: int = 50) -> list[dic
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, created_at, created_by, snapshot_id, title, model "
-                f"FROM {_TABLE} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
+                f"FROM {_table()} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
                 f"ORDER BY created_at DESC LIMIT $2",
                 created_by,
                 limit,
@@ -121,7 +127,7 @@ async def get_plan(plan_id: int, created_by: str | None = None) -> dict | None:
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT id, created_at, created_by, snapshot_id, title, model, plan_markdown "
-                f"FROM {_TABLE} WHERE id = $1 AND lower(created_by) IS NOT DISTINCT FROM lower($2)",
+                f"FROM {_table()} WHERE id = $1 AND lower(created_by) IS NOT DISTINCT FROM lower($2)",
                 plan_id,
                 created_by,
             )

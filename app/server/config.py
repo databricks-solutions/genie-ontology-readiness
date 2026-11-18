@@ -18,12 +18,14 @@ Auth is on-behalf-of-user (OBO) by default:
     the SP directly.
 """
 
+import math
 import os
 import logging
 import contextvars
 from databricks.sdk import WorkspaceClient
 
 from server.doc_links import cloud_from_host
+from server.runtime_config import resolve_use_lakebase, resolve_workspace_id
 from server.user_agent import PRODUCT_NAME, PRODUCT_VERSION
 
 logger = logging.getLogger(__name__)
@@ -74,16 +76,41 @@ ASSESS_CATALOGS = [
 # Deploy-time identity override. When true, EVERY read runs as the app service
 # principal and OBO is never attempted, even if a viewer token is forwarded.
 # Off by default (OBO-first with SP fallback — see sql_client.execute_sql). Set
-# via the FORCE_SP env in app.yml, e.g. to guarantee consistent, workspace-wide
+# via the FORCE_SP env in app.yaml, e.g. to guarantee consistent, workspace-wide
 # system-table signals regardless of the viewer's grants.
 FORCE_SP = os.environ.get("FORCE_SP", "false").lower() == "true"
 
+
+def env_seconds(name: str, default: float) -> float:
+    """A positive, finite number of seconds from env ``name``, else ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("%s=%r is not a positive, finite number of seconds; using %s", name, raw, default)
+        return default
+    return value
+
+
+# Hard cap on one background assessment run (see assessment/runs.py). Scan time
+# grows with the number of columns, so a very large metastore can take most of an
+# hour; the no-progress and no-reader stops end stuck or abandoned runs sooner.
+MAX_RUN_SECONDS = env_seconds("GOR_MAX_RUN_SECONDS", 3 * 60 * 60)
+
 # Lakebase toggle — only used to persist assessment snapshots over time.
 # Defaults OFF so the app deploys stateless into any workspace.
-USE_LAKEBASE = os.environ.get("USE_LAKEBASE", "false").lower() == "true"
+# auto (default) = on when a Lakebase host is attached (the lakebase-db resource
+# supplies LAKEBASE_HOST); true / false force it. See runtime_config.py.
+USE_LAKEBASE = resolve_use_lakebase(os.environ.get("USE_LAKEBASE", "auto"), os.environ.get("LAKEBASE_HOST", ""))
 
-# Workspace id (for building deep links into the customer's workspace UI)
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "")
+# Workspace id (for building deep links into the customer's workspace UI). Falls back
+# to the id the Apps runtime injects.
+WORKSPACE_ID, _WORKSPACE_ID_SOURCE = resolve_workspace_id(
+    os.environ.get("WORKSPACE_ID", ""), os.environ.get("DATABRICKS_WORKSPACE_ID", ""))
 
 # Optional Genie agent to test answer quality against (pillar 5)
 GENIE_SPACE_ID = os.environ.get("GENIE_SPACE_ID", "")

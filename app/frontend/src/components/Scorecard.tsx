@@ -13,7 +13,10 @@ import {
   Tooltip,
 } from 'recharts';
 import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows } from 'lucide-react';
-import { apiGet, streamPostEvents } from '../hooks/useApi';
+import { apiDeleteQuiet, apiGet } from '../hooks/useApi';
+import { useCopy } from '../hooks/useCopy';
+import { AssessRunError, runAssessment, serverErrorDetails } from '../utils/assessRun';
+import type { PendingPillar } from '../utils/assessRun';
 import type {
   AppConfig,
   Scorecard as ScorecardType,
@@ -34,16 +37,39 @@ import type {
 } from '../types';
 import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
+import { defaultTrendScope, resolveTrendScope, scopeDetail, scopeLabel, scopeOptions, trendRuns } from '../utils/scope';
 import PillarDetail from './PillarDetail';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
+import { buildLines } from './BuildWatermark';
 
-type AssessEvent =
-  | { type: 'pillar'; pillar: PillarScore }
-  | { type: 'pillar_progress'; key: string; done: number; total: number; detail: string }
-  | { type: 'complete'; overall: ScorecardOverall; pillars: PillarScore[]; top_gaps: TopGap[]; snapshot_id?: number | null }
-  | { type: 'error'; error: string };
+/** Error line plus optional expandable detail lines (with a copy button). */
+function ErrorNotice({ message, details, centered }: { message: string; details?: string[]; centered?: boolean }) {
+  const [copied, copyText] = useCopy();
+  const hasDetails = !!details && details.length > 0;
+  const copy = () => copyText([message, ...(details || [])].join('\n'));
+  return (
+    <div className={`mt-4 text-sm text-red-600 ${centered ? 'mx-auto max-w-2xl' : ''}`} role="alert">
+      <p className={`flex items-center gap-1.5 ${centered ? 'justify-center' : ''}`}>
+        <AlertTriangle size={14} className="shrink-0" /> {message}
+      </p>
+      {hasDetails && (
+        <details className="mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-left text-xs text-red-800">
+          <summary className="cursor-pointer select-none font-medium">Details</summary>
+          <ul className="mt-2 space-y-1 break-words">
+            {details!.map((d, i) => (
+              <li key={i}>{d}</li>
+            ))}
+          </ul>
+          <button type="button" onClick={copy} className="mt-2 underline hover:no-underline">
+            {copied ? 'Copied' : 'Copy details'}
+          </button>
+        </details>
+      )}
+    </div>
+  );
+}
 
 function Gauge({ score, color }: { score: number; color: string }) {
   const radius = 52;
@@ -154,11 +180,23 @@ export default function Scorecard({
   const [overall, setOverall] = useState<ScorecardOverall | null>(scorecard?.overall ?? null);
   const [topGaps, setTopGaps] = useState<TopGap[]>(scorecard?.top_gaps ?? []);
   const [error, setError] = useState<string | null>(null);
+  // Detail lines that belong to one error message (ignored once the message changes).
+  const [errorDetails, setErrorDetails] = useState<{ message: string; lines: string[] } | null>(null);
+  const shownDetails = error && errorDetails?.message === error ? errorDetails.lines : undefined;
   const [expanded, setExpanded] = useState<string | null>(null);
   const [history, setHistory] = useState<HistorySnapshot[]>([]);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // The background run in progress, so closing or reloading the tab can cancel it.
+  const runIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const onPageHide = () => {
+      if (runIdRef.current) void apiDeleteQuiet(`/assess/runs/${runIdRef.current}`);
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
+  }, []);
 
   // Workspace scope (#25/#10): activity-based signals count within the deployed
   // workspace only, so they're never account-wide. The scope is fixed to the
@@ -338,15 +376,23 @@ export default function Scorecard({
     [config.pillars, pillarsByKey]
   );
 
+  // "Readiness over time" only plots runs with the SAME scope (#89): a run on
+  // catalog A next to one on A+B isn't a trend. Default to the scope of the run on
+  // screen; the picker switches to another saved scope. Runs saved before scopes
+  // were recorded (no scope_hash) are left out.
+  const trendScopes = useMemo(() => scopeOptions(history), [history]);
+  const autoTrendScope = useMemo(() => defaultTrendScope(history, currentId), [history, currentId]);
+  const [pickedTrendScope, setPickedTrendScope] = useState<string | null>(null);
+  // A pick lasts until a different run is shown (then follow that run's scope).
+  useEffect(() => setPickedTrendScope(null), [currentId]);
+  const trendScope = resolveTrendScope(pickedTrendScope, trendScopes, autoTrendScope);
   const trendData = useMemo(
     () =>
-      [...history]
-        .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-        .map((h) => ({
-          date: new Date(h.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-          score: h.overall_score,
-        })),
-    [history]
+      trendRuns(history, trendScope).map((h) => ({
+        date: new Date(h.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+        score: h.overall_score,
+      })),
+    [history, trendScope]
   );
 
   async function run() {
@@ -362,44 +408,82 @@ export default function Scorecard({
     abortRef.current = controller;
 
     const collected: Record<string, PillarScore> = {};
+    const progress: Record<string, string> = {};
     let completed = false;
+    let runId: string | null = null;
+    const pending = (): PendingPillar[] =>
+      config.pillars
+        .filter((cp) => !collected[cp.key])
+        .map((cp) => ({ name: cp.name, progress: progress[cp.key] }));
+    const showError = (message: string, lines: string[]) => {
+      // The build goes into every run error, so a copied report says which deploy it came from.
+      const all = [...lines, ...buildLines(config.build)];
+      setError(message);
+      setErrorDetails(all.length ? { message, lines: all } : null);
+    };
     try {
-      for await (const ev of streamPostEvents<AssessEvent>(
-        '/assess/stream',
-        {
+      await runAssessment({
+        body: {
           workspace_filter: wsFilter,
           catalogs: catFilter,
           schemas: schemaFilter ? [schemaFilter] : [],
         },
-        undefined,
-        controller.signal
-      )) {
-        if (ev.type === 'pillar') {
-          collected[ev.pillar.key] = ev.pillar;
-          setPillarsByKey({ ...collected });
-        } else if (ev.type === 'pillar_progress') {
-          setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
-        } else if (ev.type === 'complete') {
-          completed = true;
-          setOverall(ev.overall);
-          setTopGaps(ev.top_gaps);
-          setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
-          setPhase('done');
-          if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
-          refreshHistory();
-        } else if (ev.type === 'error') {
-          setError(ev.error);
-        }
-      }
+        signal: controller.signal,
+        pending,
+        onRunId: (id) => {
+          runId = id;
+          runIdRef.current = id;
+        },
+        onEvent: (ev) => {
+          if (ev.type === 'pillar') {
+            collected[ev.pillar.key] = ev.pillar;
+            setPillarsByKey({ ...collected });
+          } else if (ev.type === 'pillar_progress') {
+            progress[ev.key] = ev.detail;
+            setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
+          } else if (ev.type === 'complete') {
+            completed = true;
+            setOverall(ev.overall);
+            setTopGaps(ev.top_gaps);
+            setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
+            setPhase('done');
+            if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
+            refreshHistory();
+          } else if (ev.type === 'error') {
+            showError(ev.error, serverErrorDetails(ev, pending()));
+          }
+        },
+      });
       if (!completed) setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
     } catch (e) {
-      if ((e as Error).name !== 'AbortError') {
-        setError((e as Error).message);
+      if ((e as Error).name === 'AbortError') {
+        // Unmount / navigation: stop the server-side run too.
+        if (runId) void apiDeleteQuiet(`/assess/runs/${runId}`);
+      } else {
+        if (e instanceof AssessRunError) showError(e.message, e.details);
+        else showError((e as Error).message, []);
         setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
       }
     } finally {
       abortRef.current = null;
+      runIdRef.current = null;
     }
+  }
+
+  // "New assessment": go back to the intro page so the user can set the scope
+  // (catalogs / schema) before running. It does not start a run by itself.
+  // The last completed scorecard stays in the parent, so the Plan tab keeps it.
+  function startNew() {
+    if (phase === 'running') return;
+    setError(null);
+    setErrorDetails(null);
+    setPillarsByKey({});
+    setProgressByKey({});
+    setOverall(null);
+    setTopGaps([]);
+    setCurrentId(null);
+    setExpanded(null);
+    setPhase('idle');
   }
 
   async function loadSnapshot(id: number) {
@@ -429,7 +513,7 @@ export default function Scorecard({
   const sidebar = (
     <aside className="lg:sticky lg:top-6 self-start space-y-3">
       <button
-        onClick={run}
+        onClick={startNew}
         disabled={running}
         className="btn-primary w-full flex items-center justify-center gap-1.5 text-sm"
       >
@@ -472,9 +556,11 @@ export default function Scorecard({
                   <span className="text-base font-bold tabular-nums w-8 text-center shrink-0" style={{ color: scoreColor(h.overall_score) }}>
                     {Math.round(h.overall_score)}
                   </span>
-                  <span className="flex-1 min-w-0">
+                  <span className="flex-1 min-w-0" title={scopeDetail(h.scope)}>
                     <span className="block text-xs font-medium text-ink-700 truncate">{fmtWhen(h.created_at)}</span>
-                    <span className="block text-[11px] text-ink-400">Readiness score</span>
+                    <span className="block text-[11px] text-ink-400 truncate" data-testid="history-scope">
+                      {scopeLabel(h.scope)}
+                    </span>
                   </span>
                   {loadingId === h.id && <Loader2 size={13} className="animate-spin text-ink-400 shrink-0" />}
                 </button>
@@ -569,11 +655,7 @@ export default function Scorecard({
       </div>
 
       <div className="text-center">
-        {error && (
-          <p className="mt-4 text-sm text-red-600 flex items-center justify-center gap-1.5">
-            <AlertTriangle size={14} /> {error}
-          </p>
-        )}
+        {error && <ErrorNotice message={error} details={shownDetails} centered />}
         <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
           <Play size={16} /> Run assessment
         </button>
@@ -610,9 +692,14 @@ export default function Scorecard({
                 <Gauge score={overall.score} color={scoreColor(overall.score)} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-start justify-between gap-3 flex-wrap mb-1">
-                    <div className="flex items-center gap-3 flex-wrap min-w-0">
-                      <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
-                      <LevelBadge level={overall.level} label={overall.level_label} />
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-xs font-semibold uppercase tracking-wider text-ink-400">
+                        Readiness for Genie Ontology
+                      </span>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <h2 className="text-xl font-bold text-ink-900">{overall.readiness_stage}</h2>
+                        <LevelBadge level={overall.level} label={overall.level_label} />
+                      </div>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -625,7 +712,7 @@ export default function Scorecard({
                         {pdfBusy ? 'Exporting…' : 'Export PDF'}
                       </button>
                       <button
-                        onClick={run}
+                        onClick={startNew}
                         disabled={running}
                         className="btn-primary py-1 px-3 flex items-center gap-1.5 text-xs"
                       >
@@ -634,6 +721,9 @@ export default function Scorecard({
                     </div>
                   </div>
                   <p className="text-sm text-ink-600 leading-relaxed">{overall.readiness_detail}</p>
+                  {overall.readiness_framing && (
+                    <p className="text-xs text-ink-500 leading-relaxed mt-2">{overall.readiness_framing}</p>
+                  )}
                   <div className="flex items-center gap-3 flex-wrap mt-2">
                     {config.assess_catalogs.length > 0 && (
                       <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
@@ -689,20 +779,43 @@ export default function Scorecard({
             </ResponsiveContainer>
           </div>
 
-          {config.lakebase_enabled && trendData.length > 1 && (
+          {config.lakebase_enabled && trendScopes.some((o) => o.runs > 1) && (
             <div className="card p-5">
               <div className="flex items-center gap-2 mb-2">
                 <TrendingUp size={15} className="text-databricks-500" />
                 <h3 className="text-sm font-semibold text-ink-700">Readiness over time</h3>
+                {trendScopes.length > 1 ? (
+                  <select
+                    value={trendScope ?? ''}
+                    onChange={(e) => setPickedTrendScope(e.target.value || null)}
+                    data-testid="trend-scope"
+                    title="Only runs with the same scope are compared"
+                    className="ml-auto max-w-[180px] rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-ink-600"
+                  >
+                    {trendScopes.map((o) => (
+                      <option key={o.hash} value={o.hash}>{`${o.label} (${o.runs})`}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="ml-auto text-[11px] text-ink-400 truncate">
+                    {scopeLabel(history.find((h) => h.scope_hash === trendScope)?.scope)}
+                  </span>
+                )}
               </div>
-              <ResponsiveContainer width="100%" height={140}>
-                <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
-                  <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#97afb2' }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="score" stroke="#FF3621" strokeWidth={2} dot={{ r: 3 }} />
-                </LineChart>
-              </ResponsiveContainer>
+              {trendData.length > 1 ? (
+                <ResponsiveContainer width="100%" height={140}>
+                  <LineChart data={trendData} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#97afb2' }} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#97afb2' }} />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="score" stroke="#FF3621" strokeWidth={2} dot={{ r: 3 }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <p className="text-xs text-ink-400 py-6 text-center" data-testid="trend-single-run">
+                  Only one run has this scope so far. Run again with the same catalogs to see a trend.
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -722,6 +835,12 @@ export default function Scorecard({
                   <span>
                     <span className="font-medium text-ink-800">{g.pillar}:</span>{' '}
                     <span className="text-ink-600">{g.gap}</span>
+                    {g.impact && (
+                      <span className="block text-xs text-ink-500 mt-0.5 leading-relaxed">
+                        <span className="font-medium text-ink-600">Impact for Genie Ontology: </span>
+                        {g.impact}
+                      </span>
+                    )}
                   </span>
                 </li>
               ))}
@@ -795,11 +914,7 @@ export default function Scorecard({
         })}
       </div>
 
-      {error && (
-        <p className="text-sm text-red-600 flex items-center gap-1.5">
-          <AlertTriangle size={14} /> {error}
-        </p>
-      )}
+      {error && <ErrorNotice message={error} details={shownDetails} />}
     </div>
   );
 

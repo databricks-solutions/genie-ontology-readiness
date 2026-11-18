@@ -25,8 +25,23 @@ export interface AppConfig {
   ai_models: AIModel[];
   default_model: string;
   lakebase_enabled: boolean;
+  warehouse_configured?: boolean;
+  history_ready?: boolean;
   genie_space_configured: boolean;
   assess_catalogs: string[];
+  build?: BuildInfo;
+}
+
+/** The running build, from /api/config (version + Git commit + deployment). */
+export interface BuildInfo {
+  label: string;
+  version: string;
+  commit: string | null;
+  commit_short: string | null;
+  ref: string | null;
+  deployment_id: string | null;
+  deployed_at: string | null;
+  source: 'env' | 'deployment' | 'git' | null;
 }
 
 export interface Signal {
@@ -62,6 +77,8 @@ export interface DrillDown {
   rows: Record<string, string | number | null>[];
   // Column keys the drill-down modal offers as slice-by filters (workspace/catalog/schema/agent).
   dimensions?: string[];
+  // Set when the server kept only the first `rows.length` of `total_rows` rows.
+  total_rows?: number;
 }
 
 // A catalog accessible to the selected workspaces, for the pre-run catalog filter.
@@ -125,6 +142,10 @@ export interface PillarScore {
   note: string | null;
   signals: Signal[];
   gaps: string[];
+  // Impact for Genie Ontology (server/impact.py). Optional: snapshots saved before
+  // impact statements existed have none.
+  impact?: string | null;
+  gap_impacts?: (string | null)[];
   best_practices: string[];
   summary: string;
   metrics: Record<string, unknown>;
@@ -149,12 +170,15 @@ export interface ScorecardOverall {
   level_label: string;
   readiness_stage: string;
   readiness_detail: string;
+  // Fixed framing: the score is readiness for Genie Ontology (Private Preview).
+  readiness_framing?: string;
   assessed_at?: string;
 }
 
 export interface TopGap {
   pillar: string;
   gap: string;
+  impact?: string | null;
 }
 
 export interface Scorecard {
@@ -163,12 +187,23 @@ export interface Scorecard {
   top_gaps: TopGap[];
 }
 
+// What a run covered (#89). Lower-cased, sorted names; [] catalogs = all catalogs,
+// [] workspace_ids = all workspaces. null on snapshots saved before scopes existed.
+export interface AssessmentScope {
+  catalogs: string[];
+  schemas: string[];
+  workspace_mode: 'include' | 'exclude' | null;
+  workspace_ids: string[];
+}
+
 export interface HistorySnapshot {
   id: string | number;
   created_at: string;
   created_by: string;
   overall_score: number;
   overall_level: number;
+  scope?: AssessmentScope | null;
+  scope_hash?: string | null;
 }
 
 export interface HistoryResponse {
@@ -240,6 +275,7 @@ export interface CompareEndpoint {
   id: number | string | null;
   created_at: string | null;
   overall: ScorecardOverall;
+  scope?: AssessmentScope | null;
 }
 
 export interface CompareResult {
@@ -255,6 +291,9 @@ export interface CompareResult {
     removed: number;
     unavailable: number;
   };
+  // #89: false when the two runs covered different catalogs/schemas/workspaces;
+  // null when either run predates saved scopes.
+  same_scope?: boolean | null;
 }
 
 export interface PlanListItem {

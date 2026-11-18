@@ -58,17 +58,9 @@ async def lifespan(app: FastAPI):
     from server.sql_client import execute_sql
 
     async def init_lakebase():
-        if USE_LAKEBASE:
-            from server.lakebase_client import init_pool, is_available
-            await init_pool()
-            if is_available():
-                from server.snapshots import ensure_table as ensure_snapshots
-                from server.plans import ensure_table as ensure_plans
-                await ensure_snapshots()
-                await ensure_plans()
-                logger.info("Lakebase pool ready — assessment history + plans enabled")
-            else:
-                logger.warning("Lakebase pool unavailable — history/plans disabled")
+        # Never raises: a Lakebase error leaves history off and the app running.
+        from server.lakebase_client import start_history
+        await start_history()
 
     async def warmup_warehouse():
         try:

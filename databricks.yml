@@ -5,13 +5,14 @@ bundle:
 # Genie Ontology / Unity Catalog Business Semantics and generates tailored
 # enablement plans. It READS the existing environment — it does not seed data.
 
-# The built frontend (app/frontend/dist) and the rendered app/app.yml are
+# The built frontend (app/frontend/dist) and the rendered app/app.yaml are
 # .gitignored (build artifact / workspace-specific), but the app needs both at
 # runtime — force-include them in the deploy sync. node_modules stays excluded.
 sync:
   include:
     - app/frontend/dist/**
-    - app/app.yml
+    # app/app.yaml is tracked (it has no workspace values); the rendered copy is
+    # written only during a CLI publish and restored afterwards.
 
 variables:
   warehouse_id:

@@ -1,0 +1,7 @@
+{
+  "name": "genie-ontology-readiness-app",
+  "private": true,
+  "scripts": {
+    "build": "cd frontend && npm ci --no-audit --no-fund && npm run build"
+  }
+}

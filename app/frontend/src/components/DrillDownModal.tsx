@@ -107,6 +107,12 @@ export default function DrillDownModal({
           <div className="px-5 py-4 overflow-y-auto space-y-4">
             {drill && drill.rows.length > 0 ? (
               <>
+                {drill.total_rows && drill.total_rows > drill.rows.length && (
+                  <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    Filters and the CSV export cover these {drill.rows.length.toLocaleString()} rows only
+                    (of {drill.total_rows.toLocaleString()}).
+                  </p>
+                )}
                 {/* Slice-by filters + CSV export + View SQL */}
                 <div className="flex flex-wrap items-end gap-3">
                   {dims.map((d) => {
