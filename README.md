@@ -382,6 +382,7 @@ covered by the `sql` user scope) and Lakebase credential minting.
 | Run any query | SQL warehouse | `CAN USE` on the warehouse |
 | UC Foundation · Metadata · Relationships · Metrics · Domains (tags) | catalog / `system.information_schema` | `BROWSE` on each assessed catalog (metadata-only, least privilege) — or `USE CATALOG`+`USE SCHEMA`+`SELECT` |
 | "Not in Unity Catalog" coverage | `hive_metastore.information_schema` | read on `hive_metastore` (if legacy access is enabled) |
+| Domains (Discover domains and subdomains, optional) | Domains REST API (Beta) | `MANAGE DISCOVER` on the **SP**: Discover → ⋮ → **Manage Domains** → **Permissions** → **Grant Permissions**. Account and workspace admins have it by default. The viewer's `sql`-scoped token can't call this API, so the app retries as the SP. Without it, domains are inferred from governed tags, which can miss top-level domains and count other `/` tags |
 | Genie Agents (count + activity) | `system.access.audit` (`aibiGenie` events) | `USE`+`SELECT` on `system.access` |
 | Adoption & Activity | `system.access.audit`, `system.query.history` | `USE`+`SELECT` on `system.access` and `system.query` |
 | Top‑10 most‑accessed + certified | `system.access.table_lineage` + `information_schema.table_tags` | `USE`+`SELECT` on `system.access` + catalog metadata |

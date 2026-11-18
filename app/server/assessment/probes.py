@@ -1563,6 +1563,7 @@ async def _native_domains() -> dict:
             if status == "ok":
                 record_identity("sp_fallback")
                 return {"status": "ok", "domains": domains}
+            logger.info(f"Domains API refused the viewer token; as the app SP: {status}")
     return {"status": status}
 
 
