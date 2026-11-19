@@ -1607,8 +1607,8 @@ async def probe_domains() -> dict:
             ("Discover domains need MANAGE DISCOVER on the app's service principal (an account admin grants it: "
              "Discover → ⋮ → Manage Domains → Permissions). " if forbidden else
              "The Discover Domains API didn't answer in this workspace. ")
-            + "Domains aren't inferred from governed tags, because tags alone can't tell domains apart from "
-              "other tags, so this pillar is left out of the overall score. Use the self-assessment.",
+            + "Domains aren't guessed from governed tags, because tags alone can't tell domains apart from "
+              "other tags. Use the self-assessment.",
             reason="insufficient_permission" if forbidden else "not_enabled")
         res["score_excluded"] = True
         # Short, user-facing reason shown on the pillar card and under the overall score.

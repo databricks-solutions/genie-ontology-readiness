@@ -165,7 +165,8 @@ class ProbeDomainsTest(unittest.TestCase):
             self.assertTrue(res["score_excluded"])
             self.assertEqual(res["unavailable_reason"], reason)
             self.assertEqual(statements, [])  # no tag-based guess
-            self.assertIn("left out of the overall score", res["note"])
+            self.assertIn("aren't guessed from governed tags", res["note"])
+            self.assertTrue(res["score_excluded_reason"])
         self.assertIn("MANAGE DISCOVER", _run_probe({"status": "forbidden"}, [])[0]["note"])
 
     def test_account_published_domains_drive_the_count(self):
