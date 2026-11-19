@@ -136,6 +136,22 @@ def _lakebase_resource() -> dict:
     return _RESOURCE
 
 
+def _is_endpoint_name(value: str) -> bool:
+    """True for an Autoscaling endpoint resource name (projects/<p>/branches/<b>/endpoints/<e>)."""
+    return value.startswith("projects/") and "/endpoints/" in value
+
+
+def _endpoint_host(endpoint: str) -> str:
+    """The host name of an Autoscaling endpoint, or "" when it can't be read (logged)."""
+    try:
+        from server.config import _get_workspace_client
+        ep = _get_workspace_client().postgres.get_endpoint(endpoint)
+        return getattr(getattr(getattr(ep, "status", None), "hosts", None), "host", "") or ""
+    except Exception as e:
+        logger.warning(f"Could not read the Lakebase endpoint host ({type(e).__name__})")
+        return ""
+
+
 def _autoscaling_endpoint(branch: str, host: str = "") -> str:
     """The compute endpoint of an Autoscaling branch to mint a credential for.
 
@@ -175,6 +191,10 @@ def _get_connection_config() -> dict:
     Password will be fetched asynchronously in init_pool() if needed.
     """
     host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "localhost")
+    if _is_endpoint_name(host):
+        # `valueFrom: lakebase-db` on an Autoscaling resource gives the endpoint's resource
+        # name, not a host name. The host is in PGHOST, which Apps injects for the resource.
+        host = os.environ.get("PGHOST") or _endpoint_host(host) or host
     port = int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432"))
     from server.runtime_config import resolve_database, resolve_lakebase_user
 
@@ -251,6 +271,9 @@ async def init_pool() -> None:
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
             endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
             endpoint_source = "app setting" if endpoint else ""
+            if not endpoint and _is_endpoint_name(os.environ.get("LAKEBASE_HOST", "")):
+                # An Autoscaling lakebase-db resource: valueFrom gives the endpoint itself.
+                endpoint, endpoint_source = os.environ["LAKEBASE_HOST"], "lakebase-db resource (valueFrom)"
             from server.runtime_config import resolve_instance
             instance, instance_source = resolve_instance(
                 os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
