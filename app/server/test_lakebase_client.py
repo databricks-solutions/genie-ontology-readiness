@@ -115,7 +115,7 @@ class ProvisionedTest(unittest.TestCase):
         self.assertEqual(pool.kwargs["host"], "instance-x.database.cloud.databricks.com")
 
     def test_no_resource_means_no_credential(self):
-        with _Env({"LAKEBASE_HOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}, _client([])) as e:
+        with _Env({"LAKEBASE_HOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}, _client([])):
             asyncio.run(lc.init_pool())
             lc._fetch_db_credential.assert_not_awaited()
             self.assertIsNone(lc._pool)
