@@ -18,6 +18,7 @@
 #         GOR_VERIFY_DOC_LINKS=1 bash scripts/check.sh   # also run step 8 (needs network)
 # Exits non-zero on the first failing gate.
 set -euo pipefail
+PY="${PYTHON:-python3}"  # the interpreter for the backend steps (e.g. a venv)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
@@ -41,25 +42,34 @@ step "Backend: install deps (app requirements + tooling)"
 # provision them before collecting — mirror the frontend's `npm ci`. Best-effort
 # so a machine without a writable pip env degrades to the skips below rather than
 # aborting; use a venv/uv if this warns (e.g. PEP 668 externally-managed).
-python3 -m pip install -q -r requirements-dev.txt || \
-  echo "  (warning) backend dep install failed — ruff/pytest may be skipped below" >&2
+"$PY" -m pip install -q -r requirements-dev.txt || \
+  echo "  (warning) backend dep install failed — use a venv: PYTHON=.venv/bin/python bash scripts/check.sh" >&2
+
+# A missing tool fails the gate: a skipped lint or test run must never read as "All checks
+# passed". Set GOR_ALLOW_SKIPS=1 to skip a missing tool on purpose (it is still reported).
+missing_tool() {
+  if [ "${GOR_ALLOW_SKIPS:-0}" = "1" ]; then
+    echo "  (skipped) $1 is not installed for $PY (GOR_ALLOW_SKIPS=1)" >&2
+  else
+    echo "FAIL: $1 is not installed for $PY. Install requirements-dev.txt, or set PYTHON to a venv." >&2
+    exit 1
+  fi
+}
 
 step "Backend: ruff lint"
 if command -v ruff >/dev/null 2>&1; then
   ruff check app scripts
+elif "$PY" -c "import ruff" >/dev/null 2>&1; then
+  "$PY" -m ruff check app scripts
 else
-  python3 -m ruff check app scripts 2>/dev/null || {
-    echo "ruff not installed — 'pip install ruff' (or 'pipx install ruff'). Skipping lint." >&2
-  }
+  missing_tool ruff
 fi
 
 step "Backend: pytest"
-if command -v pytest >/dev/null 2>&1; then
-  pytest -q
+if "$PY" -c "import pytest" >/dev/null 2>&1; then
+  "$PY" -m pytest -q   # a test failure fails the gate (set -e)
 else
-  python3 -m pytest -q 2>/dev/null || {
-    echo "pytest not installed — 'pip install pytest'. Skipping tests." >&2
-  }
+  missing_tool pytest
 fi
 
 step "Skill: generated docs match the App spec"
