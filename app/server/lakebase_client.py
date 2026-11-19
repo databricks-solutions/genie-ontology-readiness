@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 
 # Will be set during app lifespan
 _pool = None
-_pool_created_at: float = 0.0
-TOKEN_REFRESH_INTERVAL = 45 * 60  # Refresh pool every 45 minutes (tokens expire at 60 min)
 
 
 async def _fetch_db_credential(instance_name: str = "", endpoint_name: str = "") -> Optional[str]:
@@ -117,6 +115,7 @@ def _lakebase_resource() -> dict:
     if _RESOURCE is None:
         found = {"instance": "", "database": "", "branch": "", "database_resource": ""}
         app_name = os.environ.get("DATABRICKS_APP_NAME", "")
+        ok = True
         if app_name:
             try:
                 from server.config import _get_workspace_client
@@ -131,9 +130,12 @@ def _lakebase_resource() -> dict:
                         found = {**found, "branch": resource.postgres.branch or "",
                                  "database_resource": resource.postgres.database or ""}
             except Exception as e:
+                ok = False  # not cached: the next startup attempt reads it again
                 logger.warning(f"Could not read the lakebase-db resource ({type(e).__name__}); "
                                "using the app settings and defaults")
-        _RESOURCE = found
+        if ok:
+            _RESOURCE = found
+        return found
     return _RESOURCE
 
 
@@ -220,17 +222,27 @@ def _resolve_target() -> dict:
     res = _lakebase_resource()
     raw_host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "")
 
-    endpoint, source = os.environ.get("LAKEBASE_ENDPOINT_NAME", ""), "app setting LAKEBASE_ENDPOINT_NAME"
-    if not endpoint and _is_endpoint_name(raw_host):
-        endpoint, source = raw_host, "lakebase-db resource (Autoscaling)"
-    host = raw_host
-    if _is_endpoint_name(host):
+    host, value_from_endpoint = raw_host, ""
+    if _is_endpoint_name(raw_host):
         # `valueFrom: lakebase-db` on an Autoscaling resource gives the endpoint's resource
         # name, not a host name. The host is in PGHOST, which Apps injects for the resource.
-        host = os.environ.get("PGHOST") or _endpoint_host(host)
+        value_from_endpoint = raw_host
+        pg_host = os.environ.get("PGHOST", "")
+        host = pg_host if pg_host and not _is_endpoint_name(pg_host) else _endpoint_host(raw_host)
+
+    # Credential endpoint, first non-empty: the app setting, the valueFrom endpoint, the
+    # branch's endpoint for the host we connect to (or its read-write endpoint).
+    endpoint, source = "", ""
+    for candidate, label in (
+        (lambda: os.environ.get("LAKEBASE_ENDPOINT_NAME", ""), "app setting LAKEBASE_ENDPOINT_NAME"),
+        (lambda: value_from_endpoint, "lakebase-db resource (Autoscaling)"),
+        (lambda: _autoscaling_endpoint(res["branch"], host), "lakebase-db resource (Autoscaling branch)"),
+    ):
+        endpoint = candidate()
+        if endpoint:
+            source = label
+            break
     autoscaling = bool(endpoint or res["branch"])
-    if not endpoint and res["branch"]:
-        endpoint, source = _autoscaling_endpoint(res["branch"], host), "lakebase-db resource (Autoscaling branch)"
 
     instance = ""
     if autoscaling:
@@ -274,10 +286,15 @@ def _resolve_target() -> dict:
 
 
 async def _target() -> dict:
+    """The connection target, resolved in a thread. Cached only when it names an endpoint or
+    instance (or a password is set), so a transient failure is retried on the next start."""
     global _TARGET
-    if _TARGET is None:
-        _TARGET = await asyncio.to_thread(_resolve_target)
-    return _TARGET
+    if _TARGET is not None:
+        return _TARGET
+    target = await asyncio.to_thread(_resolve_target)
+    if target["endpoint"] or target["instance"] or os.environ.get("LAKEBASE_PASSWORD"):
+        _TARGET = target
+    return target
 
 
 # `require` encrypts the connection but performs NO certificate or hostname check,
@@ -313,38 +330,66 @@ def _ssl_arg():
     return ctx
 
 
-async def _create_pool():
-    """A new connection pool with a fresh credential, or None (logged). Never raises."""
+# A Lakebase OAuth credential is valid for about 60 minutes. A new one is minted for new
+# connections after this age; open connections stay authenticated.
+CREDENTIAL_MAX_AGE = 45 * 60
+_credential = {"token": "", "minted_at": 0.0}
+
+
+async def _mint_credential(config: dict) -> str:
+    token = await _fetch_db_credential(instance_name=config["instance"], endpoint_name=config["endpoint"]) or ""
+    if token:
+        _credential.update(token=token, minted_at=time.time())
+    return token
+
+
+async def _connection_password() -> str:
+    """The password for a new pool connection (asyncpg calls this for each one).
+
+    Reuses the current credential while it is fresh, else mints a new one. If minting fails,
+    the current credential is used: it stays valid for about 15 more minutes, and the next new
+    connection tries again."""
+    if _credential["token"] and time.time() - _credential["minted_at"] < CREDENTIAL_MAX_AGE:
+        return _credential["token"]
+    token = await _mint_credential(await _target())
+    if not token:
+        logger.warning("Could not mint a new Lakebase credential; using the current one and retrying "
+                       "on the next connection")
+    return token or _credential["token"]
+
+
+async def init_pool() -> None:
+    """Create the asyncpg connection pool. Call during app startup."""
+    global _pool
     try:
         import asyncpg
 
         config = await _target()
         password = os.environ.get("LAKEBASE_PASSWORD", "")
 
-        # If no explicit password is set in a Databricks App, mint a credential as the app
-        # service principal: for the Autoscaling endpoint, else the Provisioned instance.
+        # In a Databricks App with no explicit password, each new connection gets an OAuth
+        # credential minted as the app service principal: for the Autoscaling endpoint, else
+        # the Provisioned instance. The first one is minted now, so a failure shows at startup.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
-            if config["endpoint"] or config["instance"]:
-                password = await _fetch_db_credential(
-                    instance_name=config["instance"],
-                    endpoint_name=config["endpoint"],
-                ) or ""
-            else:
+            if not (config["endpoint"] or config["instance"]):
                 logger.warning(
                     "Running in Databricks App but no Lakebase endpoint or instance was found "
                     "(LAKEBASE_ENDPOINT_NAME / LAKEBASE_INSTANCE_NAME empty, and the lakebase-db "
                     "resource gave neither); no Lakebase credential available"
                 )
+            elif await _mint_credential(config):
+                password = _connection_password
 
         if not password:
             logger.warning(
                 "Lakebase password not set and no instance credential available — "
                 "assessment history will not persist"
             )
-            return None
+            _pool = None
+            return
 
         logger.info(f"Connecting to Lakebase at {config['host']}:{config['port']}/{config['database']}")
-        pool = await asyncio.wait_for(
+        _pool = await asyncio.wait_for(
             asyncpg.create_pool(
                 host=config["host"],
                 port=config["port"],
@@ -355,55 +400,16 @@ async def _create_pool():
                 min_size=2,
                 max_size=10,
                 command_timeout=30,
+                # Idle connections are closed after 5 minutes, so reconnects pick up the
+                # current credential well within its lifetime.
+                max_inactive_connection_lifetime=300,
             ),
             timeout=10,  # Don't hang for more than 10s on pool creation
         )
         logger.info("Lakebase connection pool initialized successfully")
-        return pool
     except Exception as e:
         logger.warning(f"Failed to initialize Lakebase pool (will fall back to SQL Warehouse): {e}")
-        return None
-
-
-async def init_pool() -> None:
-    """Create the asyncpg connection pool. Call during app startup."""
-    global _pool, _pool_created_at
-    _pool = await _create_pool()
-    _pool_created_at = time.time() if _pool is not None else 0.0
-
-
-_refresh_lock = asyncio.Lock()
-_last_refresh_try = 0.0
-REFRESH_RETRY_SECONDS = 60
-
-
-async def _refresh_pool_if_needed() -> None:
-    """Swap in a pool with a fresh credential when the current one nears expiry (~45 min).
-
-    The new pool is built first, so the current one keeps serving (history never looks off
-    and saves aren't dropped). If the new pool fails, the current one is kept (its credential
-    is valid for ~60 min) and the refresh is retried a minute later."""
-    global _pool, _pool_created_at, _last_refresh_try
-    if _pool is None or _pool_created_at == 0:
-        return
-    if time.time() - _pool_created_at < TOKEN_REFRESH_INTERVAL:
-        return
-    async with _refresh_lock:
-        if time.time() - _pool_created_at < TOKEN_REFRESH_INTERVAL:
-            return  # another request refreshed it
-        if time.time() - _last_refresh_try < REFRESH_RETRY_SECONDS:
-            return
-        _last_refresh_try = time.time()
-        logger.info(f"Refreshing Lakebase pool (age: {(time.time() - _pool_created_at)/60:.0f} min)")
-        new_pool = await _create_pool()
-        if new_pool is None:
-            logger.warning("Lakebase pool refresh failed; keeping the current pool and retrying shortly")
-            return
-        old_pool, _pool, _pool_created_at = _pool, new_pool, time.time()
-    try:
-        await old_pool.close()
-    except Exception:
-        pass
+        _pool = None
 
 
 async def close_pool() -> None:
@@ -421,8 +427,7 @@ def is_available() -> bool:
 
 
 async def get_pool():
-    """Get the connection pool, refreshing the token if needed. Returns None if unavailable."""
-    await _refresh_pool_if_needed()
+    """Get the connection pool. Returns None if unavailable."""
     return _pool
 
 
@@ -489,8 +494,6 @@ async def start_history() -> bool:
 
 async def execute_query(query: str, params: Optional[list] = None) -> list[dict]:
     """Execute a SQL query against Lakebase and return results as list of dicts."""
-    await _refresh_pool_if_needed()
-
     if _pool is None:
         raise RuntimeError("Lakebase pool not initialized")
 

@@ -46,6 +46,7 @@ class _Env:
     def __enter__(self):
         lc._RESOURCE = None
         lc._TARGET = None
+        lc._credential.update(token="", minted_at=0.0)
         self.patches = [
             patch.dict(os.environ, {"DATABRICKS_APP_NAME": "gor-test", **self.env}, clear=True),
             patch("server.config._get_workspace_client", return_value=self.client),
@@ -65,8 +66,7 @@ class _Env:
         lc._RESOURCE = None
         lc._TARGET = None
         lc._pool = None
-        lc._pool_created_at = 0.0
-        lc._last_refresh_try = 0.0
+        lc._credential.update(token="", minted_at=0.0)
 
     def run(self):
         asyncio.run(lc.init_pool())
@@ -157,35 +157,54 @@ class AutoscalingResolutionTest(unittest.TestCase):
             asyncio.run(lc.init_pool())
             asyncio.run(lc.init_pool())
             self.assertEqual(e.client.postgres.list_endpoints.call_count, 1)
-            self.assertEqual(lc._fetch_db_credential.await_count, 2)  # a fresh credential each time
 
-
-class RefreshTest(unittest.TestCase):
-    def _expired(self, e):
-        old = MagicMock()
-        old.close = AsyncMock()
-        lc._pool, lc._pool_created_at = old, 1.0  # long past the refresh interval
-        return old
-
-    def test_refresh_swaps_in_the_new_pool_then_closes_the_old_one(self):
-        with _Env({"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"},
-                  _client([_postgres_resource()])) as e:
-            old = self._expired(e)
-            asyncio.run(lc._refresh_pool_if_needed())
-            self.assertIsNot(lc._pool, old)
+    def test_a_failed_lookup_is_not_cached(self):
+        w = _client([_postgres_resource()], [_endpoint(EP, HOST)])
+        w.postgres.list_endpoints.side_effect = [RuntimeError("starting"), [_endpoint(EP, HOST)]]
+        with _Env({"LAKEBASE_HOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}, w):
+            asyncio.run(lc.init_pool())
+            self.assertIsNone(lc._pool)
+            asyncio.run(lc.init_pool())  # e.g. the next start: resolved again, now it works
             self.assertIsNotNone(lc._pool)
-            old.close.assert_awaited_once()
 
-    def test_a_failed_refresh_keeps_the_current_pool(self):
-        with _Env({"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"},
-                  _client([_postgres_resource()])) as e:
-            old = self._expired(e)
+    def test_pghost_holding_an_endpoint_name_is_not_used_as_the_host(self):
+        with _Env({"PGHOST": EP, "PGDATABASE": "d", "PGUSER": "u"}, _client([_postgres_resource()])) as e:
+            cred, pool = e.run()
+        self.assertEqual(cred.kwargs["endpoint_name"], EP)
+        self.assertEqual(pool.kwargs["host"], HOST)  # read from the endpoint
+
+
+class CredentialTest(unittest.TestCase):
+    ENV = {"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}
+
+    def test_the_pool_mints_a_credential_per_new_connection(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            _, pool = e.run()
+            self.assertIs(pool.kwargs["password"], lc._connection_password)
+            self.assertEqual(pool.kwargs["max_inactive_connection_lifetime"], 300)
+            self.assertEqual(asyncio.run(lc._connection_password()), "tok")
+            self.assertEqual(lc._fetch_db_credential.await_count, 1)  # still fresh: reused
+
+    def test_an_old_credential_is_replaced_for_new_connections(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            e.run()
+            lc._credential["minted_at"] -= lc.CREDENTIAL_MAX_AGE + 1
+            lc._fetch_db_credential.return_value = "tok2"
+            self.assertEqual(asyncio.run(lc._connection_password()), "tok2")
+
+    def test_a_failed_re_mint_keeps_the_current_credential(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            e.run()
+            lc._credential["minted_at"] -= lc.CREDENTIAL_MAX_AGE + 1
             lc._fetch_db_credential.return_value = None
-            asyncio.run(lc._refresh_pool_if_needed())
-            self.assertIs(lc._pool, old)  # history stays on; retried after REFRESH_RETRY_SECONDS
-            old.close.assert_not_awaited()
-            asyncio.run(lc._refresh_pool_if_needed())
-            self.assertEqual(lc._fetch_db_credential.await_count, 1)  # no retry within the minute
+            self.assertEqual(asyncio.run(lc._connection_password()), "tok")
+
+    def test_no_first_credential_means_no_pool(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            lc._fetch_db_credential.return_value = None
+            asyncio.run(lc.init_pool())
+            self.assertIsNone(lc._pool)
+            e.create_pool.assert_not_awaited()
 
 
 class ProvisionedTest(unittest.TestCase):
