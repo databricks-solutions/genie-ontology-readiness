@@ -162,9 +162,9 @@ def _endpoint_host(endpoint: str) -> str:
 def _autoscaling_endpoint(branch: str, host: str = "") -> str:
     """The compute endpoint of an Autoscaling branch to mint a credential for.
 
-    The endpoint whose host is the one the app connects to, else the read-write endpoint.
-    Never a read-only endpoint picked at random: history writes need read-write. Returns ""
-    (logged) when the branch has no such endpoint or the list fails."""
+    A read-write endpoint only (history writes need one): the one whose host is the one the
+    app connects to, else the first. Returns "" (logged) when the branch has none or the list
+    fails."""
     if not branch:
         return ""
     try:
@@ -178,10 +178,12 @@ def _autoscaling_endpoint(branch: str, host: str = "") -> str:
         kind = getattr(getattr(e, "status", None), "endpoint_type", None)
         return "READ_WRITE" in str(getattr(kind, "value", kind) or "")
 
-    for match in ((lambda e: host and _host_of(e) == host), _read_write):
-        for e in endpoints:
-            if e.name and match(e):
-                return e.name
+    read_write = [e for e in endpoints if e.name and _read_write(e)]
+    for e in read_write:
+        if host and _host_of(e) == host:
+            return e.name
+    if read_write:
+        return read_write[0].name
     logger.warning(f"The Lakebase branch has no read-write endpoint ({len(endpoints)} endpoint(s) listed)")
     return ""
 
@@ -410,6 +412,14 @@ async def init_pool() -> None:
     except Exception as e:
         logger.warning(f"Failed to initialize Lakebase pool (will fall back to SQL Warehouse): {e}")
         _pool = None
+    if _pool is None:
+        _forget_target()
+
+
+def _forget_target() -> None:
+    """Drop the cached target and resource, so the next start resolves them again."""
+    global _TARGET, _RESOURCE
+    _TARGET = _RESOURCE = None
 
 
 async def close_pool() -> None:

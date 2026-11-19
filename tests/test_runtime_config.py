@@ -90,37 +90,37 @@ def test_env_version_wins_over_version_file(monkeypatch):
 
 def test_lakebase_database_read_from_resource_when_env_empty(monkeypatch):
     monkeypatch.setattr(lakebase_client, "_lakebase_resource",
-                        lambda: {"instance": "inst-x", "database": "db-from-resource"})
+                        lambda: {"instance": "inst-x", "database": "db-from-resource", "branch": "", "database_resource": ""})
     monkeypatch.delenv("LAKEBASE_DATABASE", raising=False)
     monkeypatch.delenv("PGDATABASE", raising=False)
     monkeypatch.setenv("LAKEBASE_HOST", "h.example")
     monkeypatch.delenv("LAKEBASE_USER", raising=False)
     monkeypatch.delenv("PGUSER", raising=False)
     monkeypatch.setenv("DATABRICKS_CLIENT_ID", "app-sp")
-    cfg = lakebase_client._get_connection_config()
+    cfg = lakebase_client._resolve_target()
     assert cfg["database"] == "db-from-resource"
     assert cfg["user"] == "app-sp"
 
 
 def test_lakebase_database_env_wins_over_resource(monkeypatch):
     monkeypatch.setattr(lakebase_client, "_lakebase_resource",
-                        lambda: {"instance": "", "database": "db-from-resource"})
+                        lambda: {"instance": "", "database": "db-from-resource", "branch": "", "database_resource": ""})
     monkeypatch.setenv("LAKEBASE_DATABASE", "explicit_db")
-    assert lakebase_client._get_connection_config()["database"] == "explicit_db"
+    assert lakebase_client._resolve_target()["database"] == "explicit_db"
 
 
 def test_lakebase_database_defaults_without_resource(monkeypatch):
-    monkeypatch.setattr(lakebase_client, "_lakebase_resource", lambda: {"instance": "", "database": ""})
+    monkeypatch.setattr(lakebase_client, "_lakebase_resource", lambda: {"instance": "", "database": "", "branch": "", "database_resource": ""})
     monkeypatch.delenv("LAKEBASE_DATABASE", raising=False)
     monkeypatch.delenv("PGDATABASE", raising=False)
-    assert lakebase_client._get_connection_config()["database"] == "ontology_readiness"
+    assert lakebase_client._resolve_target()["database"] == "ontology_readiness"
 
 
 def test_lakebase_resource_read_failure_is_not_fatal(monkeypatch):
     """Outside a Databricks App there is no resource read at all."""
     monkeypatch.setattr(lakebase_client, "_RESOURCE", None)
     monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
-    assert lakebase_client._lakebase_resource() == {"instance": "", "database": ""}
+    assert lakebase_client._lakebase_resource() == {"instance": "", "database": "", "branch": "", "database_resource": ""}
     monkeypatch.setattr(lakebase_client, "_RESOURCE", None)
     monkeypatch.setenv("DATABRICKS_APP_NAME", "x")
 
@@ -130,5 +130,5 @@ def test_lakebase_resource_read_failure_is_not_fatal(monkeypatch):
             raise RuntimeError("no sdk")
     import server.config as cfg
     monkeypatch.setattr(cfg, "_get_workspace_client", lambda: Boom())
-    assert lakebase_client._lakebase_resource() == {"instance": "", "database": ""}
+    assert lakebase_client._lakebase_resource() == {"instance": "", "database": "", "branch": "", "database_resource": ""}
     monkeypatch.setattr(lakebase_client, "_RESOURCE", None)

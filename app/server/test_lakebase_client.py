@@ -122,8 +122,10 @@ class AutoscalingEndpointChoiceTest(unittest.TestCase):
         with patch("server.config._get_workspace_client", return_value=w):
             return lc._autoscaling_endpoint("projects/gor/branches/production", host)
 
-    def test_the_host_we_connect_to_wins_even_if_read_only(self):
-        self.assertEqual(self._pick([self.RW, self.RO], host="ro.host"), self.RO.name)
+    def test_a_host_match_counts_only_for_a_read_write_endpoint(self):
+        self.assertEqual(self._pick([self.RW, self.RO], host="ro.host"), self.RW.name)
+        rw2 = _endpoint("projects/gor/branches/production/endpoints/rw2", "rw2.host")
+        self.assertEqual(self._pick([self.RW, rw2], host="rw2.host"), rw2.name)
 
     def test_read_write_beats_list_order(self):
         self.assertEqual(self._pick([self.RO, self.RW], host="other.host"), self.RW.name)
@@ -157,6 +159,21 @@ class AutoscalingResolutionTest(unittest.TestCase):
             asyncio.run(lc.init_pool())
             asyncio.run(lc.init_pool())
             self.assertEqual(e.client.postgres.list_endpoints.call_count, 1)
+
+    def test_an_autoscaling_resource_without_an_endpoint_gets_no_instance_credential(self):
+        with _Env({"LAKEBASE_HOST": HOST, "LAKEBASE_INSTANCE_NAME": "ontos-lakebase", "PGDATABASE": "d",
+                   "PGUSER": "u"}, _client([_postgres_resource()], [])):
+            asyncio.run(lc.init_pool())
+            lc._fetch_db_credential.assert_not_awaited()  # never an instance credential
+            self.assertIsNone(lc._pool)
+
+    def test_a_failed_start_forgets_the_target(self):
+        with _Env({"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"},
+                  _client([_postgres_resource()])) as e:
+            e.create_pool.side_effect = OSError("Name or service not known")
+            asyncio.run(lc.init_pool())
+            self.assertIsNone(lc._pool)
+            self.assertIsNone(lc._TARGET)
 
     def test_a_failed_lookup_is_not_cached(self):
         w = _client([_postgres_resource()], [_endpoint(EP, HOST)])
