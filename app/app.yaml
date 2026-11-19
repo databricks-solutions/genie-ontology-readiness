@@ -1,8 +1,7 @@
 # App configuration for Databricks Apps. This file is committed and holds no workspace values.
 #
-# A Git deploy in the Apps UI uses it as-is. The notebook installer and the CLI script
-# write their values into a copy of it (the staged or published copy). They never change
-# this file in the repo.
+# A Git deploy in the Apps UI uses it as-is. The CLI script (scripts/post_deploy.py) writes
+# its values into a copy of it (the published copy). It never changes this file in the repo.
 #
 # Resource keys: the valueFrom names below must match the resource keys you add in the Apps
 # UI ("+ Add resource"): sql-warehouse (SQL warehouse) and lakebase-db (Lakebase database).

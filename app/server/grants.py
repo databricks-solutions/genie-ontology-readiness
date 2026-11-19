@@ -1,6 +1,6 @@
 """GRANT statements the app service principal needs for the assessment.
 
-Mirrors scripts/setup_app_permissions.py and notebooks/install.py. Pure: it builds
+Mirrors scripts/setup_app_permissions.py. Pure: it builds
 the SQL text only. An admin runs it once, in the SQL editor, with the app's
 service principal id (shown by GET /api/setup/grants).
 """

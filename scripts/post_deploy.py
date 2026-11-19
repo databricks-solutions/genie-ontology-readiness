@@ -450,8 +450,7 @@ def stage_source():
     """Copy app/ (with the built frontend and the rendered app.yaml) to your own
     staging folder and sync it there. Returns the workspace path.
 
-    The folder is under your home directory, as the notebook installer uses. The
-    deployed app's source folder may belong to whoever first deployed it, so an
+    The folder is under your home directory. The deployed app's source folder may belong to whoever first deployed it, so an
     upgrade by someone else cannot write there."""
     me = cli_json("current-user", "me")
     user = me.get("userName", "") if isinstance(me, dict) else ""

@@ -1,13 +1,13 @@
 """Reuse the deployed app's settings when a customer redeploys (stdlib only).
 
-Shared by scripts/post_deploy.py and notebooks/install.py. Nothing here does I/O:
+Used by scripts/post_deploy.py. Nothing here does I/O:
 the callers read the deployed app (apps get, workspace export) and pass the
 results in. That keeps every decision in this file testable without a workspace.
 
 Each setting is resolved in this order:
 
     you set        a value given for this run: an env var that is SET (even when
-                   empty), or a notebook widget that is not empty
+                   empty)
     deployed app   the value in the deployed app's app.yaml, or in its resources
     default        the value in the new release's app/app.yaml
 
@@ -20,12 +20,8 @@ Keys that the new template has but the deployed app.yaml does not keep the
 template default. That is how new secure defaults reach an upgraded app.
 """
 
-import json
 import re
-import time
-import urllib.request
 from collections import namedtuple
-from datetime import datetime, timezone
 
 Setting = namedtuple("Setting", "value source")
 
@@ -105,6 +101,10 @@ def read_resources(app):
         name = r.get("name")
         if name == WAREHOUSE_RESOURCE and (r.get("sql_warehouse") or {}).get("id"):
             out["WAREHOUSE_ID"] = str(r["sql_warehouse"]["id"])
+        elif name == LAKEBASE_RESOURCE and r.get("postgres"):
+            # Lakebase Autoscaling (the default for a new database). Not a setting this script
+            # can manage: find_problems stops before any change (see AUTOSCALING_STOP).
+            out["LAKEBASE_BRANCH"] = (r.get("postgres") or {}).get("branch") or ""
         elif name == LAKEBASE_RESOURCE:
             db = r.get("database") or {}
             out["LAKEBASE_INSTANCE_NAME"] = db.get("instance_name") or ""
@@ -119,11 +119,18 @@ def read_live(app, read_text):
     read. It is called only when the app has an active deployment."""
     if not app:
         return {"exists": False, "has_deployment": False, "yml_readable": True,
-                "env": {}, "resources": {}, "sp": "", "source_path": ""}
+                "env": {}, "resources": {}, "sp": "", "source_path": "", "git": False}
     deployment = app.get("active_deployment")
     has_deployment = bool(deployment)
     env, readable = {}, True
-    if has_deployment:
+    git = bool(deployment and deployment.get("git_source") and not deployment.get("source_code_path"))
+    if git:
+        # Deployed from Git (the Apps UI path): it runs the committed app.yaml of that commit,
+        # so its settings are the release defaults plus its resources. A deployment sent with
+        # custom env_vars is the exception: the API returns their names only, so the values
+        # are unknown.
+        readable = not deployment.get("env_vars")
+    elif has_deployment:
         path = (deployment.get("source_code_path") or "").rstrip("/")
         text = None
         if path:  # app.yaml is current; app.yml is what releases before the Git path deployed
@@ -135,7 +142,8 @@ def read_live(app, read_text):
     return {"exists": True, "has_deployment": has_deployment, "yml_readable": readable,
             "env": env, "resources": read_resources(app),
             "sp": app.get("service_principal_client_id") or "",
-            "source_path": (deployment or {}).get("source_code_path") or ""}
+            "source_path": (deployment or {}).get("source_code_path") or "",
+            "git": git}
 
 
 def choose_mode(app_exists, infra):
@@ -218,13 +226,30 @@ def _lakebase_problems(values, live_env, live_resources):
     return problems
 
 
+AUTOSCALING_STOP = (
+    "The app's lakebase-db resource is a Lakebase Autoscaling database. This script manages "
+    "Provisioned Lakebase only, and an update could detach the app's history. Upgrade this app "
+    "in the Apps UI instead: Deploy, Deploy using a different source, From Git (README: "
+    "Upgrade to a new release)."
+)
+
+
 def find_problems(values, live, *, reset=False):
     """Return the plain-text reasons to stop before changing anything. Empty = go ahead.
 
     With reset=True the deployed settings were ignored on purpose, so the checks that
-    compare against them are skipped."""
+    compare against them are skipped. An Autoscaling lakebase-db always stops: resetting
+    would detach the history."""
+    if "LAKEBASE_BRANCH" in (live.get("resources") or {}):
+        return [AUTOSCALING_STOP]
     if reset:
         return []
+    if live.get("git") and not live.get("yml_readable"):
+        return [
+            "The app is deployed from Git with custom settings (env_vars), and the API does not "
+            "return their values, so its settings are unknown. Set the values you want for this "
+            "run, and set RESET_SETTINGS=true to deploy them."
+        ]
     if live.get("has_deployment") and not live.get("yml_readable"):
         # The deployed settings are unknown, so no comparison against them is meaningful.
         return [
@@ -284,158 +309,3 @@ def render(template_text, values):
         if n == 0:
             missing.append(name)
     return text, missing
-
-
-WIDGET_KEYS = (
-    "app_name", "release", "staging_folder", "warehouse_id", "assess_catalogs", "genie_space_id",
-    "brand_name", "force_sp", "lakebase_instance_name", "lakebase_database", "reset_settings",
-)
-REPO_OWNER_REPO = "databricks-solutions/genie-ontology-readiness"
-LATEST_RELEASE_URL = f"https://api.github.com/repos/{REPO_OWNER_REPO}/releases/latest"
-_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_IDENT = re.compile(r"[a-z_][a-z0-9_]*")
-
-
-def validate_widgets(widgets):
-    """Return plain-text reasons why the notebook widgets are not valid. Empty = valid."""
-    problems = []
-    if not re.fullmatch(r"[a-z0-9-]{2,30}", widgets.get("app_name", "")):
-        problems.append("app_name must be 2-30 characters: lowercase letters, numbers and dashes.")
-    if widgets.get("force_sp", "") not in ("", "true", "false"):
-        problems.append("force_sp must be true, false, or empty (reuse the deployed value).")
-    release = widgets.get("release", "latest")
-    if release not in ("latest", "current") and not _TAG.fullmatch(release):
-        problems.append("release must be latest, current, or a release tag such as v1.3.0.")
-    staging = widgets.get("staging_folder", "")
-    if staging and not staging.startswith("/Workspace/"):
-        problems.append("staging_folder must start with /Workspace/ (or be empty).")
-    if widgets.get("reset_settings", "false") not in ("false", "true"):
-        problems.append("reset_settings must be false or true.")
-    database = widgets.get("lakebase_database", "")
-    if database and not _IDENT.fullmatch(database):
-        problems.append("lakebase_database must be a lowercase Postgres name (letters, digits, underscore).")
-    return problems
-
-
-def explicit_from_widgets(widgets):
-    """Turn notebook widget values into the `explicit` settings for plan().
-
-    An empty widget is not explicit: it means "reuse the deployed value". So only
-    non-empty widgets are returned. Naming a Lakebase instance turns history on."""
-    mapping = {
-        "warehouse_id": "WAREHOUSE_ID",
-        "assess_catalogs": "ASSESS_CATALOGS",
-        "genie_space_id": "GENIE_SPACE_ID",
-        "brand_name": "BRAND_NAME",
-        "force_sp": "FORCE_SP",
-        "lakebase_instance_name": "LAKEBASE_INSTANCE_NAME",
-        "lakebase_database": "LAKEBASE_DATABASE",
-    }
-    out = {}
-    for widget, key in mapping.items():
-        value = (widgets.get(widget) or "").strip()
-        if value:
-            out[key] = value
-    if out.get("LAKEBASE_INSTANCE_NAME"):
-        out["USE_LAKEBASE"] = "true"
-    return out
-
-
-# --- release choice, Git folder move, deploy check, marker, exit payload ------------
-
-def fetch_json(url, opener=urllib.request.urlopen, retries=3, timeout=10, sleep=time.sleep):
-    """GET a JSON document. Retries with backoff (1s, 2s, 4s). Raises the last error."""
-    last = None
-    for attempt in range(retries + 1):
-        try:
-            with opener(urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"}),
-                        timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as e:  # network or HTTP error: retry, then report
-            last = e
-            if attempt < retries:
-                sleep(2 ** attempt)
-    raise last
-
-
-def latest_release_tag(fetch=fetch_json):
-    """Return (tag, error). tag is None when GitHub cannot be reached."""
-    try:
-        tag = (fetch(LATEST_RELEASE_URL) or {}).get("tag_name", "")
-        return (tag, "") if tag else (None, "GitHub returned no release tag")
-    except Exception as e:
-        return None, type(e).__name__  # class name only: no raw error text is shown
-
-
-def decide_release(choice, latest_tag, latest_error=""):
-    """Return {"release": "current" | <tag>, "warning": str | None}.
-
-    latest: the latest release tag. If GitHub cannot be reached, deploy the current
-    Git folder state and warn. current: deploy what the Git folder has now. Any
-    other value is a tag, used as given."""
-    if choice == "current":
-        return {"release": "current", "warning": None}
-    if choice == "latest":
-        if latest_tag:
-            return {"release": latest_tag, "warning": None}
-        return {"release": "current",
-                "warning": f"Could not reach GitHub to find the latest release ({latest_error}). "
-                           "Deploying the current Git folder state instead."}
-    return {"release": choice, "warning": None}
-
-
-def tag_commit_sha(tag, fetch=fetch_json):
-    """Return the commit sha a release tag points to (follows an annotated tag), or None."""
-    try:
-        ref = fetch(f"https://api.github.com/repos/{REPO_OWNER_REPO}/git/ref/tags/{tag}")
-        obj = ref.get("object", {})
-        if obj.get("type") == "tag":
-            obj = fetch(f"https://api.github.com/repos/{REPO_OWNER_REPO}/git/tags/{obj['sha']}").get("object", {})
-        return obj.get("sha") or None
-    except Exception:
-        return None
-
-
-def needs_move(branch, head_sha, tag, tag_sha):
-    """True when the Git folder is not at the wanted tag. Matches on the tag name or the commit."""
-    if branch == tag:
-        return False
-    if tag_sha and head_sha == tag_sha:
-        return False
-    return True
-
-
-def moved_payload(tag):
-    """The exit value when the Git folder was moved to `tag` and the notebook must run again."""
-    return {"status": "moved", "release": tag}
-
-
-def moved_message(tag):
-    return f"The Git folder is now at {tag}. Click Run all again to deploy it."
-
-
-def app_ready(app_status, compute_status):
-    """True when the app is RUNNING and its compute is ACTIVE (both as plain strings)."""
-    return app_status == "RUNNING" and compute_status == "ACTIVE"
-
-
-def deployment_succeeded(state):
-    return state == "SUCCEEDED"
-
-
-def version_marker(git_sha, release, now=None):
-    """The JSON text written to <staging_folder>/.deployed_version."""
-    when = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return json.dumps({"git_sha": git_sha, "release": release, "deployed_at": when}, sort_keys=True)
-
-
-def exit_payload(app_name, url, release, git_sha, staging_folder, values):
-    """The notebook exit value for a finished deploy. Holds no secrets."""
-    return {
-        "app_name": app_name,
-        "url": url,
-        "release": release,
-        "git_sha": git_sha,
-        "staging_folder": staging_folder,
-        "settings": {key: {"value": values[key].value, "source": values[key].source} for key in KEYS},
-    }

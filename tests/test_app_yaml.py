@@ -69,7 +69,3 @@ def test_package_json_builds_the_frontend_into_the_path_the_server_serves():
     assert 'Path(__file__).parent / "frontend" / "dist"' in app_py
     assert (ROOT / "app" / "frontend" / "package.json").exists()
 
-
-def test_no_root_package_json_is_written_by_the_notebook():
-    nb = (ROOT / "notebooks" / "install.py").read_text()
-    assert 'write_text(\n    \'{' not in nb and 'Path(STAGE_DIR, "package.json")' not in nb
