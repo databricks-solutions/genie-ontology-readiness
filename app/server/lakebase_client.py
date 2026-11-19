@@ -100,29 +100,68 @@ _RESOURCE: dict | None = None
 
 
 def _lakebase_resource() -> dict:
-    """The instance and database of this app's own ``lakebase-db`` resource (read once).
+    """This app's own ``lakebase-db`` resource (read once).
 
-    A Git deploy in the Apps UI sets no database or instance name, so they come from
-    the attached resource. Empty when not in a Databricks App or when the read fails.
-    Read as the app service principal. Holds no secret.
+    A Git deploy in the Apps UI sets no database, instance or endpoint name, so they come
+    from the attached resource. Two kinds:
+
+    - Provisioned (``database``): ``instance`` and ``database`` names.
+    - Autoscaling (``postgres``, the default for a new Lakebase database): ``branch``
+      (``projects/<p>/branches/<b>``). Its database name comes from PGDATABASE, which Apps
+      injects for both kinds; the credential needs the branch's read-write endpoint.
+
+    Empty when not in a Databricks App or when the read fails. Read as the app service
+    principal. Holds no secret.
     """
     global _RESOURCE
     if _RESOURCE is None:
-        found = {"instance": "", "database": ""}
+        found = {"instance": "", "database": "", "branch": ""}
         app_name = os.environ.get("DATABRICKS_APP_NAME", "")
         if app_name:
             try:
                 from server.config import _get_workspace_client
                 app = _get_workspace_client().apps.get(app_name)
                 for resource in (app.resources or []):
-                    if resource.name == "lakebase-db" and resource.database:
-                        found = {"instance": resource.database.instance_name or "",
+                    if resource.name != "lakebase-db":
+                        continue
+                    if resource.database:
+                        found = {**found, "instance": resource.database.instance_name or "",
                                  "database": resource.database.database_name or ""}
+                    elif getattr(resource, "postgres", None):
+                        found = {**found, "branch": resource.postgres.branch or ""}
             except Exception as e:
                 logger.warning(f"Could not read the lakebase-db resource ({type(e).__name__}); "
                                "using the app settings and defaults")
         _RESOURCE = found
     return _RESOURCE
+
+
+def _autoscaling_endpoint(branch: str, host: str = "") -> str:
+    """The compute endpoint of an Autoscaling branch to mint a credential for.
+
+    Prefers the endpoint whose host is the one the app connects to, then the read-write
+    endpoint. Returns "" when the branch has none or the list fails (logged)."""
+    if not branch:
+        return ""
+    try:
+        from server.config import _get_workspace_client
+        endpoints = list(_get_workspace_client().postgres.list_endpoints(parent=branch))
+    except Exception as e:
+        logger.warning(f"Could not list the endpoints of the Lakebase branch ({type(e).__name__})")
+        return ""
+
+    def _host(e):
+        return getattr(getattr(getattr(e, "status", None), "hosts", None), "host", "") or ""
+
+    def _read_write(e):
+        kind = getattr(getattr(e, "status", None), "endpoint_type", None)
+        return "READ_WRITE" in str(getattr(kind, "value", kind) or "")
+
+    for match in ((lambda e: host and _host(e) == host), _read_write, (lambda e: True)):
+        for e in endpoints:
+            if e.name and match(e):
+                return e.name
+    return ""
 
 
 def _get_connection_config() -> dict:
@@ -211,12 +250,20 @@ async def init_pool() -> None:
         # retain Provisioned instance credentials for existing deployments.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
             endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
+            endpoint_source = "app setting" if endpoint else ""
             from server.runtime_config import resolve_instance
             instance, instance_source = resolve_instance(
                 os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
                 _lakebase_resource()["instance"] if not os.environ.get("LAKEBASE_INSTANCE_NAME") else "",
             )
-            logger.info(f"Lakebase instance from {instance_source}")
+            if not endpoint and not instance and _lakebase_resource()["branch"]:
+                # Autoscaling resource (the default for a new Lakebase database).
+                endpoint = _autoscaling_endpoint(_lakebase_resource()["branch"], config["host"])
+                endpoint_source = "lakebase-db resource (Autoscaling branch)" if endpoint else ""
+            if endpoint:
+                logger.info(f"Lakebase Autoscaling endpoint from {endpoint_source}")
+            else:
+                logger.info(f"Lakebase instance from {instance_source}")
             if endpoint or instance:
                 password = await _fetch_db_credential(
                     instance_name=instance,
@@ -224,8 +271,9 @@ async def init_pool() -> None:
                 ) or ""
             else:
                 logger.warning(
-                    "Running in Databricks App but neither LAKEBASE_ENDPOINT_NAME "
-                    "nor LAKEBASE_INSTANCE_NAME is set; no Lakebase credential available"
+                    "Running in Databricks App but no Lakebase endpoint or instance was found "
+                    "(LAKEBASE_ENDPOINT_NAME / LAKEBASE_INSTANCE_NAME empty, and the lakebase-db "
+                    "resource gave neither); no Lakebase credential available"
                 )
 
         # If still no password, log and skip pool creation
