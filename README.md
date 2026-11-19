@@ -52,8 +52,12 @@ and [Add resources to a Databricks app](https://docs.databricks.com/aws/en/dev-t
 
 ### First install
 
-1. **(Optional) Create a Lakebase database for history.** Use an existing Lakebase instance, and
-   create a database for this app. Skip this step to run without history.
+1. **(Optional) Create a Lakebase database for history.** Either kind works:
+   - **Autoscaling** (the default for a new Lakebase database): a project with a branch (for
+     example `production`) and a database. The project's default database works.
+   - **Provisioned**: an existing Lakebase instance, with a database for this app.
+
+   Skip this step to run without history.
 2. In the workspace, go to **Apps** → **+ Create app** → **Create a custom app**. Enter a name, for
    example `genie-ontology-readiness`. Under **Configure Git**, enter the repo URL
    `https://github.com/databricks-solutions/genie-ontology-readiness.git`. For **Git reference**,
@@ -63,9 +67,13 @@ and [Add resources to a Databricks app](https://docs.databricks.com/aws/en/dev-t
 3. Click **+ Add resource** and add these:
    - **SQL warehouse**: key `sql-warehouse`, permission **Can use**. Choose your warehouse.
    - **Lakebase database** (only if you did step 1): key `lakebase-db`, permission **Can connect
-     and create**. Choose the instance and database from step 1.
+     and create**. Choose the project, branch and database (Autoscaling), or the instance and
+     database (Provisioned), from step 1. No other setting is needed for either kind.
 4. Click **Create**. Then click **Deploy**, select **From Git**, and set **Source code path** to
    `app`. Click **Deploy**. Wait until the deployment finishes. Then check that the app status shows **Running**. A deployment can succeed while the app fails to start, so do not stop at "succeeded".
+   If you added a Lakebase database, open the app: when it can't reach the database, the Assess
+   page says **History is off**. Then check the `lakebase-db` resource and search the app logs
+   for "Lakebase".
 5. Run the GRANT SQL below once, as a user who can grant on the `system` schemas and on your
    catalogs. Replace `<app-service-principal-id>` with the app's service principal id. The app
    shows this id, and the full SQL, at `/api/setup/grants`. Without these grants, some signals
@@ -145,6 +153,11 @@ by a deploy from Git.
 
 Use this path to set the catalogs, the brand, the Genie space, or the reset option at deploy time,
 or to run the install as a job. It is optional. Steps:
+
+> [!NOTE]
+> The notebook sets up history on a **Provisioned** Lakebase instance only. For an **Autoscaling**
+> Lakebase database (the default for a new one), use the [First install](#first-install) steps in the
+> Apps UI.
 
 1. In the workspace, click **Create** → **Git folder**. Paste the repo URL. The default branch is
    fine. See [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).

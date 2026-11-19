@@ -40,6 +40,8 @@ import { downloadAllZip } from '../utils/exportAll';
 import { defaultTrendScope, resolveTrendScope, scopeDetail, scopeLabel, scopeOptions, trendRuns } from '../utils/scope';
 import PillarDetail from './PillarDetail';
 import { ExcludedPillarsNote, NOT_SCORED_EXPLAINER } from './NotScored';
+import { historyStatus } from '../utils/history';
+import { HistoryOffNotice } from './HistoryOffNotice';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
@@ -542,7 +544,11 @@ export default function Scorecard({
             <span className="text-xs text-ink-600">Running… {completedCount}/{totalPillars}</span>
           </div>
         )}
-        {history.length === 0 && !running ? (
+        {historyStatus(config) === 'unavailable' && !running ? (
+          <p className="text-xs text-amber-700 px-2 py-2" data-testid="history-off-sidebar">
+            History is off: the app couldn&apos;t connect to its Lakebase database, so runs aren&apos;t saved.
+          </p>
+        ) : history.length === 0 && !running ? (
           <p className="text-xs text-ink-400 px-2 py-2">No assessments yet. Run one to get started.</p>
         ) : (
           <div className="space-y-1 max-h-[calc(100vh-220px)] overflow-y-auto">
@@ -623,19 +629,20 @@ export default function Scorecard({
         <p className="text-xs text-ink-400 mt-2.5">
           It's read-only and degrades gracefully — any pillar the service principal can't read is
           marked "not available" rather than failing the run.
-          {config.lakebase_enabled && ' Every run is saved to your history.'}
+          {historyStatus(config) === 'saved' && ' Every run is saved to your history.'}
         </p>
-        {!config.lakebase_enabled && (
+        {historyStatus(config) === 'not_attached' && (
           <p className="mt-2.5 flex items-start gap-1.5 rounded-md bg-amber-50 border border-amber-200 px-2.5 py-2 text-xs text-amber-800">
             <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-500" />
             <span>
               <span className="font-medium">Assessments aren't saved on this deployment.</span> No
               Lakebase database is attached, so results and generated plans live only in this browser
-              session and are lost on refresh. Lakebase is optional — attach one at deploy time
-              (<code className="text-[11px]">USE_LAKEBASE=true</code>) to persist history per user.
+              session and are lost on refresh. Lakebase is optional — add a Lakebase database to the app
+              as the <code className="text-[11px]">lakebase-db</code> resource to persist history per user.
             </span>
           </p>
         )}
+        {historyStatus(config) === 'unavailable' && <HistoryOffNotice />}
       </div>
 
       <div className="mt-6 flex flex-col items-center gap-2">
