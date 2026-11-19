@@ -131,6 +131,52 @@ def test_read_live_unreadable_app_yml_is_flagged():
     assert live["has_deployment"] and not live["yml_readable"] and live["env"] == {}
 
 
+def _git_app(env_vars=None, lakebase=None):
+    deployment = {"git_source": {"commit": "abc", "source_code_path": "app"}, "source_code_path": None}
+    if env_vars is not None:
+        deployment["env_vars"] = env_vars
+    resources = [{"name": "sql-warehouse", "sql_warehouse": {"id": "wh-1"}}] + ([lakebase] if lakebase else [])
+    return {"name": "x", "service_principal_client_id": "sp", "active_deployment": deployment,
+            "resources": resources}
+
+
+def test_read_live_git_deploy_uses_release_defaults_and_resources():
+    # The README path: deployed from Git with no settings. Before, this stopped every run.
+    live = ds.read_live(_git_app(), lambda p: pytest.fail("a Git deploy has no workspace file"))
+    assert live["git"] and live["yml_readable"] and live["env"] == {}
+    assert live["resources"] == {"WAREHOUSE_ID": "wh-1"}
+    assert ds.find_problems(_values(live=live)[0], live) == []
+
+
+def test_read_live_git_deploy_with_custom_env_vars_stops():
+    live = ds.read_live(_git_app(env_vars=[{"name": "BRAND_NAME"}]), lambda p: None)
+    assert live["git"] and not live["yml_readable"]
+    problems = ds.find_problems(_values(live=live)[0], live)
+    assert len(problems) == 1 and "env_vars" in problems[0]
+    assert "RESET_SETTINGS" not in problems[0]  # a reset would detach a Provisioned history database
+
+
+def test_git_detection_does_not_need_an_empty_source_path():
+    app = _git_app()
+    app["active_deployment"]["source_code_path"] = "/Workspace/some/snapshot"
+    live = ds.read_live(app, lambda p: None)
+    assert live["git"] and live["yml_readable"]
+
+
+def test_an_empty_postgres_object_still_counts_as_autoscaling():
+    live = ds.read_live(_git_app(lakebase={"name": "lakebase-db", "postgres": {}}), lambda p: None)
+    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_lakebase_always_stops_before_any_change():
+    lakebase = {"name": "lakebase-db", "postgres": {"branch": "projects/p/branches/production",
+                                                    "database": "projects/p/branches/production/databases/d"}}
+    live = ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
+    assert live["autoscaling"] and "LAKEBASE_INSTANCE_NAME" not in live["resources"]
+    for reset in (False, True):
+        assert ds.find_problems(_values(live=live)[0], live, reset=reset) == [ds.AUTOSCALING_STOP]
+
+
 # --- precedence ----------------------------------------------------------------
 
 def test_precedence_you_set_beats_deployed_beats_default():
@@ -429,210 +475,12 @@ def test_upgrade_updates_warehouse_when_it_changed(monkeypatch):
                         "lakebase": {"instance": "shared-inst", "database": "history_db"}}]
 
 
-# --- notebook widgets ----------------------------------------------------------
-
-def _widgets(**over):
-    base = {"app_name": "genie-ontology-readiness", "warehouse_id": "", "assess_catalogs": "",
-            "genie_space_id": "", "brand_name": "", "force_sp": "", "lakebase_instance_name": "",
-            "lakebase_database": "", "reset_settings": "false"}
-    base.update(over)
-    return base
-
-
-def test_empty_widgets_are_not_explicit():
-    assert ds.explicit_from_widgets(_widgets()) == {}
-
-
-def test_non_empty_widgets_map_to_setting_keys_and_strip():
-    out = ds.explicit_from_widgets(_widgets(warehouse_id=" wh-1 ", brand_name="Acme", force_sp="false"))
-    assert out == {"WAREHOUSE_ID": "wh-1", "BRAND_NAME": "Acme", "FORCE_SP": "false"}
-
-
-def test_naming_a_lakebase_instance_turns_history_on():
-    out = ds.explicit_from_widgets(_widgets(lakebase_instance_name="inst", lakebase_database="db"))
-    assert out == {"LAKEBASE_INSTANCE_NAME": "inst", "LAKEBASE_DATABASE": "db", "USE_LAKEBASE": "true"}
-
-
-def test_widgets_plus_deployed_app_keep_settings_when_empty():
-    """Upgrade with empty widgets: every value comes from the deployed app, nothing is turned off."""
-    values, problems = ds.plan(ds.explicit_from_widgets(_widgets()), _live(), TEMPLATE,
-                               forced={"GOR_VERSION": "2.0.0"})
-    assert problems == []
-    assert values["USE_LAKEBASE"].value == "true"
-    assert values["LAKEBASE_INSTANCE_NAME"] == ("shared-inst", ds.SOURCE_DEPLOYED)
-    assert values["ASSESS_CATALOGS"] == ("sales,finance", ds.SOURCE_DEPLOYED)
-
-
-def test_widget_database_change_stops_with_no_change():
-    values, problems = ds.plan(ds.explicit_from_widgets(_widgets(lakebase_database="fresh")), _live(), TEMPLATE)
-    assert any("Lakebase database" in p for p in problems)
-
-
-def test_reset_widget_ignores_deployed_values():
-    values, problems = ds.plan(ds.explicit_from_widgets(_widgets()), _live(), TEMPLATE, reset=True)
-    assert problems == []
-    assert values["ASSESS_CATALOGS"].source == ds.SOURCE_DEFAULT
-
-
-def test_validate_widgets_accepts_defaults():
-    assert ds.validate_widgets(_widgets()) == []
-
-
-def test_validate_widgets_reports_each_bad_value():
-    bad = ds.validate_widgets(_widgets(app_name="A", force_sp="yes", reset_settings="ture",
-                                       lakebase_database="1db; drop"))
-    assert len(bad) == 4
-
-
 def test_unreadable_folder_message_names_the_path():
     _, problems = _values(live=_live(readable=False))
     assert "/Workspace/Users/a@x/.genie/app" in problems[0]
 
 
-# --- release choice, Git folder move, deploy check, marker, exit payload -----------
-
-import json as _json  # noqa: E402
-import urllib.error  # noqa: E402
-from datetime import datetime as _dt, timezone as _tz  # noqa: E402
-
-
-def _fake_fetch(table):
-    """Return a fetch(url) that serves `table` (url -> dict or Exception) and records calls."""
-    calls = []
-
-    def fetch(url):
-        calls.append(url)
-        value = table[url]
-        if isinstance(value, Exception):
-            raise value
-        return value
-    fetch.calls = calls
-    return fetch
-
-
-def test_latest_release_tag_reads_tag_name():
-    fetch = _fake_fetch({ds.LATEST_RELEASE_URL: {"tag_name": "v1.3.0"}})
-    assert ds.latest_release_tag(fetch) == ("v1.3.0", "")
-
-
-def test_latest_release_tag_reports_unreachable_github():
-    fetch = _fake_fetch({ds.LATEST_RELEASE_URL: urllib.error.URLError("no route")})
-    tag, err = ds.latest_release_tag(fetch)
-    assert tag is None and err == "URLError"
-
-
-def test_fetch_json_retries_then_succeeds():
-    attempts = []
-    sleeps = []
-
-    def opener(req, timeout):
-        attempts.append(timeout)
-        if len(attempts) < 3:
-            raise urllib.error.URLError("temporary")
-        return _Resp(b'{"tag_name": "v2"}')
-    out = ds.fetch_json("https://x", opener=opener, retries=3, timeout=5, sleep=sleeps.append)
-    assert out == {"tag_name": "v2"}
-    assert len(attempts) == 3 and sleeps == [1, 2]
-
-
-def test_fetch_json_gives_up_after_retries():
-    def opener(req, timeout):
-        raise urllib.error.URLError("down")
-    with pytest.raises(urllib.error.URLError):
-        ds.fetch_json("https://x", opener=opener, retries=2, sleep=lambda s: None)
-
-
-class _Resp:
-    def __init__(self, body):
-        self._body = body
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
-def test_decide_release_latest_uses_tag():
-    assert ds.decide_release("latest", "v1.3.0") == {"release": "v1.3.0", "warning": None}
-
-
-def test_decide_release_latest_without_github_warns_and_uses_current():
-    out = ds.decide_release("latest", None, "URLError: down")
-    assert out["release"] == "current" and "Could not reach GitHub" in out["warning"]
-
-
-def test_decide_release_current_and_explicit_tag():
-    assert ds.decide_release("current", None) == {"release": "current", "warning": None}
-    assert ds.decide_release("v1.2.0", None) == {"release": "v1.2.0", "warning": None}
-
-
-def test_tag_commit_sha_follows_annotated_tag():
-    base = "https://api.github.com/repos/databricks-solutions/genie-ontology-readiness/git"
-    fetch = _fake_fetch({
-        f"{base}/ref/tags/v1.3.0": {"object": {"type": "tag", "sha": "tagobj"}},
-        f"{base}/tags/tagobj": {"object": {"type": "commit", "sha": "c0ffee"}},
-    })
-    assert ds.tag_commit_sha("v1.3.0", fetch) == "c0ffee"
-
-
-def test_tag_commit_sha_lightweight_and_failure():
-    base = "https://api.github.com/repos/databricks-solutions/genie-ontology-readiness/git"
-    light = _fake_fetch({f"{base}/ref/tags/v1": {"object": {"type": "commit", "sha": "abc"}}})
-    assert ds.tag_commit_sha("v1", light) == "abc"
-    down = _fake_fetch({f"{base}/ref/tags/v2": OSError("down")})
-    assert ds.tag_commit_sha("v2", down) is None
-
-
-def test_needs_move_by_branch_or_commit():
-    assert ds.needs_move("v1.3.0", "x", "v1.3.0", None) is False
-    assert ds.needs_move("main", "abc", "v1.3.0", "abc") is False
-    assert ds.needs_move("main", "abc", "v1.3.0", "def") is True
-    assert ds.needs_move("main", "abc", "v1.3.0", None) is True
-
-
-def test_moved_payload_and_message():
-    assert ds.moved_payload("v1.3.0") == {"status": "moved", "release": "v1.3.0"}
-    assert ds.moved_message("v1.3.0") == "The Git folder is now at v1.3.0. Click Run all again to deploy it."
-
-
-def test_app_ready_and_deployment_succeeded():
-    assert ds.app_ready("RUNNING", "ACTIVE") is True
-    assert ds.app_ready("DEPLOYING", "ACTIVE") is False
-    assert ds.app_ready("RUNNING", "STOPPED") is False
-    assert ds.deployment_succeeded("SUCCEEDED") is True
-    assert ds.deployment_succeeded("FAILED") is False
-
-
-def test_version_marker_shape():
-    now = _dt(2026, 11, 11, 15, 30, 0, tzinfo=_tz.utc)
-    data = _json.loads(ds.version_marker("abc123", "v1.3.0", now=now))
-    assert data == {"git_sha": "abc123", "release": "v1.3.0", "deployed_at": "2026-11-11T15:30:00Z"}
-
-
-def test_exit_payload_shape_and_no_secrets():
-    values, _ = _values(explicit={"WAREHOUSE_ID": "wh-1"})
-    out = ds.exit_payload("genie-ontology-readiness", "https://app", "v1.3.0", "abc",
-                          "/Workspace/Users/a/.genie-ontology-readiness/x", values)
-    assert set(out) == {"app_name", "url", "release", "git_sha", "staging_folder", "settings"}
-    assert set(out["settings"]) == set(ds.KEYS)
-    assert out["settings"]["WAREHOUSE_ID"] == {"value": "wh-1", "source": ds.SOURCE_YOU}
-    assert "token" not in _json.dumps(out).lower()
-
-
-def test_widgets_validate_release_and_staging():
-    assert ds.validate_widgets(_widgets(release="v1.3.0")) == []
-    assert ds.validate_widgets(_widgets(release="latest")) == []
-    assert ds.validate_widgets(_widgets(release="current")) == []
-    assert ds.validate_widgets(_widgets(release="v1; rm")) != []
-    assert ds.validate_widgets(_widgets(staging_folder="/tmp/x")) != []
-    assert ds.validate_widgets(_widgets(staging_folder="/Workspace/Users/a/x")) == []
-
-
-# --- auto, and the committed app.yaml ---------------------------------------------
+# --- more CLI behavior ------------------------------------------------------------
 
 def test_effective_lakebase_auto_follows_instance():
     assert ds.effective_lakebase("auto", "inst") is True

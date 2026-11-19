@@ -99,8 +99,8 @@ GRANT USE SCHEMA ON CATALOG `<catalog>` TO `<app-service-principal-id>`;
 GRANT SELECT ON CATALOG `<catalog>` TO `<app-service-principal-id>`;
 ```
 
-The defaults work. The app lets users pick the catalogs to assess. To change the catalogs, the
-brand, or the Genie space at deploy time, use the [advanced notebook or CLI path](#advanced-automated-install-notebook).
+The defaults work. The app lets users pick the catalogs to assess. To change the default catalogs,
+the brand, or the Genie space at deploy time, use the [terminal or CI path](#advanced-terminal-or-ci).
 
 ### Upgrade to a new release
 
@@ -123,10 +123,10 @@ Resources, history, and the app itself are not touched. Only the code changes. N
 
 ### Migrate from an older install
 
-Use this if you installed the app before deploy-from-Git was supported. In that case the app was
-installed with the notebook or with `bundle deploy` + `post_deploy.py`, and it runs from a
-workspace folder. You keep the same app, so you keep its history, its service principal and its
-grants.
+Use this if your app runs from a workspace folder: you installed it before deploy-from-Git was
+supported, with the notebook installer (`notebooks/install.py`, now removed) or with
+`bundle deploy` + `post_deploy.py`. You keep the same app, so you keep its history, its service
+principal and its grants. The app overview shows a workspace folder, not a Git repo, as its source.
 
 1. **Write down your settings.** Open the app's source folder. The app overview shows it as the
    source code path. Open `app.yml` in that folder, and note any value you changed from the
@@ -142,41 +142,26 @@ grants.
 4. **Check.** The status shows **Running**, and your saved runs are in the history. The app finds
    its existing tables and keeps using them. You do not need to run the GRANT SQL again.
 5. **Settings.** If step 1 showed values that you changed, and you need them, use the
-   [notebook](#advanced-automated-install-notebook) or the [CLI](#advanced-terminal-or-ci) path.
-   These paths reuse the deployed values. Otherwise the defaults apply.
+   [terminal or CI path](#advanced-terminal-or-ci). Otherwise the defaults apply.
 
 **Rollback.** Click the arrow next to **Deploy**, then **Deploy using a different source**. Select
 the workspace source, and enter the old source folder from step 1. The old folder is not changed
 by a deploy from Git.
 
-### Advanced: automated install (notebook)
-
-Use this path to set the catalogs, the brand, the Genie space, or the reset option at deploy time,
-or to run the install as a job. It is optional. Steps:
-
-> [!NOTE]
-> The notebook sets up history on a **Provisioned** Lakebase instance only. For an **Autoscaling**
-> Lakebase database (the default for a new one), use the [First install](#first-install) steps in the
-> Apps UI.
-
-1. In the workspace, click **Create** → **Git folder**. Paste the repo URL. The default branch is
-   fine. See [Create and manage Git folders](https://docs.databricks.com/aws/en/repos/git-operations-with-repos).
-2. Open `notebooks/install.py` from the Git folder. Attach it to **Serverless** compute.
-3. Set the widgets and click **Run all**. The notebook moves the Git folder to the latest release
-   first. If it moved, click **Run all** again. Upgrades use the same steps. Leave the widgets empty
-   to keep your settings. To pick a version, set the `release` widget, for example `v1.2.0`, or
-   `current` to deploy the folder as it is.
-4. `reset_settings=true` starts fresh. A job can run the notebook with the widgets as parameters.
-   Do not add a schedule that pulls new releases.
-
-The notebook keeps every setting you did not fill in, and it stops before any change if the
-deployed app's settings cannot be read, or if the run would turn Lakebase history off or point it
-at another database.
-
 ### Advanced: terminal or CI
 
-Use this path only if you already work with the Databricks CLI, or if a pipeline deploys the app.
-It needs Node.js, the Databricks CLI, and Python 3.9+. It uses the same settings and stops.
+Use this path only if you already work with the Databricks CLI, or if a pipeline deploys the app,
+for example to set the default catalogs, the brand, or the Genie space at deploy time. It needs
+Node.js, the Databricks CLI, and Python 3.9+.
+
+- It deploys from a workspace folder, not from Git. A later **Deploy from Git** in the Apps UI goes
+  back to the release defaults.
+- History works with a **Provisioned** Lakebase instance only. If the app's `lakebase-db` is an
+  **Autoscaling** database, the script stops before any change. Upgrade that app in the Apps UI
+  ([Upgrade to a new release](#upgrade-to-a-new-release)).
+- It keeps every setting you do not set, and it stops before any change if the deployed settings
+  cannot be read, or if the run would turn history off or point it at another database. An app
+  deployed from Git with no custom settings counts as having the release defaults.
 
 ```bash
 # Stable: the latest release (recommended)

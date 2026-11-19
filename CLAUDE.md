@@ -28,19 +28,23 @@ Bundles** + `post_deploy.py`.
 The default path is the **Databricks Apps UI, deploying from this Git repo**. Create a custom
 app, set the Git reference to a release tag and the source code path to `app`, add the resources
 `sql-warehouse` and (optionally) `lakebase-db`, then deploy. The steps are in the
-[README](./README.md) (**Quick start**).
+[README](./README.md) (**Quick start**). `lakebase-db` can be a Lakebase **Autoscaling** database (the
+default for a new one; `valueFrom` gives its endpoint name) or a **Provisioned** instance
+(`valueFrom` gives its host). `app/server/lakebase_client.py` handles both with no extra setting.
 
 The app config is one file, `app/app.yaml`. It is committed and holds no workspace values. A Git
 deploy uses it as committed. `valueFrom` binds `DATABRICKS_WAREHOUSE_ID` to `sql-warehouse` and
 `LAKEBASE_HOST` to `lakebase-db`. `app/package.json` runs the frontend build on deploy.
 
-Two advanced paths write their settings into a copy of `app/app.yaml`, never into the repo:
-the notebook installer (`notebooks/install.py`, in a Git folder) and the CLI scripts
-(`scripts/post_deploy.py`, with `bundle deploy` for a first install and `INFRA=true`). Both reuse
-the deployed app's settings, in this order: the value you set, the deployed value, the release
-default. They print a table of settings and sources. They stop before any change if the deployed
-config cannot be read, or if the run would turn Lakebase history off or point it at another instance
-or database. `RESET_SETTINGS=true` starts fresh. The logic is in `scripts/deploy_settings.py`.
+One advanced path writes its settings into a copy of `app/app.yaml`, never into the repo: the CLI
+scripts (`scripts/post_deploy.py`, with `bundle deploy` for a first install and `INFRA=true`). It
+reuses the deployed app's settings, in this order: the value you set, the deployed value, the
+release default (an app deployed from Git with no custom `env_vars` has the release defaults). It
+prints a table of settings and sources. It stops before any change if the deployed config cannot be
+read, if the run would turn Lakebase history off or point it at another instance or database, or if
+`lakebase-db` is an Autoscaling database (the CLI manages Provisioned only). `RESET_SETTINGS=true`
+starts fresh. The logic is in `scripts/deploy_settings.py`. The notebook installer was removed: it
+could not upgrade apps deployed from Git or use Autoscaling Lakebase.
 
 The history tables live in `public` for existing installs, and in schema `genie_ontology_readiness` for a new database (chosen at startup in `app/server/history_schema.py`). A Lakebase error at startup turns history off; the app still runs.
 Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps inject) and
@@ -55,6 +59,19 @@ tag the commit (`v1.4.0`). A Git deploy has no `.git`, so it reads this file for
 
 The environment is a bundle **target** (`-t dev` default, `stg`, `prod`) for the CLI path. Each target
 has a fixed app name, pinned in `databricks.yml`. There is no `--var app_name`.
+
+**Internal deploys (maintainers).** The GOR apps on the internal workspace are deployed by jobs in
+the separate `gor-deploy-automation` bundle, with the same Apps Git deploy customers use. Never deploy
+them by hand.
+
+- **dev:** run the stg job with `target=dev ref=<branch or tag> force=true` to test a branch.
+- **stg:** follows `main` every 5 minutes.
+- **prod:** deploys the latest release nightly at 08:00 UTC. To ship, cut a release.
+- **Fresh install test:** dev/stg/prod are long-lived apps that already have their resources, so a
+  redeploy never tests a first install. That gap hid #134. For any change that touches setup,
+  resources, Lakebase or permissions, also run the `gor_fresh_install` job with `ref=<branch>`. It
+  follows README → First install on a NEW app with a NEW Lakebase Autoscaling project, checks that
+  an assessment saves to history, and deletes both.
 
 Scores are a deterministic function of the technical findings, so repeated runs on the same
 workspace are directly comparable **for a given identity and scope**. Each snapshot records its
@@ -133,12 +150,13 @@ have an editor run the deep pass.
 ```
 app/
   app.py                     — FastAPI entry (port from DATABRICKS_APP_PORT)
-  app/app.yaml                — committed app config (Git deploy); CLI and notebook render a copy
+  app/app.yaml                — committed app config (Git deploy); the CLI renders a copy
   server/
     config.py                — SP/local auth, host resolution, env config
     sql_client.py            — Statement Execution API
     genie_client.py          — Genie Conversation API (answer-quality test)
-    lakebase_client.py       — optional snapshot persistence pool
+    lakebase_client.py       — optional history pool (Autoscaling or Provisioned lakebase-db;
+                               a fresh credential per new connection)
     snapshots.py             — optional assessment history (Lakebase)
     pillars.py               — canonical 7 readiness pillars + maturity model
     signal_spec.py           — per-pillar signal SQL/thresholds/gap text shared with the skill
@@ -154,8 +172,6 @@ app/
     routes/
       config.py  assess.py  content.py  plan.py  chat.py  genie.py  _shared.py
   frontend/                  — React + Vite + Tailwind (4 tabs: Assess/Learn/Plan/Assistant)
-notebooks/
-  install.py                 — workspace notebook installer (no CLI / Node.js needed)
 scripts/
   post_deploy.py             — render app/app.yaml, grant SP, publish
   setup_app_permissions.py   — UC read grants for the app SP
