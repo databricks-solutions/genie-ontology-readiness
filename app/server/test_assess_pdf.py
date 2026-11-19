@@ -92,6 +92,19 @@ class AssessmentMarkdownTest(unittest.TestCase):
         self.assertIn("Domains & Stewardship — not available", md)
         self.assertIn("lacks access to read tags", md)
 
+    def test_not_scored_pillar_is_explained(self):
+        sc = _scorecard()
+        p = sc["pillars"][-1]
+        p.update(available=False, score_excluded=True,
+                 score_excluded_reason="The app's service principal needs MANAGE DISCOVER to read Discover domains.")
+        sc["overall"]["excluded_pillars"] = [{"key": p["key"], "name": p["name"],
+                                              "reason": p["score_excluded_reason"]}]
+        md = _assessment_markdown(sc)
+        self.assertIn(f"_Not scored: {p['name']}.", md)
+        self.assertIn("left out of the overall score instead of counting as 0", md)
+        self.assertIn(f"- {p['name']}: The app's service principal needs MANAGE DISCOVER", md)
+        self.assertIn(f"### {p['name']} — not scored", md)
+
     def test_top_gaps_and_signals_and_practices(self):
         md = _assessment_markdown(_scorecard())
         self.assertIn("## Top gaps to close", md)

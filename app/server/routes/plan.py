@@ -71,6 +71,12 @@ def _scorecard_digest(sc: Optional[dict]) -> str:
     lines = [f"Overall readiness: {overall.get('score')}/100 ({overall.get('level_label')}) — {overall.get('readiness_stage')}."]
     for p in sc.get("pillars", []):
         sigs = ", ".join(f"{s.get('label')}={s.get('value')}{s.get('unit','')}" for s in (p.get("signals") or [])[:3])
+        if p.get("score_excluded"):
+            # Left out of the overall score: don't present it to the LLM as a measured 0.
+            lines.append(f"- {p.get('name')}: NOT SCORED (excluded from the overall score, not a 0) — "
+                         f"{p.get('score_excluded_reason') or 'the app could not measure it'}. Treat it as "
+                         "unknown, not as the weakest pillar; recommend fixing the access first.")
+            continue
         avail = "" if p.get("available", True) else " [not available]"
         line = f"- {p.get('name')}: {p.get('score')} ({p.get('level_label')}){avail}"
         if sigs:
@@ -104,11 +110,20 @@ def _scorecard_markdown(sc: Optional[dict]) -> str:
     if pillars:
         lines += ["| Pillar | Score | Level |", "| --- | --- | --- |"]
         for p in pillars:
+            if p.get("score_excluded"):
+                lines.append(f"| {p.get('name')} | not scored | — |")
+                continue
             avail = "" if p.get("available", True) else " (n/a)"
             lines.append(
                 f"| {p.get('name')} | {p.get('score')}{avail} | L{p.get('level')} {p.get('level_label') or ''} |"
             )
         lines.append("")
+        excluded = [e for e in (overall.get("excluded_pillars") or []) if isinstance(e, dict)]
+        for e in excluded:
+            lines.append(f"_Not scored: {e.get('name')}. {e.get('reason') or ''} It is left out of the overall "
+                         "score instead of counting as 0._")
+        if excluded:
+            lines.append("")
 
     top_gaps = sc.get("top_gaps") or []
     if top_gaps:

@@ -71,6 +71,11 @@ and [Add resources to a Databricks app](https://docs.databricks.com/aws/en/dev-t
    shows this id, and the full SQL, at `/api/setup/grants`. Without these grants, some signals
    show as not available. The app still runs.
 6. Optional: if your workspace offers user authorization, enable the `sql` user scope for the app.
+7. Optional: to count Discover domains and subdomains exactly, ask an **account admin** to grant the
+   app's service principal `MANAGE DISCOVER`. Go to **Discover** → ⋮ → **Manage Domains** →
+   **Permissions** → **Grant Permissions**. This grant is only in the UI, so it isn't in the SQL
+   below. It is a curator permission: it also lets the service principal manage domains. Without it,
+   the Domains pillar is not scored and is left out of the overall score.
 
 ```sql
 GRANT USE CATALOG ON CATALOG system TO `<app-service-principal-id>`;
@@ -373,7 +378,9 @@ defaults to **on-behalf-of-user (OBO)** with an automatic **SP fallback**:
   **service principal (SP)**, so the SP must hold the grants below.
 
 A few reads are **always** the SP (they can't run OBO): the Genie REST API (not
-covered by the `sql` user scope) and Lakebase credential minting.
+covered by the `sql` user scope) and Lakebase credential minting. The Domains REST API
+is tried as the viewer first, but the `sql`-scoped token is refused, so in practice it
+also runs as the SP.
 
 ### Who needs what
 
@@ -382,6 +389,7 @@ covered by the `sql` user scope) and Lakebase credential minting.
 | Run any query | SQL warehouse | `CAN USE` on the warehouse |
 | UC Foundation · Metadata · Relationships · Metrics · Domains (tags) | catalog / `system.information_schema` | `BROWSE` on each assessed catalog (metadata-only, least privilege) — or `USE CATALOG`+`USE SCHEMA`+`SELECT` |
 | "Not in Unity Catalog" coverage | `hive_metastore.information_schema` | read on `hive_metastore` (if legacy access is enabled) |
+| Domains (Discover domains and subdomains; needed to score this pillar) | Domains REST API (Beta) | `MANAGE DISCOVER` on the **SP**, granted by an **account admin**: Discover → ⋮ → **Manage Domains** → **Permissions** → **Grant Permissions**. Account and workspace admins hold it by default; the docs name account admins as the ones who grant it. The viewer's `sql`-scoped token can't call this API, so the app retries as the SP. Without it, the Domains pillar is **not scored**: it's left out of the overall score, and domains aren't guessed from tags |
 | Genie Agents (count + activity) | `system.access.audit` (`aibiGenie` events) | `USE`+`SELECT` on `system.access` |
 | Adoption & Activity | `system.access.audit`, `system.query.history` | `USE`+`SELECT` on `system.access` and `system.query` |
 | Top‑10 most‑accessed + certified | `system.access.table_lineage` + `information_schema.table_tags` | `USE`+`SELECT` on `system.access` + catalog metadata |

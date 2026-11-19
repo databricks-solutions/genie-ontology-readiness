@@ -197,6 +197,17 @@ def _overall_diff(base_over: dict, cur_over: dict) -> dict:
     }
 
 
+def _excluded_names(overall: dict) -> dict:
+    return {e.get("key"): e.get("name") for e in (overall.get("excluded_pillars") or [])
+            if isinstance(e, dict) and e.get("key")}
+
+
+def _not_scored_changed(base_over: dict, cur_over: dict) -> list[str]:
+    """Names of the pillars that are not scored in exactly one of the two runs."""
+    b, c = _excluded_names(base_over), _excluded_names(cur_over)
+    return sorted({**b, **c}[k] or k for k in set(b) ^ set(c))
+
+
 def compare_snapshots(baseline: dict, current: dict) -> dict:
     """Diff two snapshot dicts (each ``{id, created_at, scorecard}``) → a compare result.
 
@@ -234,6 +245,9 @@ def compare_snapshots(baseline: dict, current: dict) -> dict:
             "scope": current.get("scope"),
         },
         "overall": _overall_diff(base_sc.get("overall") or {}, cur_sc.get("overall") or {}),
+        # Pillars left out of one run's overall score but not the other's (e.g. Domains without
+        # MANAGE DISCOVER): the overall delta then partly reflects which pillars were averaged.
+        "not_scored_changed": _not_scored_changed(base_sc.get("overall") or {}, cur_sc.get("overall") or {}),
         "pillars": pillars,
         "summary": summary,
         # #89: True / False, or None when either run predates saved scopes. The UI

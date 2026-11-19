@@ -258,6 +258,16 @@ def _assessment_markdown(sc: dict) -> str:
     elif stage:
         lines.append(f"**{stage}**")
         lines.append("")
+    excluded = [e if isinstance(e, dict) else {"name": str(e)} for e in (overall.get("excluded_pillars") or [])]
+    if excluded:
+        lines.append(f"_Not scored: {', '.join(e.get('name') or '' for e in excluded)}. The app couldn't measure "
+                     f"{'these pillars' if len(excluded) > 1 else 'this pillar'}, so "
+                     f"{'they are' if len(excluded) > 1 else 'it is'} left out of the overall score instead of "
+                     "counting as 0._")
+        for e in excluded:
+            if e.get("reason"):
+                lines.append(f"- {e.get('name')}: {e['reason']}")
+        lines.append("")
     if detail:
         lines.append(detail)
         lines.append("")
@@ -272,10 +282,13 @@ def _assessment_markdown(sc: dict) -> str:
         lines.append("| Pillar | Score | Maturity | Weight |")
         lines.append("| --- | --- | --- | --- |")
         for p in pillars:
-            score_cell = str(p.get("score")) if p.get("available", True) else "n/a"
+            score_cell = (str(p.get("score")) if p.get("available", True)
+                      else "not scored" if p.get("score_excluded") else "n/a")
+            maturity = ("—" if p.get("score_excluded")
+                        else 'L' + str(p.get('level')) + ' ' + (p.get('level_label') or ''))
             lines.append(
                 f"| {_cell(p.get('name'))} | {_cell(score_cell)} "
-                f"| {_cell('L' + str(p.get('level')) + ' ' + (p.get('level_label') or ''))} "
+                f"| {_cell(maturity)} "
                 f"| {_cell(p.get('weight'))} |"
             )
         lines.append("")
@@ -299,6 +312,8 @@ def _assessment_markdown(sc: dict) -> str:
             available = p.get("available", True)
             if available:
                 lines.append(f"### {name} — {p.get('score')}/100 (L{p.get('level')} {p.get('level_label') or ''})")
+            elif p.get("score_excluded"):
+                lines.append(f"### {name} — not scored")
             else:
                 lines.append(f"### {name} — not available")
             lines.append("")

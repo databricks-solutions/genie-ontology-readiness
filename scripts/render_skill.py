@@ -167,7 +167,8 @@ def _at_a_glance() -> str:
         f"- {len(P.PILLARS)} pillars, each scored 0-100. Pillar **weights sum to {total}**:\n"
         f"  {weights}.\n"
         "- **Overall** = weighted average of the pillar scores (an unavailable pillar\n"
-        "  contributes 0). Map it to a maturity **level** (0-4) and a **readiness stage**.\n"
+        "  contributes 0, except Domains without the Domains API, which is left out).\n"
+        "  Map it to a maturity **level** (0-4) and a **readiness stage**.\n"
         "- **Prioritized gaps** = each pillar's gaps, ordered lowest-score / highest-weight\n"
         f"  first, top {P.TOP_GAPS_LIMIT}.\n"
     )

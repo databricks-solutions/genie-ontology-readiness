@@ -8,6 +8,7 @@ import type {
   SignalIdentity,
   UnavailableReason,
 } from '../types';
+import { NOT_SCORED_EXPLAINER } from './NotScored';
 import GenieTester from './GenieTester';
 import DrillDownModal from './DrillDownModal';
 import SqlModal from './SqlModal';
@@ -156,13 +157,16 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
   ) : null;
 
   if (!pillar.available) {
-    const { Icon, box, label } = unavailableStyle(pillar.unavailable_reason);
+    const { Icon, box, label } = pillar.score_excluded
+      ? { Icon: Info, box: 'bg-gray-50 border-gray-200 text-ink-700', label: 'Not scored' }
+      : unavailableStyle(pillar.unavailable_reason);
     return (
       <div className="px-4 pb-4 pt-1 space-y-2">
         <div className={`flex items-start gap-2 rounded-md border px-3 py-3 text-sm ${box}`}>
           <Icon size={16} className="mt-0.5 shrink-0" />
           <span>
             <span className="font-semibold">{label}.</span>{' '}
+            {pillar.score_excluded && <>{NOT_SCORED_EXPLAINER} </>}
             {pillar.note || 'This signal is not available in the current workspace context.'}
           </span>
         </div>

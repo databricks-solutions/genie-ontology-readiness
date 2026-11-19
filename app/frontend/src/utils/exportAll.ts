@@ -16,14 +16,26 @@ const SUMMARY_COLUMNS = [
 ];
 
 export function buildSummaryCsv(pillars: PillarScore[]): string {
-  const rows = pillars.map((p) => ({
-    pillar: p.name,
-    score: p.score,
-    level: p.level,
-    maturity: p.level_label,
-    available: p.available ? 'yes' : 'no',
-    gaps: p.gaps.length ? p.gaps.join(' | ') : '—',
-  }));
+  const rows = pillars.map((p) =>
+    p.score_excluded
+      ? {
+          // Left out of the overall score, so no score or level is written.
+          pillar: p.name,
+          score: 'not scored',
+          level: '',
+          maturity: '',
+          available: 'no',
+          gaps: p.score_excluded_reason || 'Not scored: left out of the overall score.',
+        }
+      : {
+          pillar: p.name,
+          score: p.score,
+          level: p.level,
+          maturity: p.level_label,
+          available: p.available ? 'yes' : 'no',
+          gaps: p.gaps.length ? p.gaps.join(' | ') : '—',
+        },
+  );
   return rowsToCsv(SUMMARY_COLUMNS, rows);
 }
 

@@ -39,6 +39,7 @@ import { levelStyle, scoreColor } from '../theme/levels';
 import { downloadAllZip } from '../utils/exportAll';
 import { defaultTrendScope, resolveTrendScope, scopeDetail, scopeLabel, scopeOptions, trendRuns } from '../utils/scope';
 import PillarDetail from './PillarDetail';
+import { ExcludedPillarsNote, NOT_SCORED_EXPLAINER } from './NotScored';
 import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
@@ -367,12 +368,15 @@ export default function Scorecard({
 
   const radarData = useMemo(
     () =>
-      config.pillars.map((p) => ({
-        // Use the pillar's card title (name), not its long description, so the
-        // radar labels match the 7 pillar cards below.
-        pillar: p.name,
-        score: Math.round(pillarsByKey[p.key]?.score ?? 0),
-      })),
+      config.pillars
+        // A not-scored pillar has no value to plot (a 0 would look measured), so it is left off.
+        .filter((p) => !pillarsByKey[p.key]?.score_excluded)
+        .map((p) => ({
+          // Use the pillar's card title (name), not its long description, so the
+          // radar labels match the pillar cards below.
+          pillar: p.name,
+          score: Math.round(pillarsByKey[p.key]?.score ?? 0),
+        })),
     [config.pillars, pillarsByKey]
   );
 
@@ -613,6 +617,7 @@ export default function Scorecard({
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>A <span className="font-medium">SQL warehouse</span> for the read-only metadata queries.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>Read access for the app's <span className="font-medium">service principal</span>: <code className="text-xs">USE CATALOG</code> / <code className="text-xs">USE SCHEMA</code> / <code className="text-xs">SELECT</code> on <code className="text-xs">system.information_schema</code>, <code className="text-xs">system.access</code>, <code className="text-xs">system.query</code>, plus the catalogs you want assessed. Deploy applies these automatically; it falls back to each catalog's own <code className="text-xs">information_schema</code> if system tables aren't granted.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">CAN_RUN</code> on your Genie Agents so the Genie pillar can count and assess them.</span></li>
+          <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span><span className="font-medium">Optional:</span> <code className="text-xs">MANAGE DISCOVER</code> on the app&apos;s service principal (an account admin grants it in Discover → Manage Domains) so the Domains pillar can read Discover domains. Without it, that pillar is not scored and is left out of the overall score.</span></li>
           <li className="flex items-start gap-2"><span className="text-ink-300 mt-0.5">•</span><span>The <span className="font-medium">Plan</span> tab additionally uses your workspace's Foundation Model API to generate a plan against a saved assessment.</span></li>
         </ul>
         <p className="text-xs text-ink-400 mt-2.5">
@@ -724,6 +729,7 @@ export default function Scorecard({
                   {overall.readiness_framing && (
                     <p className="text-xs text-ink-500 leading-relaxed mt-2">{overall.readiness_framing}</p>
                   )}
+                  <ExcludedPillarsNote excluded={overall.excluded_pillars} />
                   <div className="flex items-center gap-3 flex-wrap mt-2">
                     {config.assess_catalogs.length > 0 && (
                       <p className="text-xs text-ink-400">Assessing catalogs: {config.assess_catalogs.join(', ')}</p>
@@ -888,23 +894,37 @@ export default function Scorecard({
                 className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
               >
                 <div className="w-12 text-center shrink-0">
-                  <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
-                    {Math.round(p.score)}
-                  </div>
+                  {p.score_excluded ? (
+                    <div className="text-lg font-bold text-ink-400" title={NOT_SCORED_EXPLAINER}>
+                      —
+                    </div>
+                  ) : (
+                    <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
+                      {Math.round(p.score)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-ink-900">{p.name}</span>
-                    <LevelBadge level={p.level} label={p.level_label} />
-                    {!p.available && <span className="text-[11px] text-ink-400 italic">not available</span>}
+                    {!p.score_excluded && <LevelBadge level={p.level} label={p.level_label} />}
+                    {p.score_excluded ? (
+                      <span className="text-[11px] text-ink-500 italic">not scored</span>
+                    ) : (
+                      !p.available && <span className="text-[11px] text-ink-400 italic">not available</span>
+                    )}
                     {p.identity && <IdentityBadge identity={p.identity} />}
                   </div>
-                  <p className="text-xs text-ink-500 mt-0.5 truncate">{p.short}</p>
+                  <p className="text-xs text-ink-500 mt-0.5 truncate">
+                    {p.score_excluded ? p.score_excluded_reason || NOT_SCORED_EXPLAINER : p.short}
+                  </p>
                 </div>
                 <div className="hidden sm:block w-24 shrink-0">
-                  <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                    <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
-                  </div>
+                  {!p.score_excluded && (
+                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
+                    </div>
+                  )}
                 </div>
                 <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
               </button>
