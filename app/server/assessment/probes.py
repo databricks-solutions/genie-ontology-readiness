@@ -1515,6 +1515,8 @@ async def _list_domains(host: str, headers: dict) -> tuple[str, list]:
     Returns ("ok", domains), ("forbidden", []) on 401/403, else ("unavailable", [])."""
     status = "unavailable"
     for path in _DOMAINS_API_PATHS:
+        if status == "forbidden":  # the same identity gets the same answer on the other path
+            break
         domains, token = [], None
         try:
             async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers=with_ua()) as session:
@@ -1655,9 +1657,15 @@ async def probe_domains() -> dict:
                      for v, f in views]
             return (f"SELECT COUNT(DISTINCT lower(domain)) AS used_domains, COUNT(*) AS assignments "
                     f"FROM ({' UNION ALL '.join(parts)})")
-        level_views = [(tt, sch)] + ([(st, sch)] if st else [])
+        # tt, st and ct are all set here (_src returns None for all of them only with no catalogs).
+        # catalog_tags has no schema column; in per-catalog mode keep it to the assessed catalogs.
+        cat_scope = ("" if s.get("system_ok") or not s.get("catalogs") else
+                     "AND catalog_name IN (" + ", ".join(quote_literal(c) for c in s["catalogs"]) + ")")
+        level_views = [(tt, sch), (st, sch)]
         try:
-            rows = await execute_sql(used_sql(level_views + ([(ct, "")] if ct else [])))
+            rows = await execute_sql(used_sql(level_views + [(ct, cat_scope)]))
+        except StatementTimeout:
+            raise
         except Exception as e:  # catalog_tags unreadable: count schema and table assignments
             logger.info(f"domains: catalog tags unavailable: {str(e)[:80]}")
             rows = await execute_sql(used_sql(level_views))
@@ -1699,12 +1707,12 @@ async def probe_domains() -> dict:
         except Exception:
             governed_tagged = 0
         in_table = f"(table_catalog, table_schema, table_name) IN (SELECT catalog_name, schema_name, table_name FROM {tt} WHERE {domain_pred})"
-        in_schema = f"(table_catalog, table_schema) IN (SELECT catalog_name, schema_name FROM {st} WHERE {domain_pred})" if st else None
-        in_catalog = f"table_catalog IN (SELECT catalog_name FROM {ct} WHERE {domain_pred})" if ct else None
-        inherited = [c for c in (in_table, in_schema, in_catalog) if c]
+        in_schema = f"(table_catalog, table_schema) IN (SELECT catalog_name, schema_name FROM {st} WHERE {domain_pred})"
+        in_catalog = f"table_catalog IN (SELECT catalog_name FROM {ct} WHERE {domain_pred})"
+        # With catalog tags, then without them, then tables tagged directly.
         domain_tagged = await _first_scalar(
-            [f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)} AND ({' OR '.join(inherited)})",
-             f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)} AND ({' OR '.join(inherited[:2])})",
+            [f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)} AND ({in_table} OR {in_schema} OR {in_catalog})",
+             f"SELECT COUNT(*) FROM {tbl} WHERE {_schema_sql(s)} AND ({in_table} OR {in_schema})",
              f"SELECT COUNT(DISTINCT concat_ws('.', catalog_name, schema_name, table_name)) "
              f"FROM {tt} WHERE {domain_pred} {sch}"]) if published else 0
         pct_tagged = _pct(governed_tagged, total_tables)
@@ -1838,7 +1846,7 @@ async def probe_domains() -> dict:
                 "Governance tags by schema",
                 [{"key": "catalog", "label": "Catalog"},
                  {"key": "schema", "label": "Schema"},
-                 {"key": "domain_tagged", "label": "Domain-tagged tables"},
+                 {"key": "domain_tagged", "label": "Tables tagged with a domain (directly)"},
                  {"key": "stewarded", "label": "Stewarded"},
                  {"key": "certified", "label": "Certified"}],
                 drill_rows,

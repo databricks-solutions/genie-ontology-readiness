@@ -284,9 +284,11 @@ def _assessment_markdown(sc: dict) -> str:
         for p in pillars:
             score_cell = (str(p.get("score")) if p.get("available", True)
                       else "not scored" if p.get("score_excluded") else "n/a")
+            maturity = ("—" if p.get("score_excluded")
+                        else 'L' + str(p.get('level')) + ' ' + (p.get('level_label') or ''))
             lines.append(
                 f"| {_cell(p.get('name'))} | {_cell(score_cell)} "
-                f"| {_cell('L' + str(p.get('level')) + ' ' + (p.get('level_label') or ''))} "
+                f"| {_cell(maturity)} "
                 f"| {_cell(p.get('weight'))} |"
             )
         lines.append("")

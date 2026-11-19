@@ -62,8 +62,9 @@ class NativeDomainsTest(unittest.TestCase):
         self.assertEqual(calls[1][1].get("page_token"), "p2")
 
     def test_forbidden_means_missing_manage_discover(self):
-        res, _ = _run_native({"/api/2.0/domains": [_Resp(403)], "/api/discover/v1/domains": [_Resp(403)]})
+        res, calls = _run_native({"/api/2.0/domains": [_Resp(403)], "/api/discover/v1/domains": [_Resp(403)]})
         self.assertEqual(res, {"status": "forbidden"})
+        self.assertEqual(len(calls), 1)  # the alternate path won't answer the same identity differently
 
     def test_missing_endpoint_is_unavailable(self):
         res, calls = _run_native({})
@@ -80,16 +81,20 @@ class _AuthSession(_Session):
     """Refuses the viewer token (403) and answers the SP token, like the Domains API with an
     `sql`-scoped OBO token."""
 
+    sp_status = 200
+
     def get(self, url, headers=None, params=None):
         self.calls.append((url.split("example.cloud.databricks.com", 1)[1], (headers or {}).get("Authorization")))
-        if (headers or {}).get("Authorization") == "Bearer viewer":
-            return _Resp(403)
+        if (headers or {}).get("Authorization") == "Bearer viewer" or self.sp_status != 200:
+            return _Resp(403 if (headers or {}).get("Authorization") == "Bearer viewer" else self.sp_status)
         return _Resp(200, {"domains": [{"domain_id": "1", "tag_key": "Finance"}]})
 
 
-def _run_native_obo(user_token):
+def _run_native_obo(user_token, sp_status=200, sp_token="sp"):
     calls, identities = [], []
-    headers = lambda force_sp=False: {"Authorization": "Bearer sp" if force_sp or not user_token else "Bearer viewer"}
+    _AuthSession.sp_status = sp_status
+    headers = lambda force_sp=False: {"Authorization": f"Bearer {sp_token}" if force_sp or not user_token
+                                      else "Bearer viewer"}
     with patch.object(probes, "get_workspace_host", return_value="https://example.cloud.databricks.com"), \
          patch.object(probes, "get_auth_headers", side_effect=headers), \
          patch.object(probes, "get_user_token", return_value=user_token), \
@@ -103,8 +108,19 @@ class NativeDomainsIdentityTest(unittest.TestCase):
     def test_refused_viewer_token_retries_as_the_sp(self):
         res, calls, identities = _run_native_obo("viewer")
         self.assertEqual(res["status"], "ok")
-        self.assertEqual([c[1] for c in calls], ["Bearer viewer", "Bearer viewer", "Bearer sp"])
+        self.assertEqual([c[1] for c in calls], ["Bearer viewer", "Bearer sp"])  # one 403 per identity
         self.assertEqual(identities, ["sp_fallback"])
+
+    def test_sp_refused_too_is_forbidden(self):
+        res, calls, identities = _run_native_obo("viewer", sp_status=403)
+        self.assertEqual(res, {"status": "forbidden"})
+        self.assertEqual([c[1] for c in calls], ["Bearer viewer", "Bearer sp"])
+        self.assertEqual(identities, [])
+
+    def test_no_retry_when_the_sp_token_is_the_viewer_token(self):
+        res, calls, _ = _run_native_obo("viewer", sp_token="viewer")
+        self.assertEqual(res, {"status": "forbidden"})
+        self.assertEqual([c[1] for c in calls], ["Bearer viewer"])
 
     def test_sp_only_does_not_retry(self):
         res, calls, identities = _run_native_obo(None)
@@ -220,6 +236,32 @@ class ProbeDomainsTest(unittest.TestCase):
             self.assertTrue(res["available"])
             self.assertEqual(res["score"], 40 + 40 * 2 / 5)
             self.assertEqual(res["metrics"]["distinct_domains"], 2)
+
+
+class NotScoredOutputsTest(unittest.TestCase):
+    def _sc(self):
+        res, _ = _run_probe({"status": "forbidden"}, [])
+        out, pillars = ScoreExclusionTest()._scorecard(res)
+        return {**out, "pillars": pillars}
+
+    def test_plan_does_not_present_a_not_scored_pillar_as_zero(self):
+        from server.routes import plan
+        sc = self._sc()
+        digest = plan._scorecard_digest(sc)
+        self.assertIn("Domains & Stewardship: NOT SCORED", digest)
+        self.assertNotIn("Domains & Stewardship: 0.0", digest)
+        md = plan._scorecard_markdown(sc)
+        self.assertIn("| Domains & Stewardship | not scored | — |", md)
+        self.assertIn("_Not scored: Domains & Stewardship.", md)
+
+    def test_compare_flags_runs_that_scored_different_pillars(self):
+        from server.assessment.compare import compare_snapshots
+        new = self._sc()
+        old = {**new, "overall": {**new["overall"], "excluded_pillars": []}}
+        res = compare_snapshots({"id": 1, "scorecard": old}, {"id": 2, "scorecard": new})
+        self.assertEqual(res["not_scored_changed"], ["Domains & Stewardship"])
+        same = compare_snapshots({"id": 1, "scorecard": new}, {"id": 2, "scorecard": new})
+        self.assertEqual(same["not_scored_changed"], [])
 
 
 class ScoreExclusionTest(unittest.TestCase):

@@ -265,6 +265,18 @@ export default function CompareModal({
                   </span>
                 </div>
               )}
+              {(result.not_scored_changed?.length ?? 0) > 0 && (
+                <div
+                  data-testid="compare-not-scored-warning"
+                  className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 mb-3 text-xs text-amber-800 flex items-start gap-1.5"
+                >
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  <span>
+                    {result.not_scored_changed!.join(', ')} {result.not_scored_changed!.length > 1 ? 'were' : 'was'}{' '}
+                    not scored in one of these runs, so the overall change partly reflects which pillars were averaged.
+                  </span>
+                </div>
+              )}
               {result.same_scope == null && (
                 <p data-testid="compare-scope-unknown" className="text-[11px] text-ink-400 mb-3">
                   One of these runs was saved before scopes were recorded, so it can't be checked for the same scope.

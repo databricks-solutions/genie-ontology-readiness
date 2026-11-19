@@ -294,6 +294,8 @@ export interface CompareResult {
   baseline: CompareEndpoint;
   current: CompareEndpoint;
   overall: CompareOverall;
+  // Pillars not scored in exactly one of the two runs (absent on older servers).
+  not_scored_changed?: string[];
   pillars: PillarDiff[];
   summary: {
     improved: number;

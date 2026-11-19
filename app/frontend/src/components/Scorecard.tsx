@@ -368,12 +368,15 @@ export default function Scorecard({
 
   const radarData = useMemo(
     () =>
-      config.pillars.map((p) => ({
-        // Use the pillar's card title (name), not its long description, so the
-        // radar labels match the 7 pillar cards below.
-        pillar: pillarsByKey[p.key]?.score_excluded ? `${p.name} (not scored)` : p.name,
-        score: Math.round(pillarsByKey[p.key]?.score ?? 0),
-      })),
+      config.pillars
+        // A not-scored pillar has no value to plot (a 0 would look measured), so it is left off.
+        .filter((p) => !pillarsByKey[p.key]?.score_excluded)
+        .map((p) => ({
+          // Use the pillar's card title (name), not its long description, so the
+          // radar labels match the pillar cards below.
+          pillar: p.name,
+          score: Math.round(pillarsByKey[p.key]?.score ?? 0),
+        })),
     [config.pillars, pillarsByKey]
   );
 
