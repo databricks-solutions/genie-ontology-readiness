@@ -153,14 +153,26 @@ def test_read_live_git_deploy_with_custom_env_vars_stops():
     assert live["git"] and not live["yml_readable"]
     problems = ds.find_problems(_values(live=live)[0], live)
     assert len(problems) == 1 and "env_vars" in problems[0]
+    assert "RESET_SETTINGS" not in problems[0]  # a reset would detach a Provisioned history database
+
+
+def test_git_detection_does_not_need_an_empty_source_path():
+    app = _git_app()
+    app["active_deployment"]["source_code_path"] = "/Workspace/some/snapshot"
+    live = ds.read_live(app, lambda p: None)
+    assert live["git"] and live["yml_readable"]
+
+
+def test_an_empty_postgres_object_still_counts_as_autoscaling():
+    live = ds.read_live(_git_app(lakebase={"name": "lakebase-db", "postgres": {}}), lambda p: None)
+    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_STOP]
 
 
 def test_autoscaling_lakebase_always_stops_before_any_change():
     lakebase = {"name": "lakebase-db", "postgres": {"branch": "projects/p/branches/production",
                                                     "database": "projects/p/branches/production/databases/d"}}
     live = ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
-    assert live["resources"]["LAKEBASE_BRANCH"] == "projects/p/branches/production"
-    assert "LAKEBASE_INSTANCE_NAME" not in live["resources"]
+    assert live["autoscaling"] and "LAKEBASE_INSTANCE_NAME" not in live["resources"]
     for reset in (False, True):
         assert ds.find_problems(_values(live=live)[0], live, reset=reset) == [ds.AUTOSCALING_STOP]
 
@@ -466,3 +478,59 @@ def test_upgrade_updates_warehouse_when_it_changed(monkeypatch):
 def test_unreadable_folder_message_names_the_path():
     _, problems = _values(live=_live(readable=False))
     assert "/Workspace/Users/a@x/.genie/app" in problems[0]
+
+
+# --- more CLI behavior ------------------------------------------------------------
+
+def test_effective_lakebase_auto_follows_instance():
+    assert ds.effective_lakebase("auto", "inst") is True
+    assert ds.effective_lakebase("auto", "") is False
+    assert ds.effective_lakebase("", "inst") is True
+    assert ds.effective_lakebase("true", "") is True
+    assert ds.effective_lakebase("false", "inst") is False
+
+
+def test_auto_deployed_with_resource_keeps_history_and_stops_only_on_change():
+    """A Git-deployed app has USE_LAKEBASE=auto and the lakebase-db resource. Reuse keeps it on."""
+    app = {"active_deployment": {"source_code_path": "/Workspace/x/app"},
+           "resources": [{"name": "lakebase-db",
+                          "database": {"instance_name": "shared-inst", "database_name": "history_db"}}]}
+    live = ds.read_live(app, lambda p: 'env:\n  - name: USE_LAKEBASE\n    value: "auto"\n')
+    values, problems = ds.plan({}, live, TEMPLATE, forced={"GOR_VERSION": "1"})
+    assert problems == []
+    assert values["USE_LAKEBASE"] == ("auto", ds.SOURCE_DEPLOYED)
+    _, problems = ds.plan({"USE_LAKEBASE": "false"}, live, TEMPLATE)
+    assert len(problems) == 1 and "turns Lakebase off" in problems[0]
+
+
+def test_read_live_falls_back_to_legacy_app_yml():
+    app = {"resources": [], "active_deployment": {"source_code_path": "/Workspace/x/app"}}
+    seen = []
+
+    def read_text(path):
+        seen.append(path)
+        return None if path.endswith("app.yaml") else DEPLOYED_YML
+    live = ds.read_live(app, read_text)
+    assert live["yml_readable"] is True and live["env"]["BRAND_NAME"] == "Acme"
+    assert seen == ["/Workspace/x/app/app.yaml", "/Workspace/x/app/app.yml"]
+
+
+def test_default_database_is_ontology_readiness():
+    values, _ = ds.plan({}, ds.read_live(None, lambda p: None), TEMPLATE)
+    assert values["LAKEBASE_DATABASE"] == ("ontology_readiness", ds.SOURCE_DEFAULT)
+
+
+def test_main_restores_committed_app_yaml_even_when_a_run_stops(tmp_path, monkeypatch):
+    """A CLI publish renders app/app.yaml. The committed text must come back, even on a stop."""
+    committed = 'env:\n  - name: BRAND_NAME\n    value: "Databricks"\n'
+    target = tmp_path / "app.yaml"
+    target.write_text(committed)
+    monkeypatch.setattr(post_deploy, "APP_CONFIG", target)
+
+    def rendered_then_stop():
+        target.write_text('env:\n  - name: BRAND_NAME\n    value: "Acme"\n')
+        raise SystemExit(1)
+    monkeypatch.setattr(post_deploy, "_main", rendered_then_stop)
+    with pytest.raises(SystemExit):
+        post_deploy.main()
+    assert target.read_text() == committed

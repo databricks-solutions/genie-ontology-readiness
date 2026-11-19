@@ -101,10 +101,10 @@ def read_resources(app):
         name = r.get("name")
         if name == WAREHOUSE_RESOURCE and (r.get("sql_warehouse") or {}).get("id"):
             out["WAREHOUSE_ID"] = str(r["sql_warehouse"]["id"])
-        elif name == LAKEBASE_RESOURCE and r.get("postgres"):
-            # Lakebase Autoscaling (the default for a new database). Not a setting this script
-            # can manage: find_problems stops before any change (see AUTOSCALING_STOP).
-            out["LAKEBASE_BRANCH"] = (r.get("postgres") or {}).get("branch") or ""
+        elif name == LAKEBASE_RESOURCE and "postgres" in r:
+            # Lakebase Autoscaling: not a setting this script manages (see read_live's
+            # `autoscaling` flag and AUTOSCALING_STOP).
+            continue
         elif name == LAKEBASE_RESOURCE:
             db = r.get("database") or {}
             out["LAKEBASE_INSTANCE_NAME"] = db.get("instance_name") or ""
@@ -119,11 +119,12 @@ def read_live(app, read_text):
     read. It is called only when the app has an active deployment."""
     if not app:
         return {"exists": False, "has_deployment": False, "yml_readable": True,
-                "env": {}, "resources": {}, "sp": "", "source_path": "", "git": False}
+                "env": {}, "resources": {}, "sp": "", "source_path": "", "git": False,
+                "autoscaling": False}
     deployment = app.get("active_deployment")
     has_deployment = bool(deployment)
     env, readable = {}, True
-    git = bool(deployment and deployment.get("git_source") and not deployment.get("source_code_path"))
+    git = bool(deployment and deployment.get("git_source"))
     if git:
         # Deployed from Git (the Apps UI path): it runs the committed app.yaml of that commit,
         # so its settings are the release defaults plus its resources. A deployment sent with
@@ -143,7 +144,10 @@ def read_live(app, read_text):
             "env": env, "resources": read_resources(app),
             "sp": app.get("service_principal_client_id") or "",
             "source_path": (deployment or {}).get("source_code_path") or "",
-            "git": git}
+            "git": git,
+            # A Lakebase Autoscaling lakebase-db (the default for a new database).
+            "autoscaling": any(r.get("name") == LAKEBASE_RESOURCE and "postgres" in r
+                               for r in app.get("resources") or [])}
 
 
 def choose_mode(app_exists, infra):
@@ -240,15 +244,15 @@ def find_problems(values, live, *, reset=False):
     With reset=True the deployed settings were ignored on purpose, so the checks that
     compare against them are skipped. An Autoscaling lakebase-db always stops: resetting
     would detach the history."""
-    if "LAKEBASE_BRANCH" in (live.get("resources") or {}):
+    if live.get("autoscaling"):
         return [AUTOSCALING_STOP]
     if reset:
         return []
     if live.get("git") and not live.get("yml_readable"):
         return [
             "The app is deployed from Git with custom settings (env_vars), and the API does not "
-            "return their values, so its settings are unknown. Set the values you want for this "
-            "run, and set RESET_SETTINGS=true to deploy them."
+            "return their values, so its settings are unknown. Upgrade it the way it was deployed: "
+            "in the Apps UI (Deploy from Git), or with the pipeline that set those env_vars."
         ]
     if live.get("has_deployment") and not live.get("yml_readable"):
         # The deployed settings are unknown, so no comparison against them is meaningful.
