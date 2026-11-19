@@ -19,7 +19,7 @@ describe('historyStatus', () => {
 describe('HistoryOffNotice', () => {
   it('says history is off and where to look', () => {
     const html = renderToStaticMarkup(createElement(HistoryOffNotice));
-    expect(html).toContain('History is off.');
+    expect(html).toContain('History is off:');
     expect(html).toContain('lakebase-db');
     expect(html).toContain('Can connect and create');
   });

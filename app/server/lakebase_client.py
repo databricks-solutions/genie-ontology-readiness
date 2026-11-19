@@ -107,15 +107,15 @@ def _lakebase_resource() -> dict:
 
     - Provisioned (``database``): ``instance`` and ``database`` names.
     - Autoscaling (``postgres``, the default for a new Lakebase database): ``branch``
-      (``projects/<p>/branches/<b>``). Its database name comes from PGDATABASE, which Apps
-      injects for both kinds; the credential needs the branch's read-write endpoint.
+      (``projects/<p>/branches/<b>``) and ``database_resource`` (the database's resource
+      name, not its Postgres name).
 
     Empty when not in a Databricks App or when the read fails. Read as the app service
-    principal. Holds no secret.
+    principal (a blocking SDK call: run it off the event loop). Holds no secret.
     """
     global _RESOURCE
     if _RESOURCE is None:
-        found = {"instance": "", "database": "", "branch": ""}
+        found = {"instance": "", "database": "", "branch": "", "database_resource": ""}
         app_name = os.environ.get("DATABRICKS_APP_NAME", "")
         if app_name:
             try:
@@ -128,7 +128,8 @@ def _lakebase_resource() -> dict:
                         found = {**found, "instance": resource.database.instance_name or "",
                                  "database": resource.database.database_name or ""}
                     elif getattr(resource, "postgres", None):
-                        found = {**found, "branch": resource.postgres.branch or ""}
+                        found = {**found, "branch": resource.postgres.branch or "",
+                                 "database_resource": resource.postgres.database or ""}
             except Exception as e:
                 logger.warning(f"Could not read the lakebase-db resource ({type(e).__name__}); "
                                "using the app settings and defaults")
@@ -141,12 +142,16 @@ def _is_endpoint_name(value: str) -> bool:
     return value.startswith("projects/") and "/endpoints/" in value
 
 
+def _host_of(endpoint) -> str:
+    """The host name of an Autoscaling endpoint object ("" when it has none yet)."""
+    return getattr(getattr(getattr(endpoint, "status", None), "hosts", None), "host", "") or ""
+
+
 def _endpoint_host(endpoint: str) -> str:
     """The host name of an Autoscaling endpoint, or "" when it can't be read (logged)."""
     try:
         from server.config import _get_workspace_client
-        ep = _get_workspace_client().postgres.get_endpoint(endpoint)
-        return getattr(getattr(getattr(ep, "status", None), "hosts", None), "host", "") or ""
+        return _host_of(_get_workspace_client().postgres.get_endpoint(endpoint))
     except Exception as e:
         logger.warning(f"Could not read the Lakebase endpoint host ({type(e).__name__})")
         return ""
@@ -155,8 +160,9 @@ def _endpoint_host(endpoint: str) -> str:
 def _autoscaling_endpoint(branch: str, host: str = "") -> str:
     """The compute endpoint of an Autoscaling branch to mint a credential for.
 
-    Prefers the endpoint whose host is the one the app connects to, then the read-write
-    endpoint. Returns "" when the branch has none or the list fails (logged)."""
+    The endpoint whose host is the one the app connects to, else the read-write endpoint.
+    Never a read-only endpoint picked at random: history writes need read-write. Returns ""
+    (logged) when the branch has no such endpoint or the list fails."""
     if not branch:
         return ""
     try:
@@ -166,44 +172,87 @@ def _autoscaling_endpoint(branch: str, host: str = "") -> str:
         logger.warning(f"Could not list the endpoints of the Lakebase branch ({type(e).__name__})")
         return ""
 
-    def _host(e):
-        return getattr(getattr(getattr(e, "status", None), "hosts", None), "host", "") or ""
-
     def _read_write(e):
         kind = getattr(getattr(e, "status", None), "endpoint_type", None)
         return "READ_WRITE" in str(getattr(kind, "value", kind) or "")
 
-    for match in ((lambda e: host and _host(e) == host), _read_write, (lambda e: True)):
+    for match in ((lambda e: host and _host_of(e) == host), _read_write):
         for e in endpoints:
             if e.name and match(e):
                 return e.name
+    logger.warning(f"The Lakebase branch has no read-write endpoint ({len(endpoints)} endpoint(s) listed)")
     return ""
 
 
-def _get_connection_config() -> dict:
-    """Read Lakebase connection config from environment variables.
+def _postgres_database_name(database_resource: str) -> str:
+    """The Postgres name of an Autoscaling database resource, or "" (logged)."""
+    if not database_resource:
+        return ""
+    try:
+        from server.config import _get_workspace_client
+        db = _get_workspace_client().postgres.get_database(database_resource)
+        for part in (getattr(db, "status", None), getattr(db, "spec", None)):
+            name = getattr(part, "postgres_database", None)
+            if name:
+                return name
+    except Exception as e:
+        logger.warning(f"Could not read the Lakebase database name ({type(e).__name__})")
+    return ""
 
-    Supports two modes:
-    1. Database resource (PGHOST/PGUSER injected by Databricks Apps) + OAuth token
-    2. Explicit LAKEBASE_* env vars (legacy / secrets-based)
 
-    Returns the sync-readable portion (host/port/database/user).
-    Password will be fetched asynchronously in init_pool() if needed.
+_TARGET: dict | None = None
+
+
+def _resolve_target() -> dict:
+    """Where and how to connect: host, port, database, user, and the endpoint (Autoscaling) or
+    instance (Provisioned) to mint a credential for. Resolved once per process (it makes
+    blocking SDK calls, so init_pool runs it in a thread) and reused on every token refresh.
+
+    Sources, first non-empty wins:
+    - credential target: LAKEBASE_ENDPOINT_NAME; an Autoscaling `valueFrom` (LAKEBASE_HOST is
+      then the endpoint name); the Autoscaling branch's read-write endpoint;
+      LAKEBASE_INSTANCE_NAME; the Provisioned resource's instance. An attached Autoscaling
+      resource is never paired with an instance credential.
+    - host: LAKEBASE_HOST (unless it is an endpoint name), then PGHOST, then the endpoint's host.
+    - database: LAKEBASE_DATABASE, PGDATABASE, the resource's database, the default.
     """
-    host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "localhost")
+    from server.runtime_config import resolve_database, resolve_instance, resolve_lakebase_user
+    res = _lakebase_resource()
+    raw_host = os.environ.get("LAKEBASE_HOST") or os.environ.get("PGHOST", "")
+
+    endpoint, source = os.environ.get("LAKEBASE_ENDPOINT_NAME", ""), "app setting LAKEBASE_ENDPOINT_NAME"
+    if not endpoint and _is_endpoint_name(raw_host):
+        endpoint, source = raw_host, "lakebase-db resource (Autoscaling)"
+    host = raw_host
     if _is_endpoint_name(host):
         # `valueFrom: lakebase-db` on an Autoscaling resource gives the endpoint's resource
         # name, not a host name. The host is in PGHOST, which Apps injects for the resource.
-        host = os.environ.get("PGHOST") or _endpoint_host(host) or host
-    port = int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432"))
-    from server.runtime_config import resolve_database, resolve_lakebase_user
+        host = os.environ.get("PGHOST") or _endpoint_host(host)
+    autoscaling = bool(endpoint or res["branch"])
+    if not endpoint and res["branch"]:
+        endpoint, source = _autoscaling_endpoint(res["branch"], host), "lakebase-db resource (Autoscaling branch)"
+
+    instance = ""
+    if autoscaling:
+        if endpoint:
+            logger.info(f"Lakebase Autoscaling endpoint from {source}")
+        else:
+            logger.warning("A Lakebase Autoscaling database is attached, but no read-write endpoint was found "
+                           "for it. Check that the branch has a running read-write compute endpoint.")
+    else:
+        instance, instance_source = resolve_instance(
+            os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
+            res["instance"] if not os.environ.get("LAKEBASE_INSTANCE_NAME") else "",
+        )
+        logger.info(f"Lakebase instance from {instance_source}")
 
     # Labels say where a value came from. PGDATABASE and PGUSER are what Apps injects for
     # an attached database resource, so they are labelled "database resource".
     app_db, pg_db = os.environ.get("LAKEBASE_DATABASE", ""), os.environ.get("PGDATABASE", "")
+    resource_db = "" if (app_db or pg_db) else (
+        res["database"] or _postgres_database_name(res["database_resource"]))
     database, database_source = resolve_database(
-        app_db or pg_db,
-        "" if (app_db or pg_db) else _lakebase_resource()["database"],
+        app_db or pg_db, resource_db,
         env_label="app setting" if app_db else "database resource",
         injected_label="lakebase-db resource lookup",
     )
@@ -214,13 +263,21 @@ def _get_connection_config() -> dict:
         env_label="app setting" if app_user else "database resource",
     )
     logger.info(f"Lakebase database from {database_source}; Lakebase user from {user_source}")
-
     return {
-        "host": host,
-        "port": port,
+        "host": host or "localhost",
+        "port": int(os.environ.get("LAKEBASE_PORT") or os.environ.get("PGPORT", "5432")),
         "database": database,
         "user": user,
+        "endpoint": endpoint,
+        "instance": instance,
     }
+
+
+async def _target() -> dict:
+    global _TARGET
+    if _TARGET is None:
+        _TARGET = await asyncio.to_thread(_resolve_target)
+    return _TARGET
 
 
 # `require` encrypts the connection but performs NO certificate or hostname check,
@@ -256,41 +313,21 @@ def _ssl_arg():
     return ctx
 
 
-async def init_pool() -> None:
-    """Create the asyncpg connection pool. Call during app startup."""
-    global _pool, _pool_created_at
+async def _create_pool():
+    """A new connection pool with a fresh credential, or None (logged). Never raises."""
     try:
         import asyncpg
 
-        config = _get_connection_config()
+        config = await _target()
         password = os.environ.get("LAKEBASE_PASSWORD", "")
 
-        # If no explicit password is set in a Databricks App, mint a credential
-        # as the app service principal. Prefer Autoscaling endpoint credentials;
-        # retain Provisioned instance credentials for existing deployments.
+        # If no explicit password is set in a Databricks App, mint a credential as the app
+        # service principal: for the Autoscaling endpoint, else the Provisioned instance.
         if not password and os.environ.get("DATABRICKS_APP_NAME"):
-            endpoint = os.environ.get("LAKEBASE_ENDPOINT_NAME", "")
-            endpoint_source = "app setting" if endpoint else ""
-            if not endpoint and _is_endpoint_name(os.environ.get("LAKEBASE_HOST", "")):
-                # An Autoscaling lakebase-db resource: valueFrom gives the endpoint itself.
-                endpoint, endpoint_source = os.environ["LAKEBASE_HOST"], "lakebase-db resource (valueFrom)"
-            from server.runtime_config import resolve_instance
-            instance, instance_source = resolve_instance(
-                os.environ.get("LAKEBASE_INSTANCE_NAME", ""),
-                _lakebase_resource()["instance"] if not os.environ.get("LAKEBASE_INSTANCE_NAME") else "",
-            )
-            if not endpoint and not instance and _lakebase_resource()["branch"]:
-                # Autoscaling resource (the default for a new Lakebase database).
-                endpoint = _autoscaling_endpoint(_lakebase_resource()["branch"], config["host"])
-                endpoint_source = "lakebase-db resource (Autoscaling branch)" if endpoint else ""
-            if endpoint:
-                logger.info(f"Lakebase Autoscaling endpoint from {endpoint_source}")
-            else:
-                logger.info(f"Lakebase instance from {instance_source}")
-            if endpoint or instance:
+            if config["endpoint"] or config["instance"]:
                 password = await _fetch_db_credential(
-                    instance_name=instance,
-                    endpoint_name=endpoint,
+                    instance_name=config["instance"],
+                    endpoint_name=config["endpoint"],
                 ) or ""
             else:
                 logger.warning(
@@ -299,17 +336,15 @@ async def init_pool() -> None:
                     "resource gave neither); no Lakebase credential available"
                 )
 
-        # If still no password, log and skip pool creation
         if not password:
             logger.warning(
                 "Lakebase password not set and no instance credential available — "
                 "assessment history will not persist"
             )
-            _pool = None
-            return
+            return None
 
         logger.info(f"Connecting to Lakebase at {config['host']}:{config['port']}/{config['database']}")
-        _pool = await asyncio.wait_for(
+        pool = await asyncio.wait_for(
             asyncpg.create_pool(
                 host=config["host"],
                 port=config["port"],
@@ -323,29 +358,52 @@ async def init_pool() -> None:
             ),
             timeout=10,  # Don't hang for more than 10s on pool creation
         )
-        _pool_created_at = time.time()
         logger.info("Lakebase connection pool initialized successfully")
+        return pool
     except Exception as e:
         logger.warning(f"Failed to initialize Lakebase pool (will fall back to SQL Warehouse): {e}")
-        _pool = None
+        return None
+
+
+async def init_pool() -> None:
+    """Create the asyncpg connection pool. Call during app startup."""
+    global _pool, _pool_created_at
+    _pool = await _create_pool()
+    _pool_created_at = time.time() if _pool is not None else 0.0
+
+
+_refresh_lock = asyncio.Lock()
+_last_refresh_try = 0.0
+REFRESH_RETRY_SECONDS = 60
 
 
 async def _refresh_pool_if_needed() -> None:
-    """Recreate pool if OAuth token is near expiry (~45 min)."""
-    global _pool, _pool_created_at
+    """Swap in a pool with a fresh credential when the current one nears expiry (~45 min).
+
+    The new pool is built first, so the current one keeps serving (history never looks off
+    and saves aren't dropped). If the new pool fails, the current one is kept (its credential
+    is valid for ~60 min) and the refresh is retried a minute later."""
+    global _pool, _pool_created_at, _last_refresh_try
     if _pool is None or _pool_created_at == 0:
         return
-    elapsed = time.time() - _pool_created_at
-    if elapsed < TOKEN_REFRESH_INTERVAL:
+    if time.time() - _pool_created_at < TOKEN_REFRESH_INTERVAL:
         return
-    logger.info(f"Refreshing Lakebase pool (age: {elapsed/60:.0f} min)")
+    async with _refresh_lock:
+        if time.time() - _pool_created_at < TOKEN_REFRESH_INTERVAL:
+            return  # another request refreshed it
+        if time.time() - _last_refresh_try < REFRESH_RETRY_SECONDS:
+            return
+        _last_refresh_try = time.time()
+        logger.info(f"Refreshing Lakebase pool (age: {(time.time() - _pool_created_at)/60:.0f} min)")
+        new_pool = await _create_pool()
+        if new_pool is None:
+            logger.warning("Lakebase pool refresh failed; keeping the current pool and retrying shortly")
+            return
+        old_pool, _pool, _pool_created_at = _pool, new_pool, time.time()
     try:
-        old_pool = _pool
-        _pool = None
         await old_pool.close()
     except Exception:
         pass
-    await init_pool()
 
 
 async def close_pool() -> None:
