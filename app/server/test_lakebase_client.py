@@ -2,6 +2,7 @@
 import asyncio
 import os
 import ssl
+import time
 import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -352,6 +353,19 @@ class ConnectionRetryTest(unittest.TestCase):
             asyncio.run(lc._refresh_credential())  # within MINT_RETRY_SECONDS: no second call
             self.assertEqual(mint.await_count, 1)
             self.assertEqual(lc._credential["token"], "old")  # a failed mint keeps the current one
+
+    def test_a_new_connection_does_not_repeat_a_failed_mint_during_the_cooldown(self):
+        mint = AsyncMock(side_effect=[None, "fresh"])
+        env = {"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}
+        with _Env(env, _client([_postgres_resource()])), patch.object(lc, "_fetch_db_credential", mint):
+            lc._TARGET = {"host": HOST, "port": 5432, "database": "d", "user": "u", "endpoint": EP, "instance": ""}
+            lc._credential.update(token="old", minted_at=0.0)  # stale
+            self.assertEqual(asyncio.run(lc._connection_password()), "old")  # the mint fails: current kept
+            self.assertEqual(asyncio.run(lc._connection_password()), "old")  # cooldown: no second mint
+            self.assertEqual(mint.await_count, 1)
+            lc._credential["retry_after"] = time.time() - 1  # the cooldown has passed
+            self.assertEqual(asyncio.run(lc._connection_password()), "fresh")
+            self.assertEqual(mint.await_count, 2)
 
     def test_a_busy_pool_is_waited_for_not_treated_as_a_connection_failure(self):
         # The pool yields a connection only after longer than the connect bound: pool contention.
