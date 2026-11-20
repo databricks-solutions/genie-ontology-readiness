@@ -52,9 +52,14 @@ export interface PendingPillar {
 }
 
 export interface RunAssessmentOptions {
+  /** The scope to start a new run with. Ignored when `runId` attaches to a run. */
   body: unknown;
+  /** Attach to a run that is already working (after a reload, or from a 409)
+   * instead of starting one. Its events replay from the first one. */
+  runId?: string;
   signal: AbortSignal;
   onEvent: (ev: AssessEvent) => void;
+  /** The run is live: it was started, or (attach) its first event arrived. */
   onRunId?: (runId: string) => void;
   /** Pillars that have not finished yet, read when building an error. */
   pending?: () => PendingPillar[];
@@ -112,10 +117,202 @@ const HINT =
   '(Compute → Apps → the app → Logs), narrow the catalog scope (New assessment → pick catalogs → ' +
   'Run assessment), or use a larger SQL warehouse.';
 
+/** Shown when the user stops a run. A stopped run is not saved. */
+export const RUN_STOPPED_NOTICE = 'The assessment was stopped. Nothing was saved.';
+
+/** Shown when a run was working here and is gone, and no saved result shows it finished. */
+export const RUN_LOST_MESSAGE =
+  "Your last assessment didn't finish (the app may have restarted). Nothing was saved. Run it again.";
+
+/** Shown for a remembered run that is gone, with history off (nothing could have been saved). */
+export const LAST_RUN_UNSAVED_NOTICE =
+  'Your last assessment is no longer running. It was not saved, so run it again to get a result.';
+
+/** Shown when a remembered run finished while the page was away, and its result is shown. */
+export const FINISHED_WHILE_AWAY_NOTICE = 'This assessment finished while you were away.';
+
+/** Shown when a completed run with history on could not be saved. */
+export const RUN_NOT_SAVED_NOTICE = "This run finished but couldn't be saved to history.";
+
+/** The notice for a completed run's save result: only a history-on run that did not save warns. */
+export function unsavedRunNotice(ev: AssessEvent, historySaves: boolean): string | null {
+  return ev.type === 'complete' && historySaves && ev.snapshot_saved === false ? RUN_NOT_SAVED_NOTICE : null;
+}
+
+/** True for the end of a run that the user stopped (not an error to show). */
+export function isUserStop(ev: AssessEvent): boolean {
+  return ev.type === 'error' && ev.reason === 'cancelled';
+}
+
+export const STOP_CONFIRM = 'Stop this assessment? A stopped run is not saved to history.';
+export const STOP_CONFLICT_CONFIRM = 'Stop the assessment that is already running? A stopped run is not saved to history.';
+export const RUN_JUST_FINISHED = 'The earlier assessment just finished. Run it again.';
+export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing was saved. You can run again now.';
+export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
+
+/** The run this browser last followed. Tied to the viewer, so one user never sees
+ * another's; `startedAt` (ms) finds the saved result if the run finished while away. */
+export const RUN_ID_KEY = 'gor.assess.run';
+
+export interface RememberedRun {
+  runId: string;
+  startedAt: number;
+}
+
+/** The remembered run for `viewer`, or null (another viewer's entry is ignored). */
+export function parseRemembered(raw: string | null, viewer: string): RememberedRun | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown; startedAt?: unknown };
+    if (v.viewer !== viewer || typeof v.runId !== 'string') return null;
+    return { runId: v.runId, startedAt: typeof v.startedAt === 'number' ? v.startedAt : 0 };
+  } catch {
+    return null;
+  }
+}
+
+export function rememberRun(runId: string, viewer: string, startedAt: number): void {
+  try {
+    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer, startedAt }));
+  } catch {
+    // Storage can be blocked. The notice for a run that is gone is then not shown.
+  }
+}
+
+export function forgetRun(): void {
+  try {
+    localStorage.removeItem(RUN_ID_KEY);
+  } catch {
+    // Nothing to clear when storage is blocked.
+  }
+}
+
+export function rememberedRun(viewer: string): RememberedRun | null {
+  try {
+    return parseRemembered(localStorage.getItem(RUN_ID_KEY), viewer);
+  } catch {
+    return null;
+  }
+}
+
+/** Slack for the clock difference between this browser and the server. */
+const CLOCK_SKEW_MS = 60_000;
+
+/** The newest saved result created at or after `startedAt` (the remembered run's start),
+ * or null. `list` returns the user's history (newest first). Errors count as none. */
+export async function findFinishedWhileAway(opts: {
+  list: () => Promise<Array<{ id: string | number; created_at: string }>>;
+  startedAt: number;
+}): Promise<number | null> {
+  try {
+    const rows = await opts.list();
+    const hit = rows.find((r) => Date.parse(r.created_at) >= opts.startedAt - CLOCK_SKEW_MS);
+    return hit ? Number(hit.id) : null;
+  } catch {
+    return null;
+  }
+}
+
+export type FollowFailure = 'conflict' | 'last-run-gone' | 'lost' | 'other';
+
+/** What a failed follow means. `began` is whether the page had already shown the run. */
+export function followFailure(e: unknown, ctx: { fromRemembered: boolean; began: boolean }): FollowFailure {
+  if (e instanceof ApiError && e.status === 409) return 'conflict';
+  if (e instanceof AssessRunError && e.message === RUN_LOST_MESSAGE) {
+    return ctx.fromRemembered && !ctx.began ? 'last-run-gone' : 'lost';
+  }
+  return 'other';
+}
+
+export interface ActiveRunResponse {
+  run_id: string | null;
+  /** The signed-in user the server sees (ties a remembered run to them). */
+  viewer?: string;
+  /** True for the one slot all users share when no identity is forwarded. */
+  shared?: boolean;
+}
+
+/** The run that a refused start (409) is blocked by, or null when none is found
+ * (it finished in the meantime, or the lookup failed). */
+export async function conflictingRunId(
+  getActive: () => Promise<ActiveRunResponse>
+): Promise<{ runId: string; shared: boolean } | null> {
+  try {
+    const active = await getActive();
+    return active.run_id ? { runId: active.run_id, shared: active.shared === true } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** On page load, follow the user's run that is still working. When none is working,
+ * follow the run this browser last followed (for this viewer). The attach fails
+ * with 404 when the server no longer has it. Never starts a run. */
+export async function reattachActive(opts: {
+  getActive: () => Promise<ActiveRunResponse>;
+  attach: (runId: string, remembered: RememberedRun | null) => Promise<unknown>;
+  mounted: () => boolean;
+  remembered?: (viewer: string) => RememberedRun | null;
+}): Promise<void> {
+  let active: ActiveRunResponse;
+  try {
+    active = await opts.getActive();
+  } catch {
+    return;
+  }
+  if (!opts.mounted()) return;
+  if (active.run_id) {
+    await opts.attach(active.run_id, null);
+    return;
+  }
+  const old = active.viewer ? opts.remembered?.(active.viewer) ?? null : null;
+  if (old) await opts.attach(old.runId, old);
+}
+
+/** One follower per page: a second start or attach while one is in progress is refused. */
+export function createFollowGate(): { tryStart: () => boolean; end: () => void; readonly busy: boolean } {
+  let busy = false;
+  return {
+    tryStart() {
+      if (busy) return false;
+      busy = true;
+      return true;
+    },
+    end() {
+      busy = false;
+    },
+    get busy() {
+      return busy;
+    },
+  };
+}
+
+export type StopOutcome = 'declined' | 'stopped' | 'ended';
+
+/** Stop a run after the user confirms. Sends the DELETE only when confirmed. A 404
+ * means the run had already ended ('ended'). Any other failure rejects, so the
+ * caller keeps showing the run as it was. */
+export async function stopWithConfirm(opts: {
+  runId: string;
+  message: string;
+  confirm: (message: string) => boolean;
+  del: (path: string) => Promise<unknown>;
+}): Promise<StopOutcome> {
+  if (!opts.confirm(opts.message)) return 'declined';
+  try {
+    await opts.del(`/assess/runs/${opts.runId}`);
+    return 'stopped';
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return 'ended';
+    throw e;
+  }
+}
+
 /** Run an assessment to the end, reconnecting as needed. Resolves when the run
  * is finished (complete or server-reported error, both sent via onEvent).
  * Rejects with AssessRunError when the run can't be followed, or with the
- * AbortError when `signal` aborts. */
+ * AbortError when `signal` aborts. Aborting only stops following: the server
+ * run keeps going. A 409 (one run per user) rejects with the ApiError. */
 export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAssessmentResult> {
   const start = opts.start ?? ((body: unknown) => apiPost<{ run_id: string }>('/assess/runs', body));
   const stream = opts.stream ?? ((path: string, signal: AbortSignal) => streamGetEvents<WireEvent>(path, signal));
@@ -139,13 +336,26 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
   };
 
   let runId: string;
-  try {
-    runId = (await start(opts.body)).run_id;
-  } catch (e) {
-    if (opts.signal.aborted) throw e;
-    throw fail('Could not start the assessment.', e, null);
+  // onRunId means "this run is live": a started run at once; an attached run on its first
+  // event (a run that is gone never gets one, so the caller keeps what it was showing).
+  let announced = false;
+  const announce = () => {
+    if (announced) return;
+    announced = true;
+    opts.onRunId?.(runId);
+  };
+  if (opts.runId) {
+    runId = opts.runId;
+  } else {
+    try {
+      runId = (await start(opts.body)).run_id;
+    } catch (e) {
+      if (opts.signal.aborted) throw e;
+      if (e instanceof ApiError && e.status === 409) throw e;
+      throw fail('Could not start the assessment.', e, null);
+    }
+    announce();
   }
-  opts.onRunId?.(runId);
 
   let next = 0;
   let failures = 0;
@@ -157,6 +367,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
       for await (const ev of stream(`/assess/runs/${runId}/events?after=${next}`, opts.signal)) {
         failures = 0;
         if (ev.type === 'end') {
+          announce();
           ended = true;
           break;
         }
@@ -165,6 +376,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
           windowClosed = true;
           break;
         }
+        announce();
         try {
           opts.onEvent(ev as AssessEvent);
         } catch (handlerError) {
@@ -179,7 +391,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
       if (e instanceof AssessRunError) throw e;
       if (opts.signal.aborted || (e as Error)?.name === 'AbortError') throw e;
       if (e instanceof ApiError && e.status === 404) {
-        throw fail('The assessment run was lost on the server.', e, runId);
+        throw fail(RUN_LOST_MESSAGE, e, runId);
       }
       failures += 1;
       if (failures > maxRetries) {

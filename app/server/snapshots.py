@@ -99,6 +99,11 @@ def _scope_fields(row) -> dict:
     return {"scope": scope, "scope_hash": row["scope_hash"]}
 
 
+async def saves_history() -> bool:
+    """True when completed runs are saved (Lakebase history is on and connected)."""
+    return await _enabled()
+
+
 async def save_snapshot(scorecard: dict, created_by: str | None = None,
                         scope: dict | None = None) -> int | None:
     """Persist a completed assessment; returns the new snapshot id (or None).
@@ -127,6 +132,25 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
     except Exception as e:
         logger.warning(f"save_snapshot failed: {e}")
         return None
+
+
+async def delete_snapshot(snapshot_id: int, created_by: str) -> bool:
+    """Remove one of a user's snapshots (used when a run was stopped while saving)."""
+    if not await _enabled():
+        return False
+    try:
+        from server.lakebase_client import get_pool
+        pool = await get_pool()
+        if pool is None:
+            return False
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                f"DELETE FROM {_table()} WHERE id = $1 AND created_by = $2", snapshot_id, created_by
+            )
+        return result.endswith(" 1")
+    except Exception as e:
+        logger.warning(f"delete_snapshot failed: {e}")
+        return False
 
 
 async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list[dict]:

@@ -130,13 +130,11 @@ export async function* streamGetEvents<T = unknown>(
   yield* readSseEvents<T>(res);
 }
 
-/** Best-effort DELETE (used to cancel a background run). Errors are ignored. */
-export async function apiDeleteQuiet(path: string): Promise<void> {
-  try {
-    await fetch(`${API_BASE}${path}`, { method: 'DELETE', keepalive: true });
-  } catch {
-    // The run expires on the server anyway.
-  }
+/** DELETE a resource. Throws ApiError (with the HTTP status) when the server refuses. */
+export async function apiDelete<T = unknown>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  if (!res.ok) throw new ApiError(await parseError(res), res.status);
+  return res.json() as Promise<T>;
 }
 
 /**

@@ -1,5 +1,26 @@
 import { describe, it, expect } from 'vitest';
-import { AssessRunError, abortableSleep, runAssessment, serverErrorDetails } from '../src/utils/assessRun';
+import {
+  AssessRunError,
+  RUN_JUST_FINISHED,
+  RUN_LOST_MESSAGE,
+  STOP_CONFIRM,
+  conflictingRunId,
+  createFollowGate,
+  followFailure,
+  LAST_RUN_UNSAVED_NOTICE,
+  FINISHED_WHILE_AWAY_NOTICE,
+  RUN_LOST_MESSAGE as LOST,
+  findFinishedWhileAway,
+  parseRemembered,
+  reattachActive,
+  stopWithConfirm,
+  unsavedRunNotice,
+  RUN_STOPPED_NOTICE,
+  abortableSleep,
+  isUserStop,
+  runAssessment,
+  serverErrorDetails,
+} from '../src/utils/assessRun';
 import { ApiError, isNetworkError, parseError } from '../src/hooks/useApi';
 
 // Hermetic tests for the reconnecting run client: the start + stream calls are
@@ -96,8 +117,104 @@ describe('runAssessment', () => {
     }).catch((e) => e);
 
     expect(err).toBeInstanceOf(AssessRunError);
-    expect(err.message).toMatch(/lost on the server/);
+    expect(err.message).toBe(RUN_LOST_MESSAGE);
+    expect(err.message).toMatch(/app may have restarted/);
     expect(err.details[0]).toContain('HTTP 404');
+  });
+
+  it('attaches to a run that is already working and replays it from the first event', async () => {
+    const { stream, paths } = scripted([
+      [
+        { type: 'pillar', pillar: { key: 'metadata' }, seq: 0 },
+        { type: 'end', next: 1 },
+      ],
+    ]);
+    const starts: unknown[] = [];
+    const ids: string[] = [];
+    const seen: string[] = [];
+    const res = await runAssessment({
+      body: {},
+      runId: 'live1',
+      signal: new AbortController().signal,
+      start: async (body) => {
+        starts.push(body);
+        return { run_id: 'new' };
+      },
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => ids.push(id),
+      onEvent: (ev) => seen.push(ev.type),
+    });
+
+    expect(starts).toEqual([]);
+    expect(ids).toEqual(['live1']);
+    expect(paths).toEqual(['/assess/runs/live1/events?after=0']);
+    expect(seen).toEqual(['pillar']);
+    expect(res).toEqual({ runId: 'live1', reconnects: 0 });
+  });
+
+  it('passes a 409 (one run per user) through as the ApiError, with its status', async () => {
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(409);
+  });
+
+  it('ends quietly when the user stops the run, and the stop is not an error', async () => {
+    const stopped = { type: 'error', error: 'The assessment was stopped.', reason: 'cancelled', seq: 1 };
+    const { stream } = scripted([[{ type: 'pillar', pillar: { key: 'k' }, seq: 0 }, stopped, { type: 'end', next: 2 }]]);
+    const events: Array<{ type: string; stop: boolean }> = [];
+    await runAssessment({
+      body: {},
+      runId: 'r',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: (ev) => events.push({ type: ev.type, stop: isUserStop(ev) }),
+    });
+
+    expect(events).toEqual([
+      { type: 'pillar', stop: false },
+      { type: 'error', stop: true },
+    ]);
+    expect(RUN_STOPPED_NOTICE).toMatch(/Nothing was saved/);
+  });
+
+  it('treats a run that failed (or hit a limit) as an error, not a stop', () => {
+    expect(isUserStop({ type: 'error', error: 'x', reason: 'failed' })).toBe(false);
+    expect(isUserStop({ type: 'complete', overall: {} as never, pillars: [], top_gaps: [] })).toBe(false);
+  });
+
+  it('rejects with AbortError when the page stops following; no cancel is sent', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const err = await runAssessment({
+      body: {},
+      runId: 'r',
+      signal: controller.signal,
+      stream: (path: string, signal: AbortSignal) => {
+        calls.push(path);
+        return (async function* () {
+          yield { type: 'pillar_progress', key: 'k', done: 0, total: 1, detail: '', seq: 0 } as never;
+          controller.abort();
+          throw new DOMException('Aborted', 'AbortError');
+        })();
+      },
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+
+    expect((err as Error).name).toBe('AbortError');
+    expect(calls).toEqual(['/assess/runs/r/events?after=0']);
   });
 });
 
@@ -212,5 +329,333 @@ describe('serverErrorDetails', () => {
       'Run ID: r',
       'Reference: abc123 (search the app logs for it)',
     ]);
+  });
+});
+
+describe('reattach on page load', () => {
+  it('follows the active run from its first event and never starts a new one', async () => {
+    const { stream, paths } = scripted([[{ type: 'pillar', pillar: { key: 'metadata' }, seq: 0 }, { type: 'end', next: 1 }]]);
+    let starts = 0;
+    const attached: string[] = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: 'live9', viewer: 'me@x' }),
+      attach: async (id: string) => {
+        attached.push(id);
+        await runAssessment({
+          body: {},
+          runId: id,
+          signal: new AbortController().signal,
+          start: async () => {
+            starts += 1;
+            return { run_id: 'nope' };
+          },
+          stream,
+          sleep: noSleep,
+          onEvent: () => undefined,
+        });
+      },
+      mounted: () => true,
+    });
+
+    expect(attached).toEqual(['live9']);
+    expect(starts).toBe(0);
+    expect(paths).toEqual(['/assess/runs/live9/events?after=0']);
+  });
+
+  it('does nothing when no run is active, the lookup fails, or the page is gone', async () => {
+    const attached: string[] = [];
+    const attach = async (id: string) => {
+      attached.push(id);
+    };
+    await reattachActive({ getActive: async () => ({ run_id: null, viewer: 'me@x' }), attach, mounted: () => true });
+    await reattachActive({
+      getActive: async () => {
+        throw new TypeError('Failed to fetch');
+      },
+      attach,
+      mounted: () => true,
+    });
+    await reattachActive({ getActive: async () => ({ run_id: 'x', viewer: 'me@x' }), attach, mounted: () => false });
+    expect(attached).toEqual([]);
+  });
+});
+
+describe('reload after a run was followed here', () => {
+  it('follows the remembered run for this viewer when none is active', async () => {
+    const attached: Array<[string, boolean]> = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: null, viewer: 'me@x' }),
+      attach: async (id, remembered) => {
+        attached.push([id, remembered !== null]);
+      },
+      mounted: () => true,
+      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x', startedAt: 5 }), viewer),
+    });
+    expect(attached).toEqual([['old7', true]]);
+  });
+
+  it('prefers the active run over a remembered one', async () => {
+    const attached: Array<[string, boolean]> = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: 'live', viewer: 'me@x' }),
+      attach: async (id, remembered) => {
+        attached.push([id, remembered !== null]);
+      },
+      mounted: () => true,
+      remembered: () => ({ runId: 'old', startedAt: 1 }),
+    });
+    expect(attached).toEqual([['live', false]]);
+  });
+
+  it('ignores a remembered run that belongs to another viewer (shared browser)', () => {
+    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x', startedAt: 9 });
+    expect(parseRemembered(raw, 'bob@x')).toBeNull();
+    expect(parseRemembered(raw, 'alice@x')).toEqual({ runId: 'theirs', startedAt: 9 });
+    expect(parseRemembered('not json', 'alice@x')).toBeNull();
+    expect(parseRemembered(null, 'alice@x')).toBeNull();
+  });
+
+  it('classifies a 404 on a remembered run (finished long ago) as not an error', async () => {
+    const { stream } = scripted([[new ApiError('This assessment run is no longer available.', 404)]]);
+    const err = await runAssessment({
+      body: {},
+      runId: 'old7',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(followFailure(err, { fromRemembered: true, began: false })).toBe('last-run-gone');
+    expect(LAST_RUN_UNSAVED_NOTICE).toMatch(/not saved/);
+    expect(FINISHED_WHILE_AWAY_NOTICE).toMatch(/finished while you were away/);
+  });
+
+  it('keeps the lost-run error for a run this tab was following, or was attaching to as active', async () => {
+    const lost = new AssessRunError(RUN_LOST_MESSAGE, []);
+    expect(followFailure(lost, { fromRemembered: true, began: true })).toBe('lost');
+    expect(followFailure(lost, { fromRemembered: false, began: false })).toBe('lost');
+    expect(followFailure(new ApiError('HTTP 500', 500), { fromRemembered: true, began: false })).toBe('other');
+    expect(followFailure(new ApiError('An assessment is already running.', 409), { fromRemembered: false, began: false })).toBe('conflict');
+  });
+});
+
+describe('the page keeps what it shows until a run is live', () => {
+  it('announces a started run once the start succeeds, and never on a refused start', async () => {
+    const lives: string[] = [];
+    const refused = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(refused.status).toBe(409);
+    expect(lives).toEqual([]);
+
+    await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => ({ run_id: 'new1' }),
+      stream: scripted([[{ type: 'end', next: 0 }]]).stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    });
+    expect(lives).toEqual(['new1']);
+  });
+
+  it('does not announce an attached run that is gone (404), so the shown scorecard stays', async () => {
+    const lives: string[] = [];
+    const { stream } = scripted([[new ApiError('gone', 404)]]);
+    await runAssessment({
+      body: {},
+      runId: 'gone1',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    }).catch(() => undefined);
+    expect(lives).toEqual([]);
+  });
+
+  it('announces an attached run on its first event', async () => {
+    const lives: string[] = [];
+    const { stream } = scripted([[{ type: 'pillar', pillar: { key: 'k' }, seq: 0 }, { type: 'end', next: 1 }]]);
+    await runAssessment({
+      body: {},
+      runId: 'live2',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    });
+    expect(lives).toEqual(['live2']);
+  });
+});
+
+describe('a start refused with 409 (one run per user)', () => {
+  it('finds the blocking run and "Open it" follows that id', async () => {
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(err.status).toBe(409);
+
+    const blocking = await conflictingRunId(async () => ({ run_id: 'busy1' }));
+    expect(blocking).toEqual({ runId: 'busy1', shared: false });
+
+    const { stream, paths } = scripted([[{ type: 'end', next: 0 }]]);
+    await runAssessment({
+      body: {},
+      runId: blocking?.runId,
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: () => undefined,
+    });
+    expect(paths).toEqual(['/assess/runs/busy1/events?after=0']);
+  });
+
+  it('says "just finished" when no run is active any more, or the lookup fails', async () => {
+    expect(await conflictingRunId(async () => ({ run_id: null }))).toBeNull();
+    expect(
+      await conflictingRunId(async () => {
+        throw new TypeError('Failed to fetch');
+      })
+    ).toBeNull();
+    expect(RUN_JUST_FINISHED).toMatch(/just finished/);
+  });
+});
+
+describe('stopWithConfirm', () => {
+  it('sends nothing when the user declines', async () => {
+    const calls: string[] = [];
+    const out = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: () => false,
+      del: async (p) => {
+        calls.push(p);
+      },
+    });
+    expect(out).toBe('declined');
+    expect(calls).toEqual([]);
+  });
+
+  it('sends the DELETE for the right run once confirmed', async () => {
+    const asked: string[] = [];
+    const calls: string[] = [];
+    const out = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: (m) => {
+        asked.push(m);
+        return true;
+      },
+      del: async (p) => {
+        calls.push(p);
+        return { cancelled: true };
+      },
+    });
+    expect(asked).toEqual([STOP_CONFIRM]);
+    expect(calls).toEqual(['/assess/runs/abc']);
+    expect(out).toBe('stopped');
+  });
+
+  it('reports a run that already ended (404) as ended, not as a failure', async () => {
+    const out = await stopWithConfirm({
+      runId: 'gone',
+      message: STOP_CONFIRM,
+      confirm: () => true,
+      del: async () => {
+        throw new ApiError('Assessment run not found.', 404);
+      },
+    });
+    expect(out).toBe('ended');
+  });
+
+  it('rejects when the stop fails, so the caller keeps the run on screen', async () => {
+    const err = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: () => true,
+      del: async () => {
+        throw new ApiError('HTTP 500', 500);
+      },
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(500);
+  });
+});
+
+describe('unsavedRunNotice', () => {
+  const complete = (snapshot_saved?: boolean) =>
+    ({ type: 'complete', overall: {} as never, pillars: [], top_gaps: [], snapshot_saved } as const);
+
+  it('warns only for a completed history-on run that did not save', () => {
+    expect(unsavedRunNotice(complete(false), true)).toBe("This run finished but couldn't be saved to history.");
+    expect(unsavedRunNotice(complete(true), true)).toBeNull();
+    // History off: nothing is saved by design, so no warning.
+    expect(unsavedRunNotice(complete(false), false)).toBeNull();
+    expect(unsavedRunNotice({ type: 'pillar', pillar: {} as never }, true)).toBeNull();
+  });
+});
+
+describe('one follower per page', () => {
+  it('refuses a second start while one is in progress, and allows one again after it ends', () => {
+    const gate = createFollowGate();
+    expect(gate.busy).toBe(false);
+    expect(gate.tryStart()).toBe(true); // attach to the active run
+    expect(gate.busy).toBe(true);
+    expect(gate.tryStart()).toBe(false); // a second follow (Run, or Open it) is ignored
+    gate.end();
+    expect(gate.busy).toBe(false);
+    expect(gate.tryStart()).toBe(true);
+  });
+});
+
+describe('a remembered run that finished while the page was away', () => {
+  const history = [
+    { id: 9, created_at: '2026-11-20T10:30:00Z' },
+    { id: 8, created_at: '2026-11-20T09:00:00Z' },
+  ];
+  const at = Date.parse('2026-11-20T10:00:00Z');
+
+  it('finds the newest saved result created at or after the remembered run started', async () => {
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: at })).toBe(9);
+  });
+
+  it('finds none when every saved result is from before the run started, or the list fails', async () => {
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: Date.parse('2026-11-20T11:00:00Z') })).toBeNull();
+    expect(
+      await findFinishedWhileAway({
+        list: async () => {
+          throw new TypeError('Failed to fetch');
+        },
+        startedAt: at,
+      })
+    ).toBeNull();
+  });
+
+  it('tolerates a little clock skew between this browser and the server', async () => {
+    const justAfter = Date.parse('2026-11-20T10:30:30Z');
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: justAfter })).toBe(9);
+  });
+
+  it('keeps the lost message for a run that did not finish (history on, no saved result)', () => {
+    expect(LOST).toMatch(/didn't finish/);
+    expect(LOST).toMatch(/Nothing was saved/);
   });
 });
