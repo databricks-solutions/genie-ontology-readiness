@@ -30,6 +30,7 @@ import {
   isUserStop,
   LAST_RUN_UNSAVED_NOTICE,
   FINISHED_WHILE_AWAY_NOTICE,
+  completionEffects,
   findFinishedWhileAway,
   RUN_LOST_MESSAGE,
   rememberRun,
@@ -227,6 +228,9 @@ export default function Scorecard({
   // Following the run in this tab. Aborting it only stops following: the run goes on
   // on the server, and the page can reattach to it (see the mount effect).
   const abortRef = useRef<AbortController | null>(null);
+  // Always the latest refreshHistory (a run followed from mount must not keep a stale one).
+  const refreshRef = useRef<() => void>(() => {});
+  refreshRef.current = refreshHistory;
   // One follower at a time. `busy` covers the gap before the first event (attaching
   // to a run that is working but has not emitted yet): Run and New are disabled then.
   const gate = useRef(createFollowGate()).current;
@@ -495,7 +499,7 @@ export default function Scorecard({
       setCurrentId(null);
       setPhase('running');
       setActiveRunId(runId);
-      if (viewerRef.current) rememberRun(runId, viewerRef.current, Date.now());
+      if (viewerRef.current) rememberRun(runId, viewerRef.current);
     };
     const pending = (): PendingPillar[] =>
       config.pillars
@@ -532,8 +536,9 @@ export default function Scorecard({
             setTopGaps(ev.top_gaps);
             setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
             setPhase('done');
-            if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
-            refreshHistory();
+            const done = completionEffects(ev, historyState === 'saved');
+            if (done.currentId != null) setCurrentId(done.currentId);
+            if (done.refreshHistory) refreshRef.current();
           } else if (isUserStop(ev)) {
             forgetRun();
             setNotice(RUN_STOPPED_NOTICE);
@@ -567,13 +572,13 @@ export default function Scorecard({
         const finishedId = remembered && historyState === 'saved'
           ? await findFinishedWhileAway({
               list: () => apiGet<HistoryResponse>('/assess/history').then((h) => h.snapshots || []),
-              startedAt: remembered.startedAt,
+              runId: remembered.runId,
             })
           : null;
         if (finishedId != null) {
           await loadSnapshot(finishedId);
           setNotice(FINISHED_WHILE_AWAY_NOTICE);
-          refreshHistory();
+          refreshRef.current();
         } else if (historyState === 'saved') {
           showError(RUN_LOST_MESSAGE, []);
         } else {

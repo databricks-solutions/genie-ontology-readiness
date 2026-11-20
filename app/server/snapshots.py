@@ -135,22 +135,20 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
 
 
 async def delete_snapshot(snapshot_id: int, created_by: str) -> bool:
-    """Remove one of a user's snapshots (used when a run was stopped while saving)."""
+    """Remove one of a user's snapshots (used when a run was stopped while saving).
+
+    True when a row was removed. A database error is raised, so the caller can retry."""
     if not await _enabled():
         return False
-    try:
-        from server.lakebase_client import get_pool
-        pool = await get_pool()
-        if pool is None:
-            return False
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                f"DELETE FROM {_table()} WHERE id = $1 AND created_by = $2", snapshot_id, created_by
-            )
-        return result.endswith(" 1")
-    except Exception as e:
-        logger.warning(f"delete_snapshot failed: {e}")
+    from server.lakebase_client import get_pool
+    pool = await get_pool()
+    if pool is None:
         return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            f"DELETE FROM {_table()} WHERE id = $1 AND created_by = $2", snapshot_id, created_by
+        )
+    return result.endswith(" 1")
 
 
 async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list[dict]:
@@ -167,7 +165,8 @@ async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list
             return []
         async with lakebase_connection(pool) as conn:
             rows = await conn.fetch(
-                f"SELECT id, created_at, created_by, overall_score, overall_level{_scope_select()} "
+                f"SELECT id, created_at, created_by, overall_score, overall_level{_scope_select()}, "
+                f"scorecard->>'run_id' AS run_id "
                 f"FROM {_table()} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
                 f"ORDER BY created_at DESC LIMIT $2",
                 created_by,
@@ -180,6 +179,8 @@ async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list
                 "created_by": r["created_by"],
                 "overall_score": r["overall_score"],
                 "overall_level": r["overall_level"],
+                # The run that produced it (null for runs saved before this was recorded).
+                "run_id": r.get("run_id"),
                 **_scope_fields(r),
             }
             for r in rows

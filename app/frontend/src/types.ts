@@ -216,6 +216,8 @@ export interface HistorySnapshot {
   overall_level: number;
   scope?: AssessmentScope | null;
   scope_hash?: string | null;
+  /** The run that produced the result (absent for results saved before it was recorded). */
+  run_id?: string | null;
 }
 
 export interface HistoryResponse {

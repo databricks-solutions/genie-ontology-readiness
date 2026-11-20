@@ -33,6 +33,7 @@ from server import snapshots
 from server.scope import scope_hash
 from server.assessment.scoring import run_assessment_stream
 from server.config import MAX_RUN_SECONDS as CONFIG_MAX_RUN_SECONDS, set_user_token
+from server.sql_client import submit_without_wait
 from server.security import safe_error
 from server.workspace_filter import set_catalog_scope, set_schema_scope, set_workspace_filter
 
@@ -262,6 +263,9 @@ async def _drive(
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
 ) -> None:
+    # Statements of this run are submitted without a server-side wait, so each one's id
+    # is known at once and a Stop can cancel it (see sql_client.execute_sql).
+    submit_without_wait()
     # create_task copied the caller's context, so these settings stay local to
     # this run and reach the probe tasks it creates.
     set_user_token(user_token)
@@ -289,7 +293,7 @@ async def _drive(
 async def _save_bounded(event: dict, run: AssessmentRun) -> None:
     """The snapshot write, for at most SAVE_TIMEOUT_SECONDS."""
     try:
-        await asyncio.wait_for(_save_snapshot(event, run.principal, run.scope), SAVE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(_save_snapshot(event, run.principal, run.scope, run.id), SAVE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.warning("snapshot save for run %s took longer than %ss; giving up on it", run.id, SAVE_TIMEOUT_SECONDS)
         event.setdefault("scope", run.scope)
@@ -309,15 +313,46 @@ async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
         raise
 
 
+# A stopped run's row is removed. A failed removal is retried, then logged as an error.
+REMOVE_ATTEMPTS = 3
+REMOVE_RETRY_SECONDS = 2.0
+REMOVE_TIMEOUT_SECONDS = 30.0
+# Strong references to the removals in flight (a task nobody holds can be dropped).
+_removals: set[asyncio.Task] = set()
+
+
+async def _remove_snapshot(snapshot_id: int, principal: str) -> None:
+    delay = REMOVE_RETRY_SECONDS
+    for attempt in range(1, REMOVE_ATTEMPTS + 1):
+        try:
+            await asyncio.wait_for(snapshots.delete_snapshot(snapshot_id, principal), REMOVE_TIMEOUT_SECONDS)
+            return
+        except Exception as e:
+            if attempt == REMOVE_ATTEMPTS:
+                logger.error(
+                    "could not remove snapshot %s of a stopped run after %d attempts (%s): it is still in history",
+                    snapshot_id, attempt, e,
+                )
+                return
+            logger.warning("removing snapshot %s failed (attempt %d): %s; retrying", snapshot_id, attempt, e)
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
 def _remove_if_stopped(event: dict, run: AssessmentRun) -> None:
     sid = event.get("snapshot_id")
     if sid is not None and run.cancel_why is not None:
         logger.info("run %s was stopped while saving; removing snapshot %s", run.id, sid)
-        asyncio.ensure_future(snapshots.delete_snapshot(sid, run.principal))
+        task = asyncio.ensure_future(_remove_snapshot(sid, run.principal))
+        _removals.add(task)
+        task.add_done_callback(_removals.discard)
 
 
-async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:
-    scorecard = {"overall": event["overall"], "pillars": event["pillars"], "top_gaps": event["top_gaps"]}
+async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None,
+                         run_id: Optional[str] = None) -> None:
+    # run_id names the run in its saved result, so a page can find its own result exactly.
+    scorecard = {"overall": event["overall"], "pillars": event["pillars"], "top_gaps": event["top_gaps"],
+                 "run_id": run_id}
     event["scope"] = scope
     event["scope_hash"] = scope_hash(scope)
     try:

@@ -508,8 +508,9 @@ class StopAfterFinishTest(unittest.IsolatedAsyncioTestCase):
             second.task.cancel()
             # The write finishes in the background, then its row is removed.
             release.set()
-            for _ in range(5):
+            for _ in range(20):
                 await asyncio.sleep(0)
+            await asyncio.gather(*list(runs._removals))  # the removal is held and awaited, not lost
 
         self.assertEqual(run.events[-1]["type"], "error")
         self.assertEqual(run.events[-1]["reason"], "cancelled")
@@ -752,6 +753,188 @@ class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertTrue(any(url.endswith("/statements/stmt-1/cancel") for url in session.posts), session.posts)
+
+
+class _Acquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _Pool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _Acquire(self.conn)
+
+
+class _Conn:
+    def __init__(self, result="DELETE 1"):
+        self.result = result
+        self.calls = []
+
+    async def execute(self, sql, *args):
+        self.calls.append((sql, args))
+        return self.result
+
+
+class SnapshotDeleteTest(unittest.IsolatedAsyncioTestCase):
+    """delete_snapshot's SQL and results (the stopped-run removal depends on them)."""
+
+    def _patched(self, enabled=True, pool=None):
+        from server import snapshots
+        return (
+            patch.object(snapshots, "_enabled", AsyncMock(return_value=enabled)),
+            patch.object(snapshots, "_table", lambda: "t_hist"),
+            patch("server.lakebase_client.get_pool", AsyncMock(return_value=pool)),
+        )
+
+    async def test_deletes_only_the_given_row_of_the_given_owner(self):
+        from server import snapshots
+        conn = _Conn("DELETE 1")
+        a, b, c = self._patched(pool=_Pool(conn))
+        with a, b, c:
+            self.assertTrue(await snapshots.delete_snapshot(7, "a@x"))
+        sql, args = conn.calls[0]
+        self.assertEqual(sql, "DELETE FROM t_hist WHERE id = $1 AND created_by = $2")
+        self.assertEqual(args, (7, "a@x"))
+
+    async def test_false_when_no_row_matched(self):
+        from server import snapshots
+        a, b, c = self._patched(pool=_Pool(_Conn("DELETE 0")))
+        with a, b, c:
+            self.assertFalse(await snapshots.delete_snapshot(7, "someone-else@x"))
+
+    async def test_false_without_touching_the_database_when_history_is_off(self):
+        from server import snapshots
+        get_pool = AsyncMock()
+        with patch.object(snapshots, "_enabled", AsyncMock(return_value=False)), \
+             patch("server.lakebase_client.get_pool", get_pool):
+            self.assertFalse(await snapshots.delete_snapshot(7, "a@x"))
+        get_pool.assert_not_awaited()
+
+    async def test_false_when_the_pool_is_gone(self):
+        from server import snapshots
+        a, b, c = self._patched(pool=None)
+        with a, b, c:
+            self.assertFalse(await snapshots.delete_snapshot(7, "a@x"))
+
+    async def test_a_database_error_is_raised_so_the_caller_can_retry(self):
+        from server import snapshots
+
+        class Broken(_Conn):
+            async def execute(self, sql, *args):
+                raise RuntimeError("lakebase down")
+
+        a, b, c = self._patched(pool=_Pool(Broken()))
+        with a, b, c, self.assertRaises(RuntimeError):
+            await snapshots.delete_snapshot(7, "a@x")
+
+
+class RemovalRetryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_failed_removal_is_retried_then_logged_as_an_error(self):
+        delete = AsyncMock(side_effect=RuntimeError("lakebase down"))
+        with patch.object(runs.snapshots, "delete_snapshot", delete), \
+             patch.object(runs, "REMOVE_RETRY_SECONDS", 0.001):
+            with self.assertLogs("server.assessment.runs", level="ERROR") as logs:
+                await runs._remove_snapshot(7, "a@x")
+        self.assertEqual(delete.await_count, runs.REMOVE_ATTEMPTS)
+        self.assertIn("still in history", logs.output[0])
+
+    async def test_a_removal_that_succeeds_on_retry_is_not_an_error(self):
+        delete = AsyncMock(side_effect=[RuntimeError("blip"), True])
+        with patch.object(runs.snapshots, "delete_snapshot", delete), \
+             patch.object(runs, "REMOVE_RETRY_SECONDS", 0.001):
+            with self.assertNoLogs("server.assessment.runs", level="ERROR"):
+                await runs._remove_snapshot(7, "a@x")
+        self.assertEqual(delete.await_count, 2)
+
+    async def test_the_removal_task_is_held_until_it_ends(self):
+        gate = asyncio.Event()
+
+        async def slow(*args):
+            await gate.wait()
+            return True
+
+        with patch.object(runs.snapshots, "delete_snapshot", slow):
+            run = runs.AssessmentRun(id="stopped1", principal="a@x")
+            run.cancel_why = runs.USER_STOP
+            runs._remove_if_stopped({"snapshot_id": 9}, run)
+            self.assertEqual(len(runs._removals), 1)
+            gate.set()
+            await asyncio.gather(*list(runs._removals))
+        self.assertEqual(len(runs._removals), 0)
+
+
+class SavedResultNamesItsRunTest(unittest.IsolatedAsyncioTestCase):
+    async def test_the_saved_scorecard_carries_the_run_id(self):
+        save = AsyncMock(return_value=5)
+        event = {"overall": {}, "pillars": [], "top_gaps": []}
+        with patch.object(runs.snapshots, "save_snapshot", save):
+            await runs._save_snapshot(event, "a@x", None, "run-abc")
+        self.assertEqual(save.await_args.args[0]["run_id"], "run-abc")
+        self.assertEqual(event["snapshot_id"], 5)
+
+
+class SubmitWithoutWaitTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_run_submits_without_a_server_wait_and_other_callers_keep_theirs(self):
+        from server import sql_client
+
+        execute_once = AsyncMock(return_value=[])
+
+        async def in_run():
+            sql_client.submit_without_wait()
+            await sql_client.execute_sql("SELECT 1", record=False)
+
+        async def not_a_run():
+            await sql_client.execute_sql("SELECT 1", record=False)
+
+        with patch.object(sql_client, "_execute_once", execute_once), \
+             patch.object(sql_client, "FORCE_SP", False), \
+             patch.object(sql_client, "get_user_token", lambda: None):
+            await asyncio.create_task(in_run())
+            await asyncio.create_task(not_a_run())
+        waits = [c.kwargs["wait_seconds"] for c in execute_once.await_args_list]
+        self.assertEqual(waits, [0, 50])
+
+    async def test_polling_starts_quickly_so_a_run_is_not_slowed(self):
+        from server.sql_client import _poll_statement
+
+        class Resp:
+            status = 200
+
+            def __init__(self, body):
+                self._body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def json(self):
+                return self._body
+
+        reads = {"n": 0}
+
+        class Session:
+            def get(self, url, **kwargs):
+                reads["n"] += 1
+                state = "SUCCEEDED" if reads["n"] >= 3 else "RUNNING"
+                return Resp({"status": {"state": state}, "manifest": {}, "result": {}})
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await _poll_statement(Session(), "https://h", {}, "stmt-2", 60)
+        elapsed = loop.time() - start
+        self.assertEqual(reads["n"], 3)
+        self.assertLess(elapsed, 1.0)  # 0.1 s + 0.2 s, not 2 x 1 s
 
 
 class RunCapConfigTest(unittest.TestCase):
