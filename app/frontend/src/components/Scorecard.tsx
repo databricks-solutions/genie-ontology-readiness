@@ -24,8 +24,10 @@ import {
   STOP_CONFIRM,
   STOP_CONFLICT_CONFIRM,
   conflictingRunId,
+  followFailure,
   forgetRun,
   isUserStop,
+  lastRunGoneNotice,
   rememberRun,
   rememberedRun,
   reattachActive,
@@ -210,6 +212,13 @@ export default function Scorecard({
   const historyState = historyStatus(config);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
+  // The signed-in user, as the server sees it (from /assess/runs/active). Ties a remembered run to them.
+  const viewerRef = useRef<string | null>(null);
+  const fetchActive = () =>
+    apiGet<ActiveRunResponse>('/assess/runs/active').then((r) => {
+      if (r.viewer) viewerRef.current = r.viewer;
+      return r;
+    });
   // Following the run in this tab. Aborting it only stops following: the run goes on
   // on the server, and the page can reattach to it (see the mount effect).
   const abortRef = useRef<AbortController | null>(null);
@@ -328,8 +337,8 @@ export default function Scorecard({
     // A run that is still working (this tab was closed or reloaded meanwhile): show its progress again.
     let mounted = true;
     void reattachActive({
-      getActive: () => apiGet<ActiveRunResponse>('/assess/runs/active'),
-      attach: (id) => follow({ attachTo: id }),
+      getActive: fetchActive,
+      attach: (id, fromRemembered) => follow({ attachTo: id, fromRemembered }),
       mounted: () => mounted,
       remembered: rememberedRun,
     });
@@ -442,24 +451,32 @@ export default function Scorecard({
     });
   }
 
-  /** Follow a run (a new one, `body`, or one already working, `attachTo`) until it ends. */
-  async function follow({ body, attachTo }: { body?: unknown; attachTo?: string }) {
-    setError(null);
-    setErrorDetails(null);
-    setNotice(null);
-    setConflictRunId(null);
-    setPillarsByKey({});
-    setProgressByKey({});
-    setOverall(null);
-    setTopGaps([]);
-    setCurrentId(null);
-    setPhase('running');
+  /** Follow a run (a new one, `body`, or one already working, `attachTo`) until it ends.
+   * What is on screen is kept until the run is live (started, or its first event
+   * arrived), so a refused start or a run that is gone leaves the page as it was. */
+  async function follow({ body, attachTo, fromRemembered = false }: { body?: unknown; attachTo?: string; fromRemembered?: boolean }) {
     const controller = new AbortController();
     abortRef.current = controller;
 
     const collected: Record<string, PillarScore> = {};
     const progress: Record<string, string> = {};
     let completed = false;
+    let began = false;
+    const begin = (runId: string) => {
+      began = true;
+      setError(null);
+      setErrorDetails(null);
+      setNotice(null);
+      setConflictRunId(null);
+      setPillarsByKey({});
+      setProgressByKey({});
+      setOverall(null);
+      setTopGaps([]);
+      setCurrentId(null);
+      setPhase('running');
+      setActiveRunId(runId);
+      if (viewerRef.current) rememberRun(runId, viewerRef.current);
+    };
     const pending = (): PendingPillar[] =>
       config.pillars
         .filter((cp) => !collected[cp.key])
@@ -478,8 +495,7 @@ export default function Scorecard({
         signal: controller.signal,
         pending,
         onRunId: (id) => {
-          setActiveRunId(id);
-          rememberRun(id);
+          if (!began) begin(id);
         },
         onEvent: (ev) => {
           if (ev.type === 'pillar') {
@@ -507,24 +523,29 @@ export default function Scorecard({
           }
         },
       });
-      if (!completed) idlePhase();
+      if (!completed && began) idlePhase();
       forgetRun();
     } catch (e) {
       // Unmount or reload: this tab stops following. The run itself is not cancelled.
       if ((e as Error).name === 'AbortError') return;
-      if (e instanceof ApiError && e.status === 409) {
-        // One run per user: offer to open the one that is working, or stop it.
-        idlePhase();
-        forgetRun();
-        const id = await conflictingRunId(() => apiGet<ActiveRunResponse>('/assess/runs/active'));
+      const failure = followFailure(e, { fromRemembered, began });
+      if (failure === 'conflict') {
+        // One run per user: the page keeps what it showed; offer to open the one working, or stop it.
+        const id = await conflictingRunId(fetchActive);
         if (id) setConflictRunId(id);
         else showError(RUN_JUST_FINISHED, []);
         return;
       }
       forgetRun();
+      if (failure === 'last-run-gone') {
+        // Not an error: the run ended long ago (or the app restarted). Point to the history.
+        setNotice(lastRunGoneNotice(historyState === 'saved'));
+        refreshHistory();
+        return;
+      }
       if (e instanceof AssessRunError) showError(e.message, e.details);
       else showError((e as Error).message, []);
-      idlePhase();
+      if (began) idlePhase();
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setActiveRunId(null);

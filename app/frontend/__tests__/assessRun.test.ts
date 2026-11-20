@@ -5,6 +5,9 @@ import {
   RUN_LOST_MESSAGE,
   STOP_CONFIRM,
   conflictingRunId,
+  followFailure,
+  lastRunGoneNotice,
+  parseRemembered,
   reattachActive,
   stopWithConfirm,
   unsavedRunNotice,
@@ -331,7 +334,7 @@ describe('reattach on page load', () => {
     let starts = 0;
     const attached: string[] = [];
     await reattachActive({
-      getActive: async () => ({ run_id: 'live9' }),
+      getActive: async () => ({ run_id: 'live9', viewer: 'me@x' }),
       attach: async (id) => {
         attached.push(id);
         await runAssessment({
@@ -360,7 +363,7 @@ describe('reattach on page load', () => {
     const attach = async (id: string) => {
       attached.push(id);
     };
-    await reattachActive({ getActive: async () => ({ run_id: null }), attach, mounted: () => true });
+    await reattachActive({ getActive: async () => ({ run_id: null, viewer: 'me@x' }), attach, mounted: () => true });
     await reattachActive({
       getActive: async () => {
         throw new TypeError('Failed to fetch');
@@ -368,24 +371,47 @@ describe('reattach on page load', () => {
       attach,
       mounted: () => true,
     });
-    await reattachActive({ getActive: async () => ({ run_id: 'x' }), attach, mounted: () => false });
+    await reattachActive({ getActive: async () => ({ run_id: 'x', viewer: 'me@x' }), attach, mounted: () => false });
     expect(attached).toEqual([]);
   });
 });
 
-describe('reload after a restart', () => {
-  it('follows the remembered run when none is active, and says it is lost when the server has no record', async () => {
-    const attached: string[] = [];
+describe('reload after a run was followed here', () => {
+  it('follows the remembered run for this viewer when none is active', async () => {
+    const attached: Array<[string, boolean]> = [];
     await reattachActive({
-      getActive: async () => ({ run_id: null }),
-      attach: async (id) => {
-        attached.push(id);
+      getActive: async () => ({ run_id: null, viewer: 'me@x' }),
+      attach: async (id, fromRemembered) => {
+        attached.push([id, fromRemembered]);
       },
       mounted: () => true,
-      remembered: () => 'old7',
+      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x' }), viewer),
     });
-    expect(attached).toEqual(['old7']);
+    expect(attached).toEqual([['old7', true]]);
+  });
 
+  it('prefers the active run over a remembered one', async () => {
+    const attached: Array<[string, boolean]> = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: 'live', viewer: 'me@x' }),
+      attach: async (id, fromRemembered) => {
+        attached.push([id, fromRemembered]);
+      },
+      mounted: () => true,
+      remembered: () => 'old',
+    });
+    expect(attached).toEqual([['live', false]]);
+  });
+
+  it('ignores a remembered run that belongs to another viewer (shared browser)', () => {
+    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x' });
+    expect(parseRemembered(raw, 'bob@x')).toBeNull();
+    expect(parseRemembered(raw, 'alice@x')).toBe('theirs');
+    expect(parseRemembered('not json', 'alice@x')).toBeNull();
+    expect(parseRemembered(null, 'alice@x')).toBeNull();
+  });
+
+  it('classifies a 404 on a remembered run (finished long ago) as not an error', async () => {
     const { stream } = scripted([[new ApiError('This assessment run is no longer available.', 404)]]);
     const err = await runAssessment({
       body: {},
@@ -395,18 +421,77 @@ describe('reload after a restart', () => {
       sleep: noSleep,
       onEvent: () => undefined,
     }).catch((e) => e);
-    expect(err).toBeInstanceOf(AssessRunError);
-    expect(err.message).toBe(RUN_LOST_MESSAGE);
+    expect(followFailure(err, { fromRemembered: true, began: false })).toBe('last-run-gone');
+    expect(lastRunGoneNotice(true)).toMatch(/Assessments/);
+    expect(lastRunGoneNotice(false)).toMatch(/not saved/);
   });
 
-  it('prefers the active run over a remembered one, and attaches to nothing when neither exists', async () => {
-    const attached: string[] = [];
-    const attach = async (id: string) => {
-      attached.push(id);
-    };
-    await reattachActive({ getActive: async () => ({ run_id: 'live' }), attach, mounted: () => true, remembered: () => 'old' });
-    await reattachActive({ getActive: async () => ({ run_id: null }), attach, mounted: () => true, remembered: () => null });
-    expect(attached).toEqual(['live']);
+  it('keeps the lost-run error for a run this tab was following, or was attaching to as active', async () => {
+    const lost = new AssessRunError(RUN_LOST_MESSAGE, []);
+    expect(followFailure(lost, { fromRemembered: true, began: true })).toBe('lost');
+    expect(followFailure(lost, { fromRemembered: false, began: false })).toBe('lost');
+    expect(followFailure(new ApiError('HTTP 500', 500), { fromRemembered: true, began: false })).toBe('other');
+    expect(followFailure(new ApiError('An assessment is already running.', 409), { fromRemembered: false, began: false })).toBe('conflict');
+  });
+});
+
+describe('the page keeps what it shows until a run is live', () => {
+  it('announces a started run once the start succeeds, and never on a refused start', async () => {
+    const lives: string[] = [];
+    const refused = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(refused.status).toBe(409);
+    expect(lives).toEqual([]);
+
+    await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => ({ run_id: 'new1' }),
+      stream: scripted([[{ type: 'end', next: 0 }]]).stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    });
+    expect(lives).toEqual(['new1']);
+  });
+
+  it('does not announce an attached run that is gone (404), so the shown scorecard stays', async () => {
+    const lives: string[] = [];
+    const { stream } = scripted([[new ApiError('gone', 404)]]);
+    await runAssessment({
+      body: {},
+      runId: 'gone1',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    }).catch(() => undefined);
+    expect(lives).toEqual([]);
+  });
+
+  it('announces an attached run on its first event', async () => {
+    const lives: string[] = [];
+    const { stream } = scripted([[{ type: 'pillar', pillar: { key: 'k' }, seq: 0 }, { type: 'end', next: 1 }]]);
+    await runAssessment({
+      body: {},
+      runId: 'live2',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => lives.push(id),
+      onEvent: () => undefined,
+    });
+    expect(lives).toEqual(['live2']);
   });
 });
 

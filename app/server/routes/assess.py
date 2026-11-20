@@ -133,7 +133,9 @@ async def assess_run_start(
     try:
         run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
                              exclusive=not shared, scope=_run_scope(wsf, cat_scope, sch_scope),
-                             keep_going=await snapshots.saves_history())
+                             # A shared-bucket run is not offered to anyone, so it has no
+                             # reader to come back to: it gets the no-reader stop, like a legacy run.
+                             keep_going=not shared and await snapshots.saves_history())
     except runs.ActiveRunExists as e:
         return JSONResponse(
             {"error": "An assessment is already running. Open it, or stop it first.", "run_id": e.run_id},
@@ -146,10 +148,11 @@ async def assess_run_start(
 async def assess_run_active(principal: str = Depends(current_principal)):
     """The current user's assessment run that is still working, so the page can
     show its progress again after a reload. ``run_id`` is null when there is none."""
+    # ``viewer`` lets the page tie a remembered run id to this user (see the UI).
     run = runs.active_run(principal)
     if run is None:
-        return {"run_id": None}
-    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1)}
+        return {"run_id": None, "viewer": principal}
+    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1), "viewer": principal}
 
 
 @router.get("/assess/runs/{run_id}/events")

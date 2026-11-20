@@ -50,6 +50,9 @@ MAX_RUN_SECONDS = CONFIG_MAX_RUN_SECONDS
 # A run that nothing is reading, and that cannot keep going on its own (history
 # off, or a legacy one-request stream), is cancelled after this long.
 ABANDON_SECONDS = 90.0
+# The snapshot write has this long before the run gives up on saving it (it is then
+# reported as not saved, and the run ends).
+SAVE_TIMEOUT_SECONDS = 60.0
 # How often the sweeper enforces the limits above.
 SWEEP_INTERVAL_SECONDS = 15.0
 
@@ -131,7 +134,9 @@ class ActiveRunExists(Exception):
 
 
 def _cancel(run: AssessmentRun, why: str) -> None:
-    if run.finishing:
+    # A user stop is deferred while the result is being saved (see cancel_run). A
+    # limit or shutdown is not: it must still end the run, even mid-save.
+    if run.finishing and why == USER_STOP:
         return
     if run.task and not run.task.done():
         logger.info("cancelling assessment run %s: %s", run.id, why)
@@ -289,18 +294,21 @@ async def _drive(
 
 
 async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
-    """Save a completed run. A stop that arrives during the write is held back
-    until the write ends: the row may already be committed, so the run is then
-    reported as completed and saved, never as stopped."""
+    """Save a completed run, for at most SAVE_TIMEOUT_SECONDS. A user stop does not
+    interrupt it (the row may commit, so the run ends completed). A limit or
+    shutdown does, and then the run ends cancelled."""
     save = asyncio.ensure_future(_save_snapshot(event, run.principal, run.scope))
-    while True:
-        try:
-            await asyncio.shield(save)
-            return
-        except asyncio.CancelledError:
-            if save.done():
-                raise
-            # The save is still running: keep waiting for it.
+    try:
+        await asyncio.wait_for(asyncio.shield(save), SAVE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("snapshot save for run %s took longer than %ss; giving up on it", run.id, SAVE_TIMEOUT_SECONDS)
+        save.cancel()
+        event.setdefault("scope", run.scope)
+        event.setdefault("scope_hash", scope_hash(run.scope))
+        event["snapshot_saved"] = False
+    except asyncio.CancelledError:
+        save.cancel()
+        raise
 
 
 async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:

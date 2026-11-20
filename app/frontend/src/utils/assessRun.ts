@@ -59,6 +59,7 @@ export interface RunAssessmentOptions {
   runId?: string;
   signal: AbortSignal;
   onEvent: (ev: AssessEvent) => void;
+  /** The run is live: it was started, or (attach) its first event arrived. */
   onRunId?: (runId: string) => void;
   /** Pillars that have not finished yet, read when building an error. */
   pending?: () => PendingPillar[];
@@ -143,14 +144,26 @@ export const RUN_JUST_FINISHED = 'The earlier assessment just finished. Run it a
 export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing was saved. You can run again now.';
 export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
 
-/** The run this browser last followed, kept so a reload can tell a lost run from none. */
-export const RUN_ID_KEY = 'gor.assess.runId';
+/** The run this browser last followed, kept so a reload can tell a lost or finished
+ * run from none. It is tied to the viewer, so one user never sees another's. */
+export const RUN_ID_KEY = 'gor.assess.run';
 
-export function rememberRun(runId: string): void {
+/** The remembered run id for `viewer`, or null (another viewer's entry is ignored). */
+export function parseRemembered(raw: string | null, viewer: string): string | null {
+  if (!raw) return null;
   try {
-    localStorage.setItem(RUN_ID_KEY, runId);
+    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown };
+    return v.viewer === viewer && typeof v.runId === 'string' ? v.runId : null;
   } catch {
-    // Storage can be blocked. The lost-run notice is then simply not shown.
+    return null;
+  }
+}
+
+export function rememberRun(runId: string, viewer: string): void {
+  try {
+    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer }));
+  } catch {
+    // Storage can be blocked. The notice for a run that is gone is then not shown.
   }
 }
 
@@ -162,16 +175,37 @@ export function forgetRun(): void {
   }
 }
 
-export function rememberedRun(): string | null {
+export function rememberedRun(viewer: string): string | null {
   try {
-    return localStorage.getItem(RUN_ID_KEY);
+    return parseRemembered(localStorage.getItem(RUN_ID_KEY), viewer);
   } catch {
     return null;
   }
 }
 
+/** Shown when the run this browser last followed is no longer running (it ended long
+ * ago, or the app restarted). Not an error: it points to the history instead. */
+export function lastRunGoneNotice(historySaves: boolean): string {
+  return historySaves
+    ? "Your last assessment is no longer running. If it finished, it's in Assessments."
+    : 'Your last assessment is no longer running. It was not saved, so run it again to get a result.';
+}
+
+export type FollowFailure = 'conflict' | 'last-run-gone' | 'lost' | 'other';
+
+/** What a failed follow means. `began` is whether the page had already shown the run. */
+export function followFailure(e: unknown, ctx: { fromRemembered: boolean; began: boolean }): FollowFailure {
+  if (e instanceof ApiError && e.status === 409) return 'conflict';
+  if (e instanceof AssessRunError && e.message === RUN_LOST_MESSAGE) {
+    return ctx.fromRemembered && !ctx.began ? 'last-run-gone' : 'lost';
+  }
+  return 'other';
+}
+
 export interface ActiveRunResponse {
   run_id: string | null;
+  /** The signed-in user the server sees (ties a remembered run to them). */
+  viewer?: string;
 }
 
 /** The run that a refused start (409) is blocked by, or null when none is found
@@ -185,13 +219,13 @@ export async function conflictingRunId(getActive: () => Promise<ActiveRunRespons
 }
 
 /** On page load, follow the user's run that is still working. When none is working,
- * follow the run this browser last followed: if the server no longer has it, the
- * attach fails with RUN_LOST_MESSAGE (the app restarted). Never starts a run. */
+ * follow the run this browser last followed (for this viewer). The attach fails
+ * with 404 when the server no longer has it. Never starts a run. */
 export async function reattachActive(opts: {
   getActive: () => Promise<ActiveRunResponse>;
-  attach: (runId: string) => Promise<unknown>;
+  attach: (runId: string, fromRemembered: boolean) => Promise<unknown>;
   mounted: () => boolean;
-  remembered?: () => string | null;
+  remembered?: (viewer: string) => string | null;
 }): Promise<void> {
   let active: ActiveRunResponse;
   try {
@@ -200,8 +234,12 @@ export async function reattachActive(opts: {
     return;
   }
   if (!opts.mounted()) return;
-  const runId = active.run_id ?? opts.remembered?.() ?? null;
-  if (runId) await opts.attach(runId);
+  if (active.run_id) {
+    await opts.attach(active.run_id, false);
+    return;
+  }
+  const old = active.viewer ? opts.remembered?.(active.viewer) ?? null : null;
+  if (old) await opts.attach(old, true);
 }
 
 export type StopOutcome = 'declined' | 'stopped' | 'ended';
@@ -253,6 +291,14 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
   };
 
   let runId: string;
+  // onRunId means "this run is live": a started run at once; an attached run on its first
+  // event (a run that is gone never gets one, so the caller keeps what it was showing).
+  let announced = false;
+  const announce = () => {
+    if (announced) return;
+    announced = true;
+    opts.onRunId?.(runId);
+  };
   if (opts.runId) {
     runId = opts.runId;
   } else {
@@ -263,8 +309,8 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
       if (e instanceof ApiError && e.status === 409) throw e;
       throw fail('Could not start the assessment.', e, null);
     }
+    announce();
   }
-  opts.onRunId?.(runId);
 
   let next = 0;
   let failures = 0;
@@ -276,6 +322,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
       for await (const ev of stream(`/assess/runs/${runId}/events?after=${next}`, opts.signal)) {
         failures = 0;
         if (ev.type === 'end') {
+          announce();
           ended = true;
           break;
         }
@@ -284,6 +331,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
           windowClosed = true;
           break;
         }
+        announce();
         try {
           opts.onEvent(ev as AssessEvent);
         } catch (handlerError) {

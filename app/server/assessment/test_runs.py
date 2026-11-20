@@ -375,13 +375,13 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again.status_code, 409)
         self.assertEqual(again.json()["run_id"], run_id)
         self.assertEqual(active.json()["run_id"], run_id)
-        self.assertEqual(other.json(), {"run_id": None})
+        self.assertIsNone(other.json()["run_id"])
 
         # Once the run ends, there is nothing active and a new run can start.
         runs._runs[run_id].task.cancel()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        self.assertEqual((await self.client.get("/api/assess/runs/active")).json(), {"run_id": None})
+        self.assertIsNone((await self.client.get("/api/assess/runs/active")).json()["run_id"])
 
     async def test_delete_then_immediate_post_is_not_a_409(self):
         async def slow():
@@ -498,16 +498,56 @@ class StopAfterFinishTest(unittest.IsolatedAsyncioTestCase):
              patch.object(runs.snapshots, "save_snapshot", slow_save):
             run = runs.start_run("a@x", None, None, None, None)
             await save_started.wait()
-            # The stop is refused during the save, and a cancel that slips through is held.
+            # The stop is refused during the save, and a user stop that reaches the run is deferred.
             self.assertFalse(runs.cancel_run(run.id, "a@x"))
-            run.task.cancel()
-            await asyncio.sleep(0)
+            runs._cancel(run, runs.USER_STOP)
+            self.assertIsNone(run.cancel_why)
             release.set()
             await run.task
 
         self.assertEqual(run.events[-1]["type"], "complete")
         self.assertEqual(run.events[-1]["snapshot_id"], 42)
         self.assertTrue(run.events[-1]["snapshot_saved"])
+
+    async def test_a_hung_save_still_ends_at_the_run_cap(self):
+        started = asyncio.Event()
+
+        async def completes():
+            yield {"type": "complete", "overall": {}, "pillars": [], "top_gaps": []}
+
+        async def hangs(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(runs, "run_assessment_stream", completes), \
+             patch.object(runs.snapshots, "save_snapshot", hangs):
+            run = runs.start_run("a@x", None, None, None, None)
+            await started.wait()
+            run.started_at -= runs.MAX_RUN_SECONDS + 1  # past the hard cap
+            runs._sweep()
+            with self.assertRaises(asyncio.CancelledError):
+                await run.task
+
+        self.assertTrue(run.done)
+        self.assertEqual(run.events[-1]["reason"], "failed")
+        self.assertIn("run time limit", run.events[-1]["error"])
+
+    async def test_a_save_that_never_returns_is_given_up_after_the_timeout(self):
+        async def completes():
+            yield {"type": "complete", "overall": {}, "pillars": [], "top_gaps": []}
+
+        async def hangs(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with patch.object(runs, "run_assessment_stream", completes), \
+             patch.object(runs.snapshots, "save_snapshot", hangs), \
+             patch.object(runs, "SAVE_TIMEOUT_SECONDS", 0.05):
+            run = runs.start_run("a@x", None, None, None, None)
+            await asyncio.wait_for(run.task, 5)
+
+        self.assertTrue(run.done)
+        self.assertEqual(run.events[-1]["type"], "complete")
+        self.assertFalse(run.events[-1]["snapshot_saved"])
 
 
 class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
@@ -547,14 +587,24 @@ class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(active.json(), {"run_id": None})
+        self.assertIsNone(active.json()["run_id"])
         self.assertFalse(runs._runs[first.json()["run_id"]].exclusive)
+
+    async def test_shared_bucket_runs_get_the_no_reader_stop_even_with_history_on(self):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow), \
+             patch.object(runs.snapshots, "saves_history", AsyncMock(return_value=True)):
+            r = await self.client.post("/api/assess/runs", json={})
+        self.assertFalse(runs._runs[r.json()["run_id"]].keep_going)
 
     async def test_a_run_from_another_user_cannot_be_stopped_or_read_as_active(self):
         other = runs.AssessmentRun(id="theirs", principal="someone@x")
         other.exclusive = True
         runs._runs[other.id] = other
-        self.assertEqual((await self.client.get("/api/assess/runs/active")).json(), {"run_id": None})
+        self.assertIsNone((await self.client.get("/api/assess/runs/active")).json()["run_id"])
         self.assertEqual((await self.client.delete("/api/assess/runs/theirs")).status_code, 404)
         self.assertFalse(other.done)
 
