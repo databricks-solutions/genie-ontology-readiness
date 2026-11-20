@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, useEffect } from 'react';
 import { Layers, Search, Check, ChevronDown, Loader2, Info } from 'lucide-react';
+import { selectedFirst } from '../utils/pickerOrder';
 
 const WHY_SINGLE_CATALOG =
   'To select an individual schema, first pick a single catalog. Schema scope is only available when exactly one catalog is selected.';
@@ -46,10 +47,13 @@ export default function SchemaFilter({
     if (locked) setOpen(false);
   }, [locked]);
 
+  // The selected schema floats to the top. Single-select closes the list on a pick,
+  // so the live value cannot reorder rows while the list is open.
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return q ? schemas.filter((s) => s.name.toLowerCase().includes(q)) : schemas;
-  }, [query, schemas]);
+    const matches = q ? schemas.filter((s) => s.name.toLowerCase().includes(q)) : schemas;
+    return selectedFirst(matches, (s) => s.name === value);
+  }, [query, schemas, value]);
 
   const summary = locked
     ? 'All schemas'
