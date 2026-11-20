@@ -47,8 +47,20 @@ function stamp(): string {
 // Build and download a ZIP: summary.csv + one <pillar-key>.csv per pillar that
 // has drill-down rows (the same content that pillar's own Export CSV produces).
 // jszip is loaded on demand so it is a separate chunk, fetched only when a user exports.
+// A redeploy replaces the hashed chunk, so a tab opened before it cannot fetch the old one.
+export const EXPORT_LOAD_ERROR =
+  "Export couldn't load. The app may have been updated: reload the page and try again.";
+
+async function loadJSZip() {
+  try {
+    return await import('jszip');
+  } catch {
+    throw new Error(EXPORT_LOAD_ERROR);
+  }
+}
+
 export async function downloadAllZip(pillars: PillarScore[]): Promise<void> {
-  const { default: JSZip } = await import('jszip');
+  const { default: JSZip } = await loadJSZip();
   const zip = new JSZip();
   zip.file('summary.csv', buildSummaryCsv(pillars));
   for (const p of pillars) {
