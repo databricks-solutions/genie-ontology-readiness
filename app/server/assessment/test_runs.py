@@ -598,6 +598,31 @@ class HistoryOffFlagTest(unittest.IsolatedAsyncioTestCase):
                     r.task.cancel()
 
 
+class SourcesResolvedOnceTest(unittest.IsolatedAsyncioTestCase):
+    """The catalog set is resolved once per assessment: a later probe must not re-ask
+    the bindings API (under the viewer token, which may have expired by then)."""
+
+    async def test_later_probes_keep_the_first_catalog_set_when_bindings_fail(self):
+        from server.assessment import probes
+        from server.workspace_filter import set_workspace_filter
+
+        # First call succeeds; a second call (token expired mid-run) would return None.
+        bindings = AsyncMock(side_effect=[[{"name": "c1"}], None])
+
+        async def assess_in_one_context():
+            set_workspace_filter({"mode": "include", "workspace_ids": ["1"]})
+            first = await probes.prime_request_sources()
+            later = await probes._resolve_sources()  # what every later probe calls
+            return first, later
+
+        with patch.object(probes, "accessible_catalogs", bindings), \
+             patch.object(probes, "execute_sql", AsyncMock(return_value=[])):
+            first, later = await asyncio.create_task(assess_in_one_context())
+
+        self.assertEqual(bindings.await_count, 1)
+        self.assertIs(later, first)
+
+
 class RunCapConfigTest(unittest.TestCase):
     def test_env_override_and_bad_values(self):
         from server.config import env_seconds

@@ -7,6 +7,7 @@ import {
   conflictingRunId,
   reattachActive,
   stopWithConfirm,
+  unsavedRunNotice,
   RUN_STOPPED_NOTICE,
   abortableSleep,
   isUserStop,
@@ -507,5 +508,18 @@ describe('stopWithConfirm', () => {
     }).catch((e) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(500);
+  });
+});
+
+describe('unsavedRunNotice', () => {
+  const complete = (snapshot_saved?: boolean) =>
+    ({ type: 'complete', overall: {} as never, pillars: [], top_gaps: [], snapshot_saved } as const);
+
+  it('warns only for a completed history-on run that did not save', () => {
+    expect(unsavedRunNotice(complete(false), true)).toBe("This run finished but couldn't be saved to history.");
+    expect(unsavedRunNotice(complete(true), true)).toBeNull();
+    // History off: nothing is saved by design, so no warning.
+    expect(unsavedRunNotice(complete(false), false)).toBeNull();
+    expect(unsavedRunNotice({ type: 'pillar', pillar: {} as never }, true)).toBeNull();
   });
 });

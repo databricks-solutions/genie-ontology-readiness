@@ -29,6 +29,7 @@ import {
   rememberRun,
   rememberedRun,
   reattachActive,
+  unsavedRunNotice,
   runAssessment,
   serverErrorDetails,
   stopWithConfirm,
@@ -490,7 +491,7 @@ export default function Scorecard({
           } else if (ev.type === 'complete') {
             completed = true;
             forgetRun();
-            setNotice(null);
+            setNotice(unsavedRunNotice(ev, historyState === 'saved'));
             setOverall(ev.overall);
             setTopGaps(ev.top_gaps);
             setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });

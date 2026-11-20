@@ -124,6 +124,14 @@ export const RUN_LOST_MESSAGE =
   'The assessment run is no longer on the server: the app restarted, or it ended more than 15 minutes ago. ' +
   'If it finished with history on, it is in your history. Otherwise, run it again.';
 
+/** Shown when a completed run with history on could not be saved. */
+export const RUN_NOT_SAVED_NOTICE = "This run finished but couldn't be saved to history.";
+
+/** The notice for a completed run's save result: only a history-on run that did not save warns. */
+export function unsavedRunNotice(ev: AssessEvent, historySaves: boolean): string | null {
+  return ev.type === 'complete' && historySaves && ev.snapshot_saved === false ? RUN_NOT_SAVED_NOTICE : null;
+}
+
 /** True for the end of a run that the user stopped (not an error to show). */
 export function isUserStop(ev: AssessEvent): boolean {
   return ev.type === 'error' && ev.reason === 'cancelled';
