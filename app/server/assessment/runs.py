@@ -79,8 +79,6 @@ class AssessmentRun:
     # Browsers reading the events now, and when one last read them.
     readers: int = 0
     last_read: float = field(default_factory=time.monotonic)
-    # The completed result is being saved: it can no longer be stopped.
-    finishing: bool = False
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -134,10 +132,6 @@ class ActiveRunExists(Exception):
 
 
 def _cancel(run: AssessmentRun, why: str) -> None:
-    # A user stop is deferred while the result is being saved (see cancel_run). A
-    # limit or shutdown is not: it must still end the run, even mid-save.
-    if run.finishing and why == USER_STOP:
-        return
     if run.task and not run.task.done():
         logger.info("cancelling assessment run %s: %s", run.id, why)
         run.cancel_why = why
@@ -198,16 +192,16 @@ def active_run(principal: str) -> Optional[AssessmentRun]:
     wind down, but a new run must not be refused because of it."""
     for run in _runs.values():
         if (run.principal == principal and run.exclusive and not run.done
-                and not run.finishing and run.cancel_why is None):
+                and run.cancel_why is None):
             return run
     return None
 
 
 def cancel_run(run_id: str, principal: str) -> bool:
-    """Stop a run that is still working. False when there is nothing to stop:
-    the run is unknown, already finished, or saving its result."""
+    """Stop a run that is still working, at once (also while its result is being
+    saved). False when there is nothing to stop: unknown, or already finished."""
     run = get_run(run_id, principal)
-    if run is None or run.done or run.finishing:
+    if run is None or run.done:
         return False
     _cancel(run, USER_STOP)
     return True
@@ -277,7 +271,6 @@ async def _drive(
     try:
         async for event in run_assessment_stream():
             if event.get("type") == "complete":
-                run.finishing = True
                 await _save_snapshot_to_end(event, run)
             run.append(event)
     except asyncio.CancelledError:
@@ -293,22 +286,34 @@ async def _drive(
         run.finish()
 
 
-async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
-    """Save a completed run, for at most SAVE_TIMEOUT_SECONDS. A user stop does not
-    interrupt it (the row may commit, so the run ends completed). A limit or
-    shutdown does, and then the run ends cancelled."""
-    save = asyncio.ensure_future(_save_snapshot(event, run.principal, run.scope))
+async def _save_bounded(event: dict, run: AssessmentRun) -> None:
+    """The snapshot write, for at most SAVE_TIMEOUT_SECONDS."""
     try:
-        await asyncio.wait_for(asyncio.shield(save), SAVE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(_save_snapshot(event, run.principal, run.scope), SAVE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.warning("snapshot save for run %s took longer than %ss; giving up on it", run.id, SAVE_TIMEOUT_SECONDS)
-        save.cancel()
         event.setdefault("scope", run.scope)
         event.setdefault("scope_hash", scope_hash(run.scope))
         event["snapshot_saved"] = False
+
+
+async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
+    """Save a completed run. A stop (or a limit) ends the run at once. If the write
+    is still in flight then, it finishes in the background and its row is removed
+    (see _remove_if_stopped): a stopped run is never in history."""
+    save = asyncio.ensure_future(_save_bounded(event, run))
+    try:
+        await asyncio.shield(save)
     except asyncio.CancelledError:
-        save.cancel()
+        save.add_done_callback(lambda _t: _remove_if_stopped(event, run))
         raise
+
+
+def _remove_if_stopped(event: dict, run: AssessmentRun) -> None:
+    sid = event.get("snapshot_id")
+    if sid is not None and run.cancel_why is not None:
+        logger.info("run %s was stopped while saving; removing snapshot %s", run.id, sid)
+        asyncio.ensure_future(snapshots.delete_snapshot(sid, run.principal))
 
 
 async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:

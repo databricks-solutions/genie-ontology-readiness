@@ -5,8 +5,12 @@ import {
   RUN_LOST_MESSAGE,
   STOP_CONFIRM,
   conflictingRunId,
+  createFollowGate,
   followFailure,
-  lastRunGoneNotice,
+  LAST_RUN_UNSAVED_NOTICE,
+  FINISHED_WHILE_AWAY_NOTICE,
+  RUN_LOST_MESSAGE as LOST,
+  findFinishedWhileAway,
   parseRemembered,
   reattachActive,
   stopWithConfirm,
@@ -114,7 +118,7 @@ describe('runAssessment', () => {
 
     expect(err).toBeInstanceOf(AssessRunError);
     expect(err.message).toBe(RUN_LOST_MESSAGE);
-    expect(err.message).toMatch(/app restarted/);
+    expect(err.message).toMatch(/app may have restarted/);
     expect(err.details[0]).toContain('HTTP 404');
   });
 
@@ -335,7 +339,7 @@ describe('reattach on page load', () => {
     const attached: string[] = [];
     await reattachActive({
       getActive: async () => ({ run_id: 'live9', viewer: 'me@x' }),
-      attach: async (id) => {
+      attach: async (id: string) => {
         attached.push(id);
         await runAssessment({
           body: {},
@@ -381,11 +385,11 @@ describe('reload after a run was followed here', () => {
     const attached: Array<[string, boolean]> = [];
     await reattachActive({
       getActive: async () => ({ run_id: null, viewer: 'me@x' }),
-      attach: async (id, fromRemembered) => {
-        attached.push([id, fromRemembered]);
+      attach: async (id, remembered) => {
+        attached.push([id, remembered !== null]);
       },
       mounted: () => true,
-      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x' }), viewer),
+      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x', startedAt: 5 }), viewer),
     });
     expect(attached).toEqual([['old7', true]]);
   });
@@ -394,19 +398,19 @@ describe('reload after a run was followed here', () => {
     const attached: Array<[string, boolean]> = [];
     await reattachActive({
       getActive: async () => ({ run_id: 'live', viewer: 'me@x' }),
-      attach: async (id, fromRemembered) => {
-        attached.push([id, fromRemembered]);
+      attach: async (id, remembered) => {
+        attached.push([id, remembered !== null]);
       },
       mounted: () => true,
-      remembered: () => 'old',
+      remembered: () => ({ runId: 'old', startedAt: 1 }),
     });
     expect(attached).toEqual([['live', false]]);
   });
 
   it('ignores a remembered run that belongs to another viewer (shared browser)', () => {
-    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x' });
+    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x', startedAt: 9 });
     expect(parseRemembered(raw, 'bob@x')).toBeNull();
-    expect(parseRemembered(raw, 'alice@x')).toBe('theirs');
+    expect(parseRemembered(raw, 'alice@x')).toEqual({ runId: 'theirs', startedAt: 9 });
     expect(parseRemembered('not json', 'alice@x')).toBeNull();
     expect(parseRemembered(null, 'alice@x')).toBeNull();
   });
@@ -422,8 +426,8 @@ describe('reload after a run was followed here', () => {
       onEvent: () => undefined,
     }).catch((e) => e);
     expect(followFailure(err, { fromRemembered: true, began: false })).toBe('last-run-gone');
-    expect(lastRunGoneNotice(true)).toMatch(/Assessments/);
-    expect(lastRunGoneNotice(false)).toMatch(/not saved/);
+    expect(LAST_RUN_UNSAVED_NOTICE).toMatch(/not saved/);
+    expect(FINISHED_WHILE_AWAY_NOTICE).toMatch(/finished while you were away/);
   });
 
   it('keeps the lost-run error for a run this tab was following, or was attaching to as active', async () => {
@@ -510,12 +514,12 @@ describe('a start refused with 409 (one run per user)', () => {
     expect(err.status).toBe(409);
 
     const blocking = await conflictingRunId(async () => ({ run_id: 'busy1' }));
-    expect(blocking).toBe('busy1');
+    expect(blocking).toEqual({ runId: 'busy1', shared: false });
 
     const { stream, paths } = scripted([[{ type: 'end', next: 0 }]]);
     await runAssessment({
       body: {},
-      runId: blocking ?? undefined,
+      runId: blocking?.runId,
       signal: new AbortController().signal,
       stream,
       sleep: noSleep,
@@ -606,5 +610,52 @@ describe('unsavedRunNotice', () => {
     // History off: nothing is saved by design, so no warning.
     expect(unsavedRunNotice(complete(false), false)).toBeNull();
     expect(unsavedRunNotice({ type: 'pillar', pillar: {} as never }, true)).toBeNull();
+  });
+});
+
+describe('one follower per page', () => {
+  it('refuses a second start while one is in progress, and allows one again after it ends', () => {
+    const gate = createFollowGate();
+    expect(gate.busy).toBe(false);
+    expect(gate.tryStart()).toBe(true); // attach to the active run
+    expect(gate.busy).toBe(true);
+    expect(gate.tryStart()).toBe(false); // a second follow (Run, or Open it) is ignored
+    gate.end();
+    expect(gate.busy).toBe(false);
+    expect(gate.tryStart()).toBe(true);
+  });
+});
+
+describe('a remembered run that finished while the page was away', () => {
+  const history = [
+    { id: 9, created_at: '2026-11-20T10:30:00Z' },
+    { id: 8, created_at: '2026-11-20T09:00:00Z' },
+  ];
+  const at = Date.parse('2026-11-20T10:00:00Z');
+
+  it('finds the newest saved result created at or after the remembered run started', async () => {
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: at })).toBe(9);
+  });
+
+  it('finds none when every saved result is from before the run started, or the list fails', async () => {
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: Date.parse('2026-11-20T11:00:00Z') })).toBeNull();
+    expect(
+      await findFinishedWhileAway({
+        list: async () => {
+          throw new TypeError('Failed to fetch');
+        },
+        startedAt: at,
+      })
+    ).toBeNull();
+  });
+
+  it('tolerates a little clock skew between this browser and the server', async () => {
+    const justAfter = Date.parse('2026-11-20T10:30:30Z');
+    expect(await findFinishedWhileAway({ list: async () => history, startedAt: justAfter })).toBe(9);
+  });
+
+  it('keeps the lost message for a run that did not finish (history on, no saved result)', () => {
+    expect(LOST).toMatch(/didn't finish/);
+    expect(LOST).toMatch(/Nothing was saved/);
   });
 });

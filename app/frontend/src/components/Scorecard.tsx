@@ -24,12 +24,17 @@ import {
   STOP_CONFIRM,
   STOP_CONFLICT_CONFIRM,
   conflictingRunId,
+  createFollowGate,
   followFailure,
   forgetRun,
   isUserStop,
-  lastRunGoneNotice,
+  LAST_RUN_UNSAVED_NOTICE,
+  FINISHED_WHILE_AWAY_NOTICE,
+  findFinishedWhileAway,
+  RUN_LOST_MESSAGE,
   rememberRun,
   rememberedRun,
+  type RememberedRun,
   reattachActive,
   unsavedRunNotice,
   runAssessment,
@@ -222,9 +227,15 @@ export default function Scorecard({
   // Following the run in this tab. Aborting it only stops following: the run goes on
   // on the server, and the page can reattach to it (see the mount effect).
   const abortRef = useRef<AbortController | null>(null);
+  // One follower at a time. `busy` covers the gap before the first event (attaching
+  // to a run that is working but has not emitted yet): Run and New are disabled then.
+  const gate = useRef(createFollowGate()).current;
+  const [busy, setBusy] = useState(false);
   // The run this tab is following (for Stop), and a run that a new start found already running.
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [conflictRunId, setConflictRunId] = useState<string | null>(null);
+  // The blocking run is the one slot all users share (no identity forwarded): say so.
+  const [conflictShared, setConflictShared] = useState(false);
   // A note about the last run (for example, that it was stopped and not saved).
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -336,11 +347,15 @@ export default function Scorecard({
       .catch(() => {});
     // A run that is still working (this tab was closed or reloaded meanwhile): show its progress again.
     let mounted = true;
+    // Busy until we know whether a run is being followed (and while it is attached).
+    setBusy(true);
     void reattachActive({
       getActive: fetchActive,
-      attach: (id, fromRemembered) => follow({ attachTo: id, fromRemembered }),
+      attach: (id, remembered) => follow({ attachTo: id, remembered }),
       mounted: () => mounted,
       remembered: rememberedRun,
+    }).finally(() => {
+      if (mounted) setBusy(false);
     });
     return () => {
       mounted = false;
@@ -454,7 +469,9 @@ export default function Scorecard({
   /** Follow a run (a new one, `body`, or one already working, `attachTo`) until it ends.
    * What is on screen is kept until the run is live (started, or its first event
    * arrived), so a refused start or a run that is gone leaves the page as it was. */
-  async function follow({ body, attachTo, fromRemembered = false }: { body?: unknown; attachTo?: string; fromRemembered?: boolean }) {
+  async function follow({ body, attachTo, remembered = null }: { body?: unknown; attachTo?: string; remembered?: RememberedRun | null }) {
+    if (!gate.tryStart()) return;
+    setBusy(true);
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -475,7 +492,7 @@ export default function Scorecard({
       setCurrentId(null);
       setPhase('running');
       setActiveRunId(runId);
-      if (viewerRef.current) rememberRun(runId, viewerRef.current);
+      if (viewerRef.current) rememberRun(runId, viewerRef.current, Date.now());
     };
     const pending = (): PendingPillar[] =>
       config.pillars
@@ -528,25 +545,45 @@ export default function Scorecard({
     } catch (e) {
       // Unmount or reload: this tab stops following. The run itself is not cancelled.
       if ((e as Error).name === 'AbortError') return;
-      const failure = followFailure(e, { fromRemembered, began });
+      const failure = followFailure(e, { fromRemembered: remembered !== null, began });
       if (failure === 'conflict') {
         // One run per user: the page keeps what it showed; offer to open the one working, or stop it.
-        const id = await conflictingRunId(fetchActive);
-        if (id) setConflictRunId(id);
-        else showError(RUN_JUST_FINISHED, []);
+        const blocking = await conflictingRunId(fetchActive);
+        if (blocking) {
+          setConflictShared(blocking.shared);
+          setConflictRunId(blocking.runId);
+        } else {
+          showError(RUN_JUST_FINISHED, []);
+        }
         return;
       }
       forgetRun();
       if (failure === 'last-run-gone') {
-        // Not an error: the run ended long ago (or the app restarted). Point to the history.
-        setNotice(lastRunGoneNotice(historyState === 'saved'));
-        refreshHistory();
+        // The remembered run is no longer on the server. If it finished while the page was
+        // away, its saved result is shown; otherwise say it did not finish (or was not saved).
+        const finishedId = remembered && historyState === 'saved'
+          ? await findFinishedWhileAway({
+              list: () => apiGet<HistoryResponse>('/assess/history').then((h) => h.snapshots || []),
+              startedAt: remembered.startedAt,
+            })
+          : null;
+        if (finishedId != null) {
+          await loadSnapshot(finishedId);
+          setNotice(FINISHED_WHILE_AWAY_NOTICE);
+          refreshHistory();
+        } else if (historyState === 'saved') {
+          showError(RUN_LOST_MESSAGE, []);
+        } else {
+          setNotice(LAST_RUN_UNSAVED_NOTICE);
+        }
         return;
       }
       if (e instanceof AssessRunError) showError(e.message, e.details);
       else showError((e as Error).message, []);
       if (began) idlePhase();
     } finally {
+      gate.end();
+      setBusy(false);
       if (abortRef.current === controller) abortRef.current = null;
       setActiveRunId(null);
     }
@@ -619,7 +656,7 @@ export default function Scorecard({
     <aside className="lg:sticky lg:top-6 self-start space-y-3">
       <button
         onClick={startNew}
-        disabled={running}
+        disabled={running || busy}
         className="btn-primary w-full flex items-center justify-center gap-1.5 text-sm"
       >
         <Plus size={15} /> New assessment
@@ -770,9 +807,13 @@ export default function Scorecard({
         {notice && <p className="text-sm text-ink-600 mt-3" data-testid="run-notice">{notice}</p>}
         {conflictRunId && (
           <div className="mt-3 inline-flex flex-col items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900" data-testid="run-conflict">
-            <p>An assessment is already running. Open it to follow its progress, or stop it.</p>
+            <p>
+              {conflictShared
+                ? 'Another assessment is already running in this workspace. Open it to follow its progress, or stop it.'
+                : 'An assessment is already running. Open it to follow its progress, or stop it.'}
+            </p>
             <div className="flex items-center gap-2">
-              <button onClick={() => void follow({ attachTo: conflictRunId })} className="btn-primary py-1 px-3 text-xs">
+              <button onClick={() => void follow({ attachTo: conflictRunId })} disabled={busy} className="btn-primary py-1 px-3 text-xs disabled:opacity-60">
                 Open it
               </button>
               <button onClick={() => void stopRunById(conflictRunId, true)} className="btn-secondary py-1 px-3 text-xs">
@@ -781,7 +822,7 @@ export default function Scorecard({
             </div>
           </div>
         )}
-        <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
+        <button onClick={run} disabled={busy} className="btn-primary mt-4 inline-flex items-center gap-2 disabled:opacity-60">
           <Play size={16} /> Run assessment
         </button>
       </div>
@@ -856,7 +897,7 @@ export default function Scorecard({
                       </button>
                       <button
                         onClick={startNew}
-                        disabled={running}
+                        disabled={running || busy}
                         className="btn-primary py-1 px-3 flex items-center gap-1.5 text-xs"
                       >
                         <RefreshCw size={13} /> New assessment

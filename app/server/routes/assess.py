@@ -127,15 +127,12 @@ async def assess_run_start(
     One run per user at a time: while one is working this returns 409 with its
     ``run_id``, so the page can open it (``GET /assess/runs/active``) or stop it."""
     wsf, cat_scope, sch_scope = _scope_from(req)
-    # A shared bucket (no forwarded identity) cannot tell users apart, so its runs are
-    # not exclusive: nobody is offered another user's run (see /assess/runs/active).
-    shared = principal == UNATTRIBUTED_PRINCIPAL
+    # Without a forwarded identity every request is the shared bucket: one slot for the
+    # whole workspace (the users cannot be told apart, so the slot is shared by all).
     try:
         run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
-                             exclusive=not shared, scope=_run_scope(wsf, cat_scope, sch_scope),
-                             # A shared-bucket run is not offered to anyone, so it has no
-                             # reader to come back to: it gets the no-reader stop, like a legacy run.
-                             keep_going=not shared and await snapshots.saves_history())
+                             scope=_run_scope(wsf, cat_scope, sch_scope),
+                             keep_going=await snapshots.saves_history())
     except runs.ActiveRunExists as e:
         return JSONResponse(
             {"error": "An assessment is already running. Open it, or stop it first.", "run_id": e.run_id},
@@ -148,11 +145,13 @@ async def assess_run_start(
 async def assess_run_active(principal: str = Depends(current_principal)):
     """The current user's assessment run that is still working, so the page can
     show its progress again after a reload. ``run_id`` is null when there is none."""
-    # ``viewer`` lets the page tie a remembered run id to this user (see the UI).
+    # ``viewer`` ties a remembered run id to this user; ``shared`` marks the one slot that
+    # all users share when no identity is forwarded (the page words its notice for that).
+    shared = principal == UNATTRIBUTED_PRINCIPAL
     run = runs.active_run(principal)
     if run is None:
-        return {"run_id": None, "viewer": principal}
-    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1), "viewer": principal}
+        return {"run_id": None, "viewer": principal, "shared": shared}
+    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1), "viewer": principal, "shared": shared}
 
 
 @router.get("/assess/runs/{run_id}/events")

@@ -482,7 +482,7 @@ class StopAfterFinishTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runs.cancel_run(run.id, "a@x"))
         self.assertNotIn("stopped", json.dumps(run.events))
 
-    async def test_a_stop_during_the_save_is_held_and_the_run_completes_saved(self):
+    async def test_a_stop_during_the_save_ends_the_run_frees_the_slot_and_leaves_no_row(self):
         save_started = asyncio.Event()
         release = asyncio.Event()
 
@@ -494,20 +494,27 @@ class StopAfterFinishTest(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return 42
 
+        delete = AsyncMock(return_value=True)
         with patch.object(runs, "run_assessment_stream", completes), \
-             patch.object(runs.snapshots, "save_snapshot", slow_save):
+             patch.object(runs.snapshots, "save_snapshot", slow_save), \
+             patch.object(runs.snapshots, "delete_snapshot", delete):
             run = runs.start_run("a@x", None, None, None, None)
             await save_started.wait()
-            # The stop is refused during the save, and a user stop that reaches the run is deferred.
-            self.assertFalse(runs.cancel_run(run.id, "a@x"))
-            runs._cancel(run, runs.USER_STOP)
-            self.assertIsNone(run.cancel_why)
+            self.assertTrue(runs.cancel_run(run.id, "a@x"))
+            with self.assertRaises(asyncio.CancelledError):
+                await run.task
+            # The slot is free at once: a new run starts without a 409.
+            second = runs.start_run("a@x", None, None, None, None)
+            second.task.cancel()
+            # The write finishes in the background, then its row is removed.
             release.set()
-            await run.task
+            for _ in range(5):
+                await asyncio.sleep(0)
 
-        self.assertEqual(run.events[-1]["type"], "complete")
-        self.assertEqual(run.events[-1]["snapshot_id"], 42)
-        self.assertTrue(run.events[-1]["snapshot_saved"])
+        self.assertEqual(run.events[-1]["type"], "error")
+        self.assertEqual(run.events[-1]["reason"], "cancelled")
+        self.assertFalse(any(e.get("type") == "complete" for e in run.events))
+        delete.assert_awaited_once_with(42, "a@x")
 
     async def test_a_hung_save_still_ends_at_the_run_cap(self):
         started = asyncio.Event()
@@ -575,7 +582,7 @@ class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
                 r.task.cancel()
         runs._runs.clear()
 
-    async def test_shared_bucket_runs_are_not_exclusive_and_not_offered_as_active(self):
+    async def test_shared_bucket_is_one_slot_for_the_whole_workspace(self):
         async def slow():
             await asyncio.sleep(30)
             yield {}
@@ -586,11 +593,12 @@ class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
             active = await self.client.get("/api/assess/runs/active")
 
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        self.assertIsNone(active.json()["run_id"])
-        self.assertFalse(runs._runs[first.json()["run_id"]].exclusive)
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json()["run_id"], first.json()["run_id"])
+        self.assertEqual(active.json()["run_id"], first.json()["run_id"])
+        self.assertTrue(active.json()["shared"])
 
-    async def test_shared_bucket_runs_get_the_no_reader_stop_even_with_history_on(self):
+    async def test_shared_bucket_run_keeps_going_when_history_is_on(self):
         async def slow():
             await asyncio.sleep(30)
             yield {}
@@ -598,7 +606,13 @@ class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(runs, "run_assessment_stream", slow), \
              patch.object(runs.snapshots, "saves_history", AsyncMock(return_value=True)):
             r = await self.client.post("/api/assess/runs", json={})
-        self.assertFalse(runs._runs[r.json()["run_id"]].keep_going)
+        self.assertTrue(runs._runs[r.json()["run_id"]].keep_going)
+
+        runs.cancel_run(r.json()["run_id"], "unattributed")
+        with patch.object(runs, "run_assessment_stream", slow), \
+             patch.object(runs.snapshots, "saves_history", AsyncMock(return_value=False)):
+            off = await self.client.post("/api/assess/runs", json={})
+        self.assertFalse(runs._runs[off.json()["run_id"]].keep_going)
 
     async def test_a_run_from_another_user_cannot_be_stopped_or_read_as_active(self):
         other = runs.AssessmentRun(id="theirs", principal="someone@x")
@@ -671,6 +685,73 @@ class SourcesResolvedOnceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bindings.await_count, 1)
         self.assertIs(later, first)
+
+
+class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
+    """A stop reaches the work in flight: the probes, and the warehouse statement they poll."""
+
+    async def test_stopping_the_run_cancels_its_probes(self):
+        from server.assessment import scoring
+
+        cancelled = []
+
+        async def hang_probe(key):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(key)
+
+        async def collect():
+            return [e async for e in scoring.run_assessment_stream()]
+
+        with patch.object(scoring, "PROBES", ["a", "b"]), patch.object(scoring, "_run_probe", hang_probe), \
+             patch.object(scoring, "prime_request_sources", AsyncMock(return_value={})):
+            task = asyncio.create_task(collect())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+        self.assertEqual(sorted(cancelled), ["a", "b"])
+
+    async def test_a_cancelled_poll_cancels_its_warehouse_statement(self):
+        from server.sql_client import _poll_statement
+
+        class Resp:
+            def __init__(self, body=None):
+                self.status = 200
+                self._body = body or {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def json(self):
+                return self._body
+
+            async def read(self):
+                return b""
+
+        class Session:
+            def __init__(self):
+                self.posts = []
+
+            def get(self, url, **kwargs):
+                return Resp({"status": {"state": "RUNNING"}})
+
+            def post(self, url, **kwargs):
+                self.posts.append(url)
+                return Resp()
+
+        session = Session()
+        task = asyncio.create_task(_poll_statement(session, "https://h", {}, "stmt-1", 60))
+        await asyncio.sleep(1.2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(any(url.endswith("/statements/stmt-1/cancel") for url in session.posts), session.posts)
 
 
 class RunCapConfigTest(unittest.TestCase):

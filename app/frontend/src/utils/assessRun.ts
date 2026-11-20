@@ -120,10 +120,16 @@ const HINT =
 /** Shown when the user stops a run. A stopped run is not saved. */
 export const RUN_STOPPED_NOTICE = 'The assessment was stopped. Nothing was saved.';
 
-/** Shown when the app restarted (or otherwise lost the run) while it was working. */
+/** Shown when a run was working here and is gone, and no saved result shows it finished. */
 export const RUN_LOST_MESSAGE =
-  'The assessment run is no longer on the server: the app restarted, or it ended more than 15 minutes ago. ' +
-  'If it finished with history on, it is in your history. Otherwise, run it again.';
+  "Your last assessment didn't finish (the app may have restarted). Nothing was saved. Run it again.";
+
+/** Shown for a remembered run that is gone, with history off (nothing could have been saved). */
+export const LAST_RUN_UNSAVED_NOTICE =
+  'Your last assessment is no longer running. It was not saved, so run it again to get a result.';
+
+/** Shown when a remembered run finished while the page was away, and its result is shown. */
+export const FINISHED_WHILE_AWAY_NOTICE = 'This assessment finished while you were away.';
 
 /** Shown when a completed run with history on could not be saved. */
 export const RUN_NOT_SAVED_NOTICE = "This run finished but couldn't be saved to history.";
@@ -144,24 +150,30 @@ export const RUN_JUST_FINISHED = 'The earlier assessment just finished. Run it a
 export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing was saved. You can run again now.';
 export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
 
-/** The run this browser last followed, kept so a reload can tell a lost or finished
- * run from none. It is tied to the viewer, so one user never sees another's. */
+/** The run this browser last followed. Tied to the viewer, so one user never sees
+ * another's; `startedAt` (ms) finds the saved result if the run finished while away. */
 export const RUN_ID_KEY = 'gor.assess.run';
 
-/** The remembered run id for `viewer`, or null (another viewer's entry is ignored). */
-export function parseRemembered(raw: string | null, viewer: string): string | null {
+export interface RememberedRun {
+  runId: string;
+  startedAt: number;
+}
+
+/** The remembered run for `viewer`, or null (another viewer's entry is ignored). */
+export function parseRemembered(raw: string | null, viewer: string): RememberedRun | null {
   if (!raw) return null;
   try {
-    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown };
-    return v.viewer === viewer && typeof v.runId === 'string' ? v.runId : null;
+    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown; startedAt?: unknown };
+    if (v.viewer !== viewer || typeof v.runId !== 'string') return null;
+    return { runId: v.runId, startedAt: typeof v.startedAt === 'number' ? v.startedAt : 0 };
   } catch {
     return null;
   }
 }
 
-export function rememberRun(runId: string, viewer: string): void {
+export function rememberRun(runId: string, viewer: string, startedAt: number): void {
   try {
-    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer }));
+    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer, startedAt }));
   } catch {
     // Storage can be blocked. The notice for a run that is gone is then not shown.
   }
@@ -175,7 +187,7 @@ export function forgetRun(): void {
   }
 }
 
-export function rememberedRun(viewer: string): string | null {
+export function rememberedRun(viewer: string): RememberedRun | null {
   try {
     return parseRemembered(localStorage.getItem(RUN_ID_KEY), viewer);
   } catch {
@@ -183,12 +195,22 @@ export function rememberedRun(viewer: string): string | null {
   }
 }
 
-/** Shown when the run this browser last followed is no longer running (it ended long
- * ago, or the app restarted). Not an error: it points to the history instead. */
-export function lastRunGoneNotice(historySaves: boolean): string {
-  return historySaves
-    ? "Your last assessment is no longer running. If it finished, it's in Assessments."
-    : 'Your last assessment is no longer running. It was not saved, so run it again to get a result.';
+/** Slack for the clock difference between this browser and the server. */
+const CLOCK_SKEW_MS = 60_000;
+
+/** The newest saved result created at or after `startedAt` (the remembered run's start),
+ * or null. `list` returns the user's history (newest first). Errors count as none. */
+export async function findFinishedWhileAway(opts: {
+  list: () => Promise<Array<{ id: string | number; created_at: string }>>;
+  startedAt: number;
+}): Promise<number | null> {
+  try {
+    const rows = await opts.list();
+    const hit = rows.find((r) => Date.parse(r.created_at) >= opts.startedAt - CLOCK_SKEW_MS);
+    return hit ? Number(hit.id) : null;
+  } catch {
+    return null;
+  }
 }
 
 export type FollowFailure = 'conflict' | 'last-run-gone' | 'lost' | 'other';
@@ -206,13 +228,18 @@ export interface ActiveRunResponse {
   run_id: string | null;
   /** The signed-in user the server sees (ties a remembered run to them). */
   viewer?: string;
+  /** True for the one slot all users share when no identity is forwarded. */
+  shared?: boolean;
 }
 
 /** The run that a refused start (409) is blocked by, or null when none is found
  * (it finished in the meantime, or the lookup failed). */
-export async function conflictingRunId(getActive: () => Promise<ActiveRunResponse>): Promise<string | null> {
+export async function conflictingRunId(
+  getActive: () => Promise<ActiveRunResponse>
+): Promise<{ runId: string; shared: boolean } | null> {
   try {
-    return (await getActive()).run_id ?? null;
+    const active = await getActive();
+    return active.run_id ? { runId: active.run_id, shared: active.shared === true } : null;
   } catch {
     return null;
   }
@@ -223,9 +250,9 @@ export async function conflictingRunId(getActive: () => Promise<ActiveRunRespons
  * with 404 when the server no longer has it. Never starts a run. */
 export async function reattachActive(opts: {
   getActive: () => Promise<ActiveRunResponse>;
-  attach: (runId: string, fromRemembered: boolean) => Promise<unknown>;
+  attach: (runId: string, remembered: RememberedRun | null) => Promise<unknown>;
   mounted: () => boolean;
-  remembered?: (viewer: string) => string | null;
+  remembered?: (viewer: string) => RememberedRun | null;
 }): Promise<void> {
   let active: ActiveRunResponse;
   try {
@@ -235,11 +262,29 @@ export async function reattachActive(opts: {
   }
   if (!opts.mounted()) return;
   if (active.run_id) {
-    await opts.attach(active.run_id, false);
+    await opts.attach(active.run_id, null);
     return;
   }
   const old = active.viewer ? opts.remembered?.(active.viewer) ?? null : null;
-  if (old) await opts.attach(old, true);
+  if (old) await opts.attach(old.runId, old);
+}
+
+/** One follower per page: a second start or attach while one is in progress is refused. */
+export function createFollowGate(): { tryStart: () => boolean; end: () => void; readonly busy: boolean } {
+  let busy = false;
+  return {
+    tryStart() {
+      if (busy) return false;
+      busy = true;
+      return true;
+    },
+    end() {
+      busy = false;
+    },
+    get busy() {
+      return busy;
+    },
+  };
 }
 
 export type StopOutcome = 'declined' | 'stopped' | 'ended';

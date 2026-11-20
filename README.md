@@ -30,7 +30,7 @@ Run a read-only assessment that scores your workspace across seven pillars, roll
 With Lakebase history on, a run keeps going if you close the tab or reload the page. Open the app
 again to see its progress, or the result when it finishes. Without history, keep the tab open:
 the run stops within about a minute of the tab closing. Use **Stop** to end a run. A stopped run is not saved.
-You can run one assessment at a time.
+You can run one assessment at a time. If the app gets no signed-in user, all users share one slot per workspace: a second run is offered the one that is working, so anyone can open or stop it.
 
 ![Assess tab walkthrough: running the readiness assessment, viewing the overall score and pillar-maturity radar, and expanding a pillar to see its signals and gaps.](assets/assess-cuj.gif)
 

@@ -134,6 +134,25 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
         return None
 
 
+async def delete_snapshot(snapshot_id: int, created_by: str) -> bool:
+    """Remove one of a user's snapshots (used when a run was stopped while saving)."""
+    if not await _enabled():
+        return False
+    try:
+        from server.lakebase_client import get_pool
+        pool = await get_pool()
+        if pool is None:
+            return False
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                f"DELETE FROM {_table()} WHERE id = $1 AND created_by = $2", snapshot_id, created_by
+            )
+        return result.endswith(" 1")
+    except Exception as e:
+        logger.warning(f"delete_snapshot failed: {e}")
+        return False
+
+
 async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list[dict]:
     """List a user's past assessment runs (metadata only), newest first.
 
