@@ -13,7 +13,9 @@ number of the next event it needs, and the stream replays from there.
 
 The registry is in process memory. The app runs one uvicorn process, so every
 request reaches the same registry. A restart drops in-flight runs; the events
-endpoint then returns 404 and the UI says to start a new run.
+endpoint then returns 404 and the UI says the run was lost. A run keeps going
+when the browser goes away: it is saved when it completes, and the browser can
+reattach through ``GET /assess/runs/active``.
 """
 
 from __future__ import annotations
@@ -45,10 +47,7 @@ FINISHED_TTL_SECONDS = 15 * 60
 # A run still working after this long is cancelled (GOR_MAX_RUN_SECONDS,
 # default 3 h; parsed in server/config.py with the other deploy settings).
 MAX_RUN_SECONDS = CONFIG_MAX_RUN_SECONDS
-# A working run with no reader for this long is abandoned (tab closed, network
-# gone) and is cancelled. Longer than the client's full reconnect backoff.
-ABANDON_SECONDS = 90.0
-# How often the sweeper enforces the limits above.
+# How often the sweeper enforces the run cap above.
 SWEEP_INTERVAL_SECONDS = 15.0
 
 
@@ -62,12 +61,11 @@ class AssessmentRun:
     task: Optional[asyncio.Task] = None
     # Normalized request scope (server.scope), saved with the snapshot (#89).
     scope: Optional[dict] = None
-    # UI runs replace each other (one at a time per user). Legacy one-request
-    # streams are not exclusive: they never replace, and are never replaced.
+    # A user has one UI run at a time: a second one is refused until this one
+    # ends. Legacy one-request streams are not exclusive.
     exclusive: bool = True
-    # Readers attached now, and when one was last attached (abandonment check).
-    readers: int = 0
-    last_read: float = field(default_factory=time.monotonic)
+    # Why the run was cancelled (None if it was not): USER_STOP, or a limit.
+    cancel_why: Optional[str] = None
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -108,25 +106,43 @@ class AssessmentRun:
 _runs: dict[str, AssessmentRun] = {}
 _sweeper: Optional[asyncio.Task] = None
 
+# Cancel reason for a run the user (or a script, for the legacy stream) stopped.
+USER_STOP = "stopped by the user"
+
+
+class ActiveRunExists(Exception):
+    """The user already has an exclusive run working; ``run_id`` is that run."""
+
+    def __init__(self, run_id: str):
+        super().__init__(run_id)
+        self.run_id = run_id
+
 
 def _cancel(run: AssessmentRun, why: str) -> None:
     if run.task and not run.task.done():
         logger.info("cancelling assessment run %s: %s", run.id, why)
+        run.cancel_why = why
         run.task.cancel()
 
 
+def _cancelled_event(run: AssessmentRun) -> dict:
+    """The end of a cancelled run. A user stop is a plain "stopped" (the UI shows
+    no error); a stop by a limit is a failure that says which limit."""
+    if run.cancel_why is None or run.cancel_why == USER_STOP:
+        return _error_event(run, "The assessment was stopped.", reason="cancelled")
+    return _error_event(run, f"The assessment was stopped: {run.cancel_why}.", reason="failed")
+
+
 def _sweep(now: Optional[float] = None) -> None:
-    """Forget finished runs past their TTL; cancel runs past the hard cap or
-    with no reader for ABANDON_SECONDS."""
+    """Forget finished runs past their TTL, and cancel runs past the hard cap.
+    A run with no browser attached keeps going: it is saved when it completes."""
     now = time.monotonic() if now is None else now
     for run_id, run in list(_runs.items()):
         if run.done:
             if now - (run.finished_at or now) > FINISHED_TTL_SECONDS:
                 _runs.pop(run_id, None)
         elif now - run.started_at > MAX_RUN_SECONDS:
-            _cancel(run, "past the run time cap")
-        elif run.readers == 0 and now - run.last_read > ABANDON_SECONDS:
-            _cancel(run, "no reader attached")
+            _cancel(run, "it ran past the run time limit")
 
 
 async def _sweep_forever() -> None:
@@ -153,11 +169,19 @@ def get_run(run_id: str, principal: str) -> Optional[AssessmentRun]:
     return run
 
 
+def active_run(principal: str) -> Optional[AssessmentRun]:
+    """The principal's exclusive run that is still working, if any."""
+    for run in _runs.values():
+        if run.principal == principal and run.exclusive and not run.done:
+            return run
+    return None
+
+
 def cancel_run(run_id: str, principal: str) -> bool:
     run = get_run(run_id, principal)
     if run is None:
         return False
-    _cancel(run, "cancelled by the user")
+    _cancel(run, USER_STOP)
     return True
 
 
@@ -166,9 +190,10 @@ def _on_task_done(run: AssessmentRun, task: asyncio.Task) -> None:
     # try/finally never ran), so a run can never stay "working" forever.
     if not run.done:
         if not run.has_error():
-            reason = "cancelled" if task.cancelled() else "failed"
-            run.append(_error_event(run, "The assessment was cancelled." if task.cancelled()
-                                    else "The assessment stopped unexpectedly.", reason=reason))
+            if task.cancelled():
+                run.append(_cancelled_event(run))
+            else:
+                run.append(_error_event(run, "The assessment stopped unexpectedly.", reason="failed"))
         run.finish()
     # Drop the task (and the context that holds the user's token).
     run.task = None
@@ -180,23 +205,23 @@ def start_run(
     workspace_filter: Optional[dict],
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
-    replace_existing: bool = True,
+    exclusive: bool = True,
     scope: Optional[dict] = None,
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
-    With ``replace_existing`` (the UI), a user's earlier UI run that is still
-    working is cancelled first: the UI shows one run at a time, and leftover
-    runs would compete for the warehouse. A legacy stream run is never
-    cancelled this way (it stops when its own client disconnects)."""
+    With ``exclusive`` (the UI), the user may have one such run at a time: if one
+    is still working, ``ActiveRunExists`` is raised and the caller offers to open
+    or stop it. A legacy stream run is not exclusive and never blocks or is
+    blocked by one."""
     _ensure_sweeper()
     _sweep()
-    if replace_existing:
-        for other in list(_runs.values()):
-            if other.principal == principal and other.exclusive and not other.done:
-                _cancel(other, "replaced by a new run")
+    if exclusive:
+        active = active_run(principal)
+        if active is not None:
+            raise ActiveRunExists(active.id)
 
-    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=replace_existing, scope=scope)
+    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=exclusive, scope=scope)
     _runs[run.id] = run
     run.task = asyncio.create_task(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
@@ -225,7 +250,7 @@ async def _drive(
                 await _save_snapshot(event, run.principal, run.scope)
             run.append(event)
     except asyncio.CancelledError:
-        run.append(_error_event(run, "The assessment was cancelled.", reason="cancelled"))
+        run.append(_cancelled_event(run))
         raise
     except Exception as e:
         # The message is generic on purpose: warehouse errors quote statements
@@ -293,29 +318,23 @@ async def stream_events(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + window
     nxt = max(0, after)
-    run.readers += 1
-    run.last_read = time.monotonic()
-    try:
-        # Send bytes at once so the proxy sees the response start.
-        yield ": connected\n\n"
-        while True:
-            while nxt < len(run.events):
-                yield sse(run.events[nxt] if legacy else {**run.events[nxt], "seq": nxt})
-                nxt += 1
-            if run.done:
-                if not legacy:
-                    yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-                yield "data: [DONE]\n\n"
-                return
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-                return
-            if not await run.wait_for_change(min(heartbeat, remaining)):
-                yield ": keepalive\n\n"
-    finally:
-        run.readers -= 1
-        run.last_read = time.monotonic()
+    # Send bytes at once so the proxy sees the response start.
+    yield ": connected\n\n"
+    while True:
+        while nxt < len(run.events):
+            yield sse(run.events[nxt] if legacy else {**run.events[nxt], "seq": nxt})
+            nxt += 1
+        if run.done:
+            if not legacy:
+                yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+            yield "data: [DONE]\n\n"
+            return
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+            return
+        if not await run.wait_for_change(min(heartbeat, remaining)):
+            yield ": keepalive\n\n"
 
 
 async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
@@ -326,4 +345,4 @@ async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
             yield chunk
     finally:
         if not run.done:
-            _cancel(run, "legacy stream client disconnected")
+            _cancel(run, USER_STOP)

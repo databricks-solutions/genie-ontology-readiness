@@ -120,12 +120,31 @@ async def assess_run_start(
 
     Read its events with ``GET /assess/runs/{run_id}/events``. The run is not tied
     to one request, so it survives the Apps proxy's ~300s cut on streamed
-    responses. Every completed run is auto-saved to the user's history (when
-    Lakebase is enabled)."""
+    responses, and it keeps going when the browser goes away. Every completed run
+    is auto-saved to the user's history (when Lakebase is enabled).
+
+    One run per user at a time: while one is working this returns 409 with its
+    ``run_id``, so the page can open it (``GET /assess/runs/active``) or stop it."""
     wsf, cat_scope, sch_scope = _scope_from(req)
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
-                         scope=_run_scope(wsf, cat_scope, sch_scope))
+    try:
+        run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
+                             scope=_run_scope(wsf, cat_scope, sch_scope))
+    except runs.ActiveRunExists as e:
+        return JSONResponse(
+            {"error": "An assessment is already running. Open it, or stop it first.", "run_id": e.run_id},
+            status_code=409,
+        )
     return {"run_id": run.id}
+
+
+@router.get("/assess/runs/active")
+async def assess_run_active(principal: str = Depends(current_principal)):
+    """The current user's assessment run that is still working, so the page can
+    show its progress again after a reload. ``run_id`` is null when there is none."""
+    run = runs.active_run(principal)
+    if run is None:
+        return {"run_id": None}
+    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1)}
 
 
 @router.get("/assess/runs/{run_id}/events")
@@ -168,7 +187,7 @@ async def assess_stream(
     scopes the activity-based signals; omit / empty for all workspaces."""
     wsf, cat_scope, sch_scope = _scope_from(req)
     # Not exclusive: a script must not cancel the same user's run in the browser.
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, replace_existing=False,
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, exclusive=False,
                          scope=_run_scope(wsf, cat_scope, sch_scope))
     return StreamingResponse(runs.stream_whole_run(run), media_type="text/event-stream", headers=_SSE_HEADERS)
 

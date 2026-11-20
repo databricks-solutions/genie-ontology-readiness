@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { AssessRunError, abortableSleep, runAssessment, serverErrorDetails } from '../src/utils/assessRun';
+import {
+  AssessRunError,
+  RUN_LOST_MESSAGE,
+  RUN_STOPPED_NOTICE,
+  abortableSleep,
+  isUserStop,
+  runAssessment,
+  serverErrorDetails,
+} from '../src/utils/assessRun';
 import { ApiError, isNetworkError, parseError } from '../src/hooks/useApi';
 
 // Hermetic tests for the reconnecting run client: the start + stream calls are
@@ -96,8 +104,104 @@ describe('runAssessment', () => {
     }).catch((e) => e);
 
     expect(err).toBeInstanceOf(AssessRunError);
-    expect(err.message).toMatch(/lost on the server/);
+    expect(err.message).toBe(RUN_LOST_MESSAGE);
+    expect(err.message).toMatch(/app restarted/);
     expect(err.details[0]).toContain('HTTP 404');
+  });
+
+  it('attaches to a run that is already working and replays it from the first event', async () => {
+    const { stream, paths } = scripted([
+      [
+        { type: 'pillar', pillar: { key: 'metadata' }, seq: 0 },
+        { type: 'end', next: 1 },
+      ],
+    ]);
+    const starts: unknown[] = [];
+    const ids: string[] = [];
+    const seen: string[] = [];
+    const res = await runAssessment({
+      body: {},
+      runId: 'live1',
+      signal: new AbortController().signal,
+      start: async (body) => {
+        starts.push(body);
+        return { run_id: 'new' };
+      },
+      stream,
+      sleep: noSleep,
+      onRunId: (id) => ids.push(id),
+      onEvent: (ev) => seen.push(ev.type),
+    });
+
+    expect(starts).toEqual([]);
+    expect(ids).toEqual(['live1']);
+    expect(paths).toEqual(['/assess/runs/live1/events?after=0']);
+    expect(seen).toEqual(['pillar']);
+    expect(res).toEqual({ runId: 'live1', reconnects: 0 });
+  });
+
+  it('passes a 409 (one run per user) through as the ApiError, with its status', async () => {
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(409);
+  });
+
+  it('ends quietly when the user stops the run, and the stop is not an error', async () => {
+    const stopped = { type: 'error', error: 'The assessment was stopped.', reason: 'cancelled', seq: 1 };
+    const { stream } = scripted([[{ type: 'pillar', pillar: { key: 'k' }, seq: 0 }, stopped, { type: 'end', next: 2 }]]);
+    const events: Array<{ type: string; stop: boolean }> = [];
+    await runAssessment({
+      body: {},
+      runId: 'r',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: (ev) => events.push({ type: ev.type, stop: isUserStop(ev) }),
+    });
+
+    expect(events).toEqual([
+      { type: 'pillar', stop: false },
+      { type: 'error', stop: true },
+    ]);
+    expect(RUN_STOPPED_NOTICE).toMatch(/Nothing was saved/);
+  });
+
+  it('treats a run that failed (or hit a limit) as an error, not a stop', () => {
+    expect(isUserStop({ type: 'error', error: 'x', reason: 'failed' })).toBe(false);
+    expect(isUserStop({ type: 'complete', overall: {} as never, pillars: [], top_gaps: [] })).toBe(false);
+  });
+
+  it('rejects with AbortError when the page stops following; no cancel is sent', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    const err = await runAssessment({
+      body: {},
+      runId: 'r',
+      signal: controller.signal,
+      stream: (path: string, signal: AbortSignal) => {
+        calls.push(path);
+        return (async function* () {
+          yield { type: 'pillar_progress', key: 'k', done: 0, total: 1, detail: '', seq: 0 } as never;
+          controller.abort();
+          throw new DOMException('Aborted', 'AbortError');
+        })();
+      },
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+
+    expect((err as Error).name).toBe('AbortError');
+    expect(calls).toEqual(['/assess/runs/r/events?after=0']);
   });
 });
 

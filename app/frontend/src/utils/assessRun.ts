@@ -52,7 +52,11 @@ export interface PendingPillar {
 }
 
 export interface RunAssessmentOptions {
+  /** The scope to start a new run with. Ignored when `runId` attaches to a run. */
   body: unknown;
+  /** Attach to a run that is already working (after a reload, or from a 409)
+   * instead of starting one. Its events replay from the first one. */
+  runId?: string;
   signal: AbortSignal;
   onEvent: (ev: AssessEvent) => void;
   onRunId?: (runId: string) => void;
@@ -112,10 +116,22 @@ const HINT =
   '(Compute → Apps → the app → Logs), narrow the catalog scope (New assessment → pick catalogs → ' +
   'Run assessment), or use a larger SQL warehouse.';
 
+/** Shown when the user stops a run. A stopped run is not saved. */
+export const RUN_STOPPED_NOTICE = 'The assessment was stopped. Nothing was saved.';
+
+/** Shown when the app restarted (or otherwise lost the run) while it was working. */
+export const RUN_LOST_MESSAGE = 'The assessment run was lost because the app restarted. Nothing was saved. Run it again.';
+
+/** True for the end of a run that the user stopped (not an error to show). */
+export function isUserStop(ev: AssessEvent): boolean {
+  return ev.type === 'error' && ev.reason === 'cancelled';
+}
+
 /** Run an assessment to the end, reconnecting as needed. Resolves when the run
  * is finished (complete or server-reported error, both sent via onEvent).
  * Rejects with AssessRunError when the run can't be followed, or with the
- * AbortError when `signal` aborts. */
+ * AbortError when `signal` aborts. Aborting only stops following: the server
+ * run keeps going. A 409 (one run per user) rejects with the ApiError. */
 export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAssessmentResult> {
   const start = opts.start ?? ((body: unknown) => apiPost<{ run_id: string }>('/assess/runs', body));
   const stream = opts.stream ?? ((path: string, signal: AbortSignal) => streamGetEvents<WireEvent>(path, signal));
@@ -139,11 +155,16 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
   };
 
   let runId: string;
-  try {
-    runId = (await start(opts.body)).run_id;
-  } catch (e) {
-    if (opts.signal.aborted) throw e;
-    throw fail('Could not start the assessment.', e, null);
+  if (opts.runId) {
+    runId = opts.runId;
+  } else {
+    try {
+      runId = (await start(opts.body)).run_id;
+    } catch (e) {
+      if (opts.signal.aborted) throw e;
+      if (e instanceof ApiError && e.status === 409) throw e;
+      throw fail('Could not start the assessment.', e, null);
+    }
   }
   opts.onRunId?.(runId);
 
@@ -179,7 +200,7 @@ export async function runAssessment(opts: RunAssessmentOptions): Promise<RunAsse
       if (e instanceof AssessRunError) throw e;
       if (opts.signal.aborted || (e as Error)?.name === 'AbortError') throw e;
       if (e instanceof ApiError && e.status === 404) {
-        throw fail('The assessment run was lost on the server.', e, runId);
+        throw fail(RUN_LOST_MESSAGE, e, runId);
       }
       failures += 1;
       if (failures > maxRetries) {

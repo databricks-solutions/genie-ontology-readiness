@@ -12,10 +12,10 @@ import {
   YAxis,
   Tooltip,
 } from 'recharts';
-import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows } from 'lucide-react';
-import { apiDeleteQuiet, apiGet } from '../hooks/useApi';
+import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows, Square } from 'lucide-react';
+import { ApiError, apiDeleteQuiet, apiGet } from '../hooks/useApi';
 import { useCopy } from '../hooks/useCopy';
-import { AssessRunError, runAssessment, serverErrorDetails } from '../utils/assessRun';
+import { AssessRunError, RUN_STOPPED_NOTICE, isUserStop, runAssessment, serverErrorDetails } from '../utils/assessRun';
 import type { PendingPillar } from '../utils/assessRun';
 import type {
   AppConfig,
@@ -192,16 +192,14 @@ export default function Scorecard({
   const historyState = historyStatus(config);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [loadingId, setLoadingId] = useState<number | null>(null);
+  // Following the run in this tab. Aborting it only stops following: the run goes on
+  // on the server, and the page can reattach to it (see the mount effect).
   const abortRef = useRef<AbortController | null>(null);
-  // The background run in progress, so closing or reloading the tab can cancel it.
-  const runIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    const onPageHide = () => {
-      if (runIdRef.current) void apiDeleteQuiet(`/assess/runs/${runIdRef.current}`);
-    };
-    window.addEventListener('pagehide', onPageHide);
-    return () => window.removeEventListener('pagehide', onPageHide);
-  }, []);
+  // The run this tab is following (for Stop), and a run that a new start found already running.
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [conflictRunId, setConflictRunId] = useState<string | null>(null);
+  // A note about the last run (for example, that it was stopped and not saved).
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Workspace scope (#25/#10): activity-based signals count within the deployed
   // workspace only, so they're never account-wide. The scope is fixed to the
@@ -309,7 +307,17 @@ export default function Scorecard({
         }
       })
       .catch(() => {});
-    return () => abortRef.current?.abort();
+    // A run that is still working (this tab was closed or reloaded meanwhile): show its progress again.
+    let mounted = true;
+    apiGet<{ run_id: string | null }>('/assess/runs/active')
+      .then((r) => {
+        if (mounted && r.run_id) void follow({ attachTo: r.run_id });
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+      abortRef.current?.abort();
+    };
   }, []);
 
   // Refetch the catalog options whenever the workspace selection changes, so the
@@ -405,7 +413,22 @@ export default function Scorecard({
 
   async function run() {
     if (phase === 'running') return;
+    setConflictRunId(null);
+    await follow({
+      body: {
+        workspace_filter: wsFilter,
+        catalogs: catFilter,
+        schemas: schemaFilter ? [schemaFilter] : [],
+      },
+    });
+  }
+
+  /** Follow a run (a new one, `body`, or one already working, `attachTo`) until it ends. */
+  async function follow({ body, attachTo }: { body?: unknown; attachTo?: string }) {
     setError(null);
+    setErrorDetails(null);
+    setNotice(null);
+    setConflictRunId(null);
     setPillarsByKey({});
     setProgressByKey({});
     setOverall(null);
@@ -418,7 +441,6 @@ export default function Scorecard({
     const collected: Record<string, PillarScore> = {};
     const progress: Record<string, string> = {};
     let completed = false;
-    let runId: string | null = null;
     const pending = (): PendingPillar[] =>
       config.pillars
         .filter((cp) => !collected[cp.key])
@@ -429,19 +451,14 @@ export default function Scorecard({
       setError(message);
       setErrorDetails(all.length ? { message, lines: all } : null);
     };
+    const idlePhase = () => setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
     try {
       await runAssessment({
-        body: {
-          workspace_filter: wsFilter,
-          catalogs: catFilter,
-          schemas: schemaFilter ? [schemaFilter] : [],
-        },
+        body: body ?? {},
+        runId: attachTo,
         signal: controller.signal,
         pending,
-        onRunId: (id) => {
-          runId = id;
-          runIdRef.current = id;
-        },
+        onRunId: (id) => setActiveRunId(id),
         onEvent: (ev) => {
           if (ev.type === 'pillar') {
             collected[ev.pillar.key] = ev.pillar;
@@ -457,25 +474,45 @@ export default function Scorecard({
             setPhase('done');
             if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
             refreshHistory();
+          } else if (isUserStop(ev)) {
+            setNotice(RUN_STOPPED_NOTICE);
           } else if (ev.type === 'error') {
             showError(ev.error, serverErrorDetails(ev, pending()));
           }
         },
       });
-      if (!completed) setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
+      if (!completed) idlePhase();
     } catch (e) {
-      if ((e as Error).name === 'AbortError') {
-        // Unmount / navigation: stop the server-side run too.
-        if (runId) void apiDeleteQuiet(`/assess/runs/${runId}`);
-      } else {
-        if (e instanceof AssessRunError) showError(e.message, e.details);
-        else showError((e as Error).message, []);
-        setPhase(Object.keys(collected).length > 0 ? 'done' : 'idle');
+      // Unmount or reload: this tab stops following. The run itself is not cancelled.
+      if ((e as Error).name === 'AbortError') return;
+      if (e instanceof ApiError && e.status === 409) {
+        // One run per user: offer to open the one that is working, or stop it.
+        idlePhase();
+        const active = await apiGet<{ run_id: string | null }>('/assess/runs/active').catch(() => ({ run_id: null }));
+        if (active.run_id) setConflictRunId(active.run_id);
+        else showError('The earlier assessment just finished. Run it again.', []);
+        return;
       }
+      if (e instanceof AssessRunError) showError(e.message, e.details);
+      else showError((e as Error).message, []);
+      idlePhase();
     } finally {
-      abortRef.current = null;
-      runIdRef.current = null;
+      if (abortRef.current === controller) abortRef.current = null;
+      setActiveRunId(null);
     }
+  }
+
+  /** Stop the run this tab follows (after a confirmation). The run ends as stopped and is not saved. */
+  function stopRun(runId: string) {
+    if (!window.confirm('Stop this assessment? A stopped run is not saved to history.')) return;
+    void apiDeleteQuiet(`/assess/runs/${runId}`);
+  }
+
+  function stopConflictRun(runId: string) {
+    if (!window.confirm('Stop the assessment that is already running? A stopped run is not saved to history.')) return;
+    void apiDeleteQuiet(`/assess/runs/${runId}`);
+    setConflictRunId(null);
+    setNotice('The earlier assessment was stopped. Nothing was saved. You can run again now.');
   }
 
   // "New assessment": go back to the intro page so the user can set the scope
@@ -670,6 +707,20 @@ export default function Scorecard({
 
       <div className="text-center">
         {error && <ErrorNotice message={error} details={shownDetails} centered />}
+        {notice && <p className="text-sm text-ink-600 mt-3" data-testid="run-notice">{notice}</p>}
+        {conflictRunId && (
+          <div className="mt-3 inline-flex flex-col items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900" data-testid="run-conflict">
+            <p>An assessment is already running. Open it to follow its progress, or stop it.</p>
+            <div className="flex items-center gap-2">
+              <button onClick={() => void follow({ attachTo: conflictRunId })} className="btn-primary py-1 px-3 text-xs">
+                Open it
+              </button>
+              <button onClick={() => stopConflictRun(conflictRunId)} className="btn-secondary py-1 px-3 text-xs">
+                Stop it
+              </button>
+            </div>
+          </div>
+        )}
         <button onClick={run} className="btn-primary mt-4 inline-flex items-center gap-2">
           <Play size={16} /> Run assessment
         </button>
@@ -695,7 +746,25 @@ export default function Scorecard({
                   style={{ width: `${(completedCount / totalPillars) * 100}%` }}
                 />
               </div>
+              <p className="text-xs text-ink-500 mt-2">
+                The assessment keeps running on the server if you close this tab, and you can reopen it to see
+                the result.
+                {historyState !== 'saved' && (
+                  <span className="block text-amber-700 mt-1" data-testid="run-history-off">
+                    Runs aren't saved on this deployment, so keep this tab open until the assessment finishes.
+                  </span>
+                )}
+              </p>
             </div>
+            {activeRunId && (
+              <button
+                onClick={() => stopRun(activeRunId)}
+                className="btn-secondary py-1 px-3 flex items-center gap-1.5 text-xs shrink-0 self-start"
+                title="Stop this assessment (it is not saved)"
+              >
+                <Square size={12} /> Stop
+              </button>
+            )}
           </div>
         ) : (
           overall && (
@@ -943,6 +1012,7 @@ export default function Scorecard({
         })}
       </div>
 
+      {notice && <p className="text-sm text-ink-600" data-testid="run-notice">{notice}</p>}
       {error && <ErrorNotice message={error} details={shownDetails} />}
     </div>
   );

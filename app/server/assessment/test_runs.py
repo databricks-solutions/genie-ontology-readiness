@@ -99,7 +99,7 @@ class RunLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(run.events[-1]["snapshot_saved"])
         self.assertEqual(save.await_args.kwargs["created_by"], "a@x")
 
-    async def test_new_run_cancels_the_same_users_earlier_run(self):
+    async def test_second_run_is_refused_while_one_is_working(self):
         started = asyncio.Event()
 
         async def slow():
@@ -110,14 +110,56 @@ class RunLifecycleTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(runs, "run_assessment_stream", slow):
             first = runs.start_run("a@x", None, None, None, None)
             await started.wait()
-            runs.start_run("a@x", None, None, None, None)
-            with self.assertRaises(asyncio.CancelledError):
-                await first.task
+            with self.assertRaises(runs.ActiveRunExists) as ctx:
+                runs.start_run("a@x", None, None, None, None)
+            self.assertEqual(ctx.exception.run_id, first.id)
+            # Another user is not blocked by this user's run.
+            other = runs.start_run("b@x", None, None, None, None)
 
-        self.assertEqual(first.events[-1]["reason"], "cancelled")
+        self.assertFalse(first.done)
+        self.assertFalse(other.done)
         for r in list(runs._runs.values()):
             if r.task and not r.task.done():
                 r.task.cancel()
+
+    async def test_stop_ends_the_run_as_cancelled_and_never_saves_it(self):
+        started = asyncio.Event()
+
+        async def slow():
+            started.set()
+            await asyncio.sleep(30)
+            yield {"type": "complete", "overall": {}, "pillars": [], "top_gaps": []}
+
+        save = AsyncMock(return_value=1)
+        with patch.object(runs, "run_assessment_stream", slow), patch.object(runs.snapshots, "save_snapshot", save):
+            run = runs.start_run("a@x", None, None, None, None)
+            await started.wait()
+            self.assertTrue(runs.cancel_run(run.id, "a@x"))
+            with self.assertRaises(asyncio.CancelledError):
+                await run.task
+
+        self.assertEqual(run.events[-1]["type"], "error")
+        self.assertEqual(run.events[-1]["reason"], "cancelled")
+        self.assertEqual(run.events[-1]["error"], "The assessment was stopped.")
+        save.assert_not_awaited()
+
+    async def test_run_stopped_by_a_limit_reports_a_failure_with_the_reason(self):
+        started = asyncio.Event()
+
+        async def slow():
+            started.set()
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            run = runs.start_run("a@x", None, None, None, None)
+            await started.wait()
+            runs._cancel(run, "it ran past the run time limit")
+            with self.assertRaises(asyncio.CancelledError):
+                await run.task
+
+        self.assertEqual(run.events[-1]["reason"], "failed")
+        self.assertIn("run time limit", run.events[-1]["error"])
 
     async def test_other_users_cannot_read_a_run(self):
         run = runs.AssessmentRun(id="r9", principal="a@x")
@@ -153,23 +195,22 @@ class LimitsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.events[-1]["reason"], "cancelled")
         self.assertIsNone(run.task)
 
-    async def test_sweep_cancels_abandoned_and_overdue_runs_and_forgets_old_ones(self):
-        abandoned = await self._slow_run("a@x")
+    async def test_run_with_no_browser_attached_keeps_going(self):
+        # The tab can close mid-run: nobody is reading, and the run must still finish.
+        unattended = await self._slow_run("a@x")
         overdue = await self._slow_run("b@x")
-        watched = await self._slow_run("c@x")
-        watched.readers = 1
-        now = abandoned.started_at + runs.ABANDON_SECONDS + 1
+        now = unattended.started_at + 10 * 60
         overdue.started_at = now - runs.MAX_RUN_SECONDS - 1
         runs._sweep(now)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        self.assertTrue(abandoned.done)
+        self.assertFalse(unattended.done)
         self.assertTrue(overdue.done)
-        self.assertFalse(watched.done)
+        self.assertEqual(overdue.events[-1]["reason"], "failed")
 
-        runs._sweep(abandoned.finished_at + runs.FINISHED_TTL_SECONDS + 1)
-        self.assertNotIn(abandoned.id, runs._runs)
-        self.assertIn(watched.id, runs._runs)
+        unattended.finish()
+        runs._sweep(unattended.finished_at + runs.FINISHED_TTL_SECONDS + 1)
+        self.assertNotIn(unattended.id, runs._runs)
 
     async def test_legacy_stream_keeps_old_shape_and_does_not_replace_ui_run(self):
         ui_run = await self._slow_run("a@x")
@@ -178,7 +219,7 @@ class LimitsTest(unittest.IsolatedAsyncioTestCase):
             yield {"type": "pillar", "pillar": {"key": "k"}}
 
         with patch.object(runs, "run_assessment_stream", quick):
-            legacy = runs.start_run("a@x", None, None, None, None, replace_existing=False)
+            legacy = runs.start_run("a@x", None, None, None, None, exclusive=False)
             chunks = await _collect(runs.stream_whole_run(legacy))
 
         self.assertFalse(ui_run.done)
@@ -186,20 +227,19 @@ class LimitsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evs, [{"type": "pillar", "pillar": {"key": "k"}}])
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
-    async def test_ui_run_does_not_replace_a_legacy_stream_run(self):
-        legacy = await self._slow_run("a@x", replace_existing=False)
+    async def test_legacy_stream_run_does_not_block_or_get_blocked_by_a_ui_run(self):
+        legacy = await self._slow_run("a@x", exclusive=False)
         ui = await self._slow_run("a@x")
         self.assertFalse(legacy.done)
         self.assertFalse(ui.done)
-        # A second UI run still replaces the first UI run.
-        await self._slow_run("a@x")
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        self.assertTrue(ui.done)
+        self.assertIs(runs.active_run("a@x"), ui)
+        with self.assertRaises(runs.ActiveRunExists):
+            await self._slow_run("a@x")
+        self.assertFalse(ui.done)
         self.assertFalse(legacy.done)
 
     async def test_legacy_stream_disconnect_cancels_the_run(self):
-        run = await self._slow_run("a@x", replace_existing=False)
+        run = await self._slow_run("a@x", exclusive=False)
         agen = runs.stream_whole_run(run)
         await agen.__anext__()  # ": connected"
         await agen.aclose()  # client went away
@@ -296,6 +336,32 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
 
         r = await self.client.delete(f"/api/assess/runs/{run_id}")
         self.assertEqual((r.status_code, r.json()), (200, {"cancelled": True}))
+
+    async def test_second_start_is_409_with_the_active_run_and_active_endpoint_finds_it(self):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            first = await self.client.post("/api/assess/runs", json={})
+            run_id = first.json()["run_id"]
+            again = await self.client.post("/api/assess/runs", json={})
+            active = await self.client.get("/api/assess/runs/active")
+            self.principal = "b@x"
+            other = await self.client.get("/api/assess/runs/active")
+            self.principal = "a@x"
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(again.json()["run_id"], run_id)
+        self.assertEqual(active.json()["run_id"], run_id)
+        self.assertEqual(other.json(), {"run_id": None})
+
+        # Once the run ends, there is nothing active and a new run can start.
+        runs._runs[run_id].task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual((await self.client.get("/api/assess/runs/active")).json(), {"run_id": None})
 
     async def test_unknown_or_foreign_run_is_a_json_404(self):
         run = runs.AssessmentRun(id="theirs", principal="b@x")
