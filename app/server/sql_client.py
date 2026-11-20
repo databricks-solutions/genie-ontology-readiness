@@ -144,6 +144,8 @@ def resolved_identity() -> Optional[dict]:
 # (~160-180 s in practice); 180 s keeps that, so slow probes such as the Genie audit
 # scan on a large account don't start timing out.
 DEFAULT_POLL_SECONDS = 180
+# The server-side wait on submit, when a caller does not choose one.
+DEFAULT_SUBMIT_WAIT_SECONDS = 50
 
 
 class StatementTimeout(Exception):
@@ -188,8 +190,14 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     if record:
         record_query(query, parameters)
     if wait_seconds is None:
-        # An assessment run submits with no wait (its statement id is known, so Stop can cancel it).
-        wait_seconds = 0 if _submit_without_wait.get() else 50
+        if _submit_without_wait.get():
+            # An assessment run submits with no wait (its statement id is known, so Stop can
+            # cancel it). The server wait it skips is added to the poll budget, so the
+            # statement keeps the total time a default submit gives it.
+            wait_seconds = 0
+            poll_seconds = poll_seconds + DEFAULT_SUBMIT_WAIT_SECONDS
+        else:
+            wait_seconds = DEFAULT_SUBMIT_WAIT_SECONDS
 
     # Override: SP only, no OBO attempt, no fallback. Either the per-call override
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
@@ -254,7 +262,8 @@ def _is_authz_error(exc: Exception) -> bool:
 
 
 async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool,
-                        poll_seconds: int = DEFAULT_POLL_SECONDS, wait_seconds: int = 50) -> list[dict]:
+                        poll_seconds: int = DEFAULT_POLL_SECONDS,
+                        wait_seconds: int = DEFAULT_SUBMIT_WAIT_SECONDS) -> list[dict]:
     """Run the query once with a single resolved identity (OBO or SP).
 
     ``wait_seconds`` is the server-side wait on submit (0-50). 0 returns the

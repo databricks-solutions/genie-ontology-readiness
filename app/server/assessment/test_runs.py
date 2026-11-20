@@ -942,6 +942,32 @@ class SubmitWithoutWaitTest(unittest.IsolatedAsyncioTestCase):
         waits = [c.kwargs["wait_seconds"] for c in execute_once.await_args_list]
         self.assertEqual(waits, [0, 50])
 
+    async def test_a_run_keeps_the_total_budget_a_default_submit_gives(self):
+        # The server wait a run skips is added to its poll budget: wait + poll is the same.
+        from server import sql_client
+
+        execute_once = AsyncMock(return_value=[])
+
+        async def run_with(poll):
+            sql_client.submit_without_wait()
+            await sql_client.execute_sql("SELECT 1", record=False, poll_seconds=poll)
+
+        async def default_with(poll):
+            await sql_client.execute_sql("SELECT 1", record=False, poll_seconds=poll)
+
+        async def budget(fn, poll):
+            execute_once.reset_mock()
+            await asyncio.create_task(fn(poll))
+            kw = execute_once.await_args.kwargs
+            return kw["wait_seconds"] + kw["poll_seconds"]
+
+        with patch.object(sql_client, "_execute_once", execute_once), \
+             patch.object(sql_client, "FORCE_SP", False), \
+             patch.object(sql_client, "get_user_token", lambda: None):
+            for poll in (sql_client.DEFAULT_POLL_SECONDS, 60):
+                self.assertEqual(await budget(run_with, poll), await budget(default_with, poll), poll)
+            self.assertEqual(await budget(run_with, sql_client.DEFAULT_POLL_SECONDS), 230)
+
     async def test_polling_starts_quickly_so_a_run_is_not_slowed(self):
         from server.sql_client import _poll_statement
 
