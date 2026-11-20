@@ -24,7 +24,10 @@ import {
   STOP_CONFIRM,
   STOP_CONFLICT_CONFIRM,
   conflictingRunId,
+  forgetRun,
   isUserStop,
+  rememberRun,
+  rememberedRun,
   reattachActive,
   runAssessment,
   serverErrorDetails,
@@ -327,6 +330,7 @@ export default function Scorecard({
       getActive: () => apiGet<ActiveRunResponse>('/assess/runs/active'),
       attach: (id) => follow({ attachTo: id }),
       mounted: () => mounted,
+      remembered: rememberedRun,
     });
     return () => {
       mounted = false;
@@ -472,7 +476,10 @@ export default function Scorecard({
         runId: attachTo,
         signal: controller.signal,
         pending,
-        onRunId: (id) => setActiveRunId(id),
+        onRunId: (id) => {
+          setActiveRunId(id);
+          rememberRun(id);
+        },
         onEvent: (ev) => {
           if (ev.type === 'pillar') {
             collected[ev.pillar.key] = ev.pillar;
@@ -482,6 +489,8 @@ export default function Scorecard({
             setProgressByKey((prev) => ({ ...prev, [ev.key]: ev.detail }));
           } else if (ev.type === 'complete') {
             completed = true;
+            forgetRun();
+            setNotice(null);
             setOverall(ev.overall);
             setTopGaps(ev.top_gaps);
             setScorecard({ overall: ev.overall, pillars: ev.pillars, top_gaps: ev.top_gaps });
@@ -489,24 +498,29 @@ export default function Scorecard({
             if (ev.snapshot_id != null) setCurrentId(ev.snapshot_id);
             refreshHistory();
           } else if (isUserStop(ev)) {
+            forgetRun();
             setNotice(RUN_STOPPED_NOTICE);
           } else if (ev.type === 'error') {
+            forgetRun();
             showError(ev.error, serverErrorDetails(ev, pending()));
           }
         },
       });
       if (!completed) idlePhase();
+      forgetRun();
     } catch (e) {
       // Unmount or reload: this tab stops following. The run itself is not cancelled.
       if ((e as Error).name === 'AbortError') return;
       if (e instanceof ApiError && e.status === 409) {
         // One run per user: offer to open the one that is working, or stop it.
         idlePhase();
+        forgetRun();
         const id = await conflictingRunId(() => apiGet<ActiveRunResponse>('/assess/runs/active'));
         if (id) setConflictRunId(id);
         else showError(RUN_JUST_FINISHED, []);
         return;
       }
+      forgetRun();
       if (e instanceof AssessRunError) showError(e.message, e.details);
       else showError((e as Error).message, []);
       idlePhase();
@@ -516,36 +530,26 @@ export default function Scorecard({
     }
   }
 
-  /** Stop the run this tab follows. The DELETE is checked: a failure stays on screen
-   * and the run is still shown as running. The stream then reports the stop. */
-  async function stopRun(runId: string) {
+  /** Stop a run: the one this tab follows, or (`blocking`) the one that refused a new start.
+   * A failed stop is shown and changes nothing else. A run that already ended is said so. */
+  async function stopRunById(runId: string, blocking: boolean) {
     try {
       const outcome = await stopWithConfirm({
         runId,
-        message: STOP_CONFIRM,
-        confirm: (m) => window.confirm(m),
-        del: apiDelete,
-      });
-      if (outcome === 'ended') setNotice(RUN_ALREADY_ENDED);
-    } catch (e) {
-      setError(`Could not stop the assessment: ${(e as Error).message}. It is still running; try again.`);
-    }
-  }
-
-  /** Stop the run that blocked a new start. The banner clears only after the stop succeeds. */
-  async function stopConflictRun(runId: string) {
-    try {
-      const outcome = await stopWithConfirm({
-        runId,
-        message: STOP_CONFLICT_CONFIRM,
+        message: blocking ? STOP_CONFLICT_CONFIRM : STOP_CONFIRM,
         confirm: (m) => window.confirm(m),
         del: apiDelete,
       });
       if (outcome === 'declined') return;
-      setConflictRunId(null);
-      setNotice(outcome === 'stopped' ? RUN_STOPPED_EARLIER : RUN_ALREADY_ENDED);
+      if (blocking) {
+        setConflictRunId(null);
+        setNotice(outcome === 'stopped' ? RUN_STOPPED_EARLIER : RUN_ALREADY_ENDED);
+      } else if (outcome === 'ended') {
+        setNotice(RUN_ALREADY_ENDED);
+      }
+      if (outcome === 'ended') refreshHistory();
     } catch (e) {
-      setError(`Could not stop the earlier assessment: ${(e as Error).message}. It is still running; try again.`);
+      setError(`Could not stop ${blocking ? 'the earlier assessment' : 'the assessment'}: ${(e as Error).message}. It is still running; try again.`);
     }
   }
 
@@ -749,7 +753,7 @@ export default function Scorecard({
               <button onClick={() => void follow({ attachTo: conflictRunId })} className="btn-primary py-1 px-3 text-xs">
                 Open it
               </button>
-              <button onClick={() => void stopConflictRun(conflictRunId)} className="btn-secondary py-1 px-3 text-xs">
+              <button onClick={() => void stopRunById(conflictRunId, true)} className="btn-secondary py-1 px-3 text-xs">
                 Stop it
               </button>
             </div>
@@ -780,19 +784,19 @@ export default function Scorecard({
                   style={{ width: `${(completedCount / totalPillars) * 100}%` }}
                 />
               </div>
-              <p className="text-xs text-ink-500 mt-2">
-                The assessment keeps running on the server if you close this tab, and you can reopen it to see
-                the result.
-                {historyState !== 'saved' && (
-                  <span className="block text-amber-700 mt-1" data-testid="run-history-off">
-                    Runs aren't saved on this deployment, so keep this tab open until the assessment finishes.
-                  </span>
-                )}
-              </p>
+              {historyState === 'saved' ? (
+                <p className="text-xs text-ink-500 mt-2">
+                  The assessment keeps running if you close this tab. Reopen the app to see its progress or result.
+                </p>
+              ) : (
+                <p className="text-xs text-amber-700 mt-2" data-testid="run-history-off">
+                  Runs aren't saved on this deployment, so keep this tab open until the assessment finishes.
+                </p>
+              )}
             </div>
             {activeRunId && (
               <button
-                onClick={() => void stopRun(activeRunId)}
+                onClick={() => void stopRunById(activeRunId, false)}
                 className="btn-secondary py-1 px-3 flex items-center gap-1.5 text-xs shrink-0 self-start"
                 title="Stop this assessment (it is not saved)"
               >

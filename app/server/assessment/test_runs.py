@@ -352,8 +352,10 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         types = [json.loads(line[6:])["type"] for line in r.text.splitlines() if line.startswith("data: {")]
         self.assertEqual(types, ["pillar", "end"])
 
+        # Stopping a run that already finished is a 404, not a "stopped" (it was saved).
         r = await self.client.delete(f"/api/assess/runs/{run_id}")
-        self.assertEqual((r.status_code, r.json()), (200, {"cancelled": True}))
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("no longer running", r.json()["error"])
 
     async def test_second_start_is_409_with_the_active_run_and_active_endpoint_finds_it(self):
         async def slow():
@@ -410,6 +412,190 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("no longer available", r.json()["error"])
         r = await self.client.delete("/api/assess/runs/theirs")
         self.assertEqual(r.status_code, 404)
+
+
+class KeepGoingTest(unittest.IsolatedAsyncioTestCase):
+    """A run with no browser attached: kept going when its result is saved, cancelled
+    after ABANDON_SECONDS when it is not (history off, or a legacy stream)."""
+
+    def tearDown(self):
+        for r in list(runs._runs.values()):
+            if r.task and not r.task.done():
+                r.task.cancel()
+        runs._runs.clear()
+
+    async def _run(self, **kw):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            run = runs.start_run("a@x", None, None, None, None, **kw)
+            await asyncio.sleep(0)
+        return run
+
+    async def _sweep_after(self, run, seconds):
+        runs._sweep(run.last_read + seconds)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    async def test_history_off_run_with_no_reader_is_cancelled_after_the_abandon_limit(self):
+        run = await self._run(keep_going=False)
+        await self._sweep_after(run, runs.ABANDON_SECONDS - 1)
+        self.assertFalse(run.done)
+        await self._sweep_after(run, runs.ABANDON_SECONDS + 1)
+        self.assertTrue(run.done)
+        self.assertEqual(run.events[-1]["reason"], "failed")
+        self.assertIn("cannot be saved", run.events[-1]["error"])
+
+    async def test_history_on_run_with_no_reader_keeps_going(self):
+        run = await self._run(keep_going=True)
+        await self._sweep_after(run, runs.ABANDON_SECONDS * 10)
+        self.assertFalse(run.done)
+
+    async def test_a_browser_reading_the_run_keeps_a_history_off_run_alive(self):
+        run = await self._run(keep_going=False)
+        agen = runs.stream_events(run)
+        await agen.__anext__()  # attaches a reader
+        await self._sweep_after(run, runs.ABANDON_SECONDS * 10)
+        self.assertFalse(run.done)
+        await agen.aclose()
+        await self._sweep_after(run, runs.ABANDON_SECONDS + 1)
+        self.assertTrue(run.done)
+
+
+class StopAfterFinishTest(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        for r in list(runs._runs.values()):
+            if r.task and not r.task.done():
+                r.task.cancel()
+        runs._runs.clear()
+
+    async def test_cancel_returns_false_once_the_run_is_done(self):
+        async def quick():
+            yield {"type": "pillar", "pillar": {"key": "k"}}
+
+        with patch.object(runs, "run_assessment_stream", quick):
+            run = runs.start_run("a@x", None, None, None, None)
+            await run.task
+        self.assertTrue(run.done)
+        self.assertFalse(runs.cancel_run(run.id, "a@x"))
+        self.assertNotIn("stopped", json.dumps(run.events))
+
+    async def test_a_stop_during_the_save_is_held_and_the_run_completes_saved(self):
+        save_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def completes():
+            yield {"type": "complete", "overall": {"score": 1}, "pillars": [], "top_gaps": []}
+
+        async def slow_save(*args, **kwargs):
+            save_started.set()
+            await release.wait()
+            return 42
+
+        with patch.object(runs, "run_assessment_stream", completes), \
+             patch.object(runs.snapshots, "save_snapshot", slow_save):
+            run = runs.start_run("a@x", None, None, None, None)
+            await save_started.wait()
+            # The stop is refused during the save, and a cancel that slips through is held.
+            self.assertFalse(runs.cancel_run(run.id, "a@x"))
+            run.task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            await run.task
+
+        self.assertEqual(run.events[-1]["type"], "complete")
+        self.assertEqual(run.events[-1]["snapshot_id"], 42)
+        self.assertTrue(run.events[-1]["snapshot_saved"])
+
+
+class SharedIdentityTest(unittest.IsolatedAsyncioTestCase):
+    """Without a forwarded identity every request is the shared bucket: its runs must
+    not be offered across users (no /active, no 409)."""
+
+    def setUp(self):
+        import httpx
+        from fastapi import FastAPI
+
+        from server.routes import _shared
+        from server.routes import assess as assess_routes
+        from server.security import UNATTRIBUTED_PRINCIPAL
+
+        app = FastAPI()
+        app.include_router(assess_routes.router, prefix="/api")
+        app.dependency_overrides[_shared.current_principal] = lambda: UNATTRIBUTED_PRINCIPAL
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+        self.bucket = UNATTRIBUTED_PRINCIPAL
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        for r in list(runs._runs.values()):
+            if r.task and not r.task.done():
+                r.task.cancel()
+        runs._runs.clear()
+
+    async def test_shared_bucket_runs_are_not_exclusive_and_not_offered_as_active(self):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            first = await self.client.post("/api/assess/runs", json={})
+            second = await self.client.post("/api/assess/runs", json={})
+            active = await self.client.get("/api/assess/runs/active")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(active.json(), {"run_id": None})
+        self.assertFalse(runs._runs[first.json()["run_id"]].exclusive)
+
+    async def test_a_run_from_another_user_cannot_be_stopped_or_read_as_active(self):
+        other = runs.AssessmentRun(id="theirs", principal="someone@x")
+        other.exclusive = True
+        runs._runs[other.id] = other
+        self.assertEqual((await self.client.get("/api/assess/runs/active")).json(), {"run_id": None})
+        self.assertEqual((await self.client.delete("/api/assess/runs/theirs")).status_code, 404)
+        self.assertFalse(other.done)
+
+
+class HistoryOffFlagTest(unittest.IsolatedAsyncioTestCase):
+    """The route decides keep_going from whether history is saved."""
+
+    def tearDown(self):
+        runs._runs.clear()
+
+    async def test_route_passes_keep_going_from_history_state(self):
+        import httpx
+        from fastapi import FastAPI
+
+        from server.routes import _shared
+        from server.routes import assess as assess_routes
+
+        app = FastAPI()
+        app.include_router(assess_routes.router, prefix="/api")
+        app.dependency_overrides[_shared.current_principal] = lambda: "a@x"
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        try:
+            with patch.object(runs, "run_assessment_stream", slow), \
+                 patch.object(assess_routes.snapshots, "saves_history", AsyncMock(return_value=False)):
+                off = await client.post("/api/assess/runs", json={})
+            runs.cancel_run(off.json()["run_id"], "a@x")
+            with patch.object(runs, "run_assessment_stream", slow), \
+                 patch.object(assess_routes.snapshots, "saves_history", AsyncMock(return_value=True)):
+                on = await client.post("/api/assess/runs", json={})
+            self.assertFalse(runs._runs[off.json()["run_id"]].keep_going)
+            self.assertTrue(runs._runs[on.json()["run_id"]].keep_going)
+        finally:
+            await client.aclose()
+            for r in list(runs._runs.values()):
+                if r.task and not r.task.done():
+                    r.task.cancel()
 
 
 class RunCapConfigTest(unittest.TestCase):

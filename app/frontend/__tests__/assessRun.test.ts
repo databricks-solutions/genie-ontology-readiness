@@ -372,6 +372,43 @@ describe('reattach on page load', () => {
   });
 });
 
+describe('reload after a restart', () => {
+  it('follows the remembered run when none is active, and says it is lost when the server has no record', async () => {
+    const attached: string[] = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: null }),
+      attach: async (id) => {
+        attached.push(id);
+      },
+      mounted: () => true,
+      remembered: () => 'old7',
+    });
+    expect(attached).toEqual(['old7']);
+
+    const { stream } = scripted([[new ApiError('This assessment run is no longer available.', 404)]]);
+    const err = await runAssessment({
+      body: {},
+      runId: 'old7',
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(AssessRunError);
+    expect(err.message).toBe(RUN_LOST_MESSAGE);
+  });
+
+  it('prefers the active run over a remembered one, and attaches to nothing when neither exists', async () => {
+    const attached: string[] = [];
+    const attach = async (id: string) => {
+      attached.push(id);
+    };
+    await reattachActive({ getActive: async () => ({ run_id: 'live' }), attach, mounted: () => true, remembered: () => 'old' });
+    await reattachActive({ getActive: async () => ({ run_id: null }), attach, mounted: () => true, remembered: () => null });
+    expect(attached).toEqual(['live']);
+  });
+});
+
 describe('a start refused with 409 (one run per user)', () => {
   it('finds the blocking run and "Open it" follows that id', async () => {
     const err = await runAssessment({

@@ -14,6 +14,7 @@ from server.assessment import runs
 from server.assessment.scoring import run_assessment
 from server.impact import OVERALL_FRAMING, pillar_impact
 from server.routes._shared import _cache_get, _cache_set, current_principal
+from server.security import UNATTRIBUTED_PRINCIPAL
 from server.config import ASSESS_CATALOGS, set_user_token
 from server.pdf import (
     build_pdf_document,
@@ -126,9 +127,13 @@ async def assess_run_start(
     One run per user at a time: while one is working this returns 409 with its
     ``run_id``, so the page can open it (``GET /assess/runs/active``) or stop it."""
     wsf, cat_scope, sch_scope = _scope_from(req)
+    # A shared bucket (no forwarded identity) cannot tell users apart, so its runs are
+    # not exclusive: nobody is offered another user's run (see /assess/runs/active).
+    shared = principal == UNATTRIBUTED_PRINCIPAL
     try:
         run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
-                             scope=_run_scope(wsf, cat_scope, sch_scope))
+                             exclusive=not shared, scope=_run_scope(wsf, cat_scope, sch_scope),
+                             keep_going=await snapshots.saves_history())
     except runs.ActiveRunExists as e:
         return JSONResponse(
             {"error": "An assessment is already running. Open it, or stop it first.", "run_id": e.run_id},
@@ -165,9 +170,10 @@ async def assess_run_events(run_id: str, after: int = 0, principal: str = Depend
 
 @router.delete("/assess/runs/{run_id}")
 async def assess_run_cancel(run_id: str, principal: str = Depends(current_principal)):
-    """Cancel a run that is still working (no-op if it already finished)."""
+    """Stop a run that is still working. 404 when there is nothing to stop (it
+    already finished, is saving its result, or is not this user's)."""
     if not runs.cancel_run(run_id, principal):
-        return JSONResponse({"error": "Assessment run not found."}, status_code=404)
+        return JSONResponse({"error": "This assessment is no longer running."}, status_code=404)
     return {"cancelled": True}
 
 
@@ -188,7 +194,7 @@ async def assess_stream(
     wsf, cat_scope, sch_scope = _scope_from(req)
     # Not exclusive: a script must not cancel the same user's run in the browser.
     run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, exclusive=False,
-                         scope=_run_scope(wsf, cat_scope, sch_scope))
+                         scope=_run_scope(wsf, cat_scope, sch_scope), keep_going=False)
     return StreamingResponse(runs.stream_whole_run(run), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 

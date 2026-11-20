@@ -120,7 +120,9 @@ const HINT =
 export const RUN_STOPPED_NOTICE = 'The assessment was stopped. Nothing was saved.';
 
 /** Shown when the app restarted (or otherwise lost the run) while it was working. */
-export const RUN_LOST_MESSAGE = 'The assessment run was lost because the app restarted. Nothing was saved. Run it again.';
+export const RUN_LOST_MESSAGE =
+  'The assessment run is no longer on the server: the app restarted, or it ended more than 15 minutes ago. ' +
+  'If it finished with history on, it is in your history. Otherwise, run it again.';
 
 /** True for the end of a run that the user stopped (not an error to show). */
 export function isUserStop(ev: AssessEvent): boolean {
@@ -132,6 +134,33 @@ export const STOP_CONFLICT_CONFIRM = 'Stop the assessment that is already runnin
 export const RUN_JUST_FINISHED = 'The earlier assessment just finished. Run it again.';
 export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing was saved. You can run again now.';
 export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
+
+/** The run this browser last followed, kept so a reload can tell a lost run from none. */
+export const RUN_ID_KEY = 'gor.assess.runId';
+
+export function rememberRun(runId: string): void {
+  try {
+    localStorage.setItem(RUN_ID_KEY, runId);
+  } catch {
+    // Storage can be blocked. The lost-run notice is then simply not shown.
+  }
+}
+
+export function forgetRun(): void {
+  try {
+    localStorage.removeItem(RUN_ID_KEY);
+  } catch {
+    // Nothing to clear when storage is blocked.
+  }
+}
+
+export function rememberedRun(): string | null {
+  try {
+    return localStorage.getItem(RUN_ID_KEY);
+  } catch {
+    return null;
+  }
+}
 
 export interface ActiveRunResponse {
   run_id: string | null;
@@ -147,11 +176,14 @@ export async function conflictingRunId(getActive: () => Promise<ActiveRunRespons
   }
 }
 
-/** On page load, follow the user's run that is still working (if any). Never starts a run. */
+/** On page load, follow the user's run that is still working. When none is working,
+ * follow the run this browser last followed: if the server no longer has it, the
+ * attach fails with RUN_LOST_MESSAGE (the app restarted). Never starts a run. */
 export async function reattachActive(opts: {
   getActive: () => Promise<ActiveRunResponse>;
   attach: (runId: string) => Promise<unknown>;
   mounted: () => boolean;
+  remembered?: () => string | null;
 }): Promise<void> {
   let active: ActiveRunResponse;
   try {
@@ -159,7 +191,9 @@ export async function reattachActive(opts: {
   } catch {
     return;
   }
-  if (opts.mounted() && active.run_id) await opts.attach(active.run_id);
+  if (!opts.mounted()) return;
+  const runId = active.run_id ?? opts.remembered?.() ?? null;
+  if (runId) await opts.attach(runId);
 }
 
 export type StopOutcome = 'declined' | 'stopped' | 'ended';

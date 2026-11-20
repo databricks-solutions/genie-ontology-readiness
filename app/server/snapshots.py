@@ -99,6 +99,11 @@ def _scope_fields(row) -> dict:
     return {"scope": scope, "scope_hash": row["scope_hash"]}
 
 
+async def saves_history() -> bool:
+    """True when completed runs are saved (Lakebase history is on and connected)."""
+    return await _enabled()
+
+
 async def save_snapshot(scorecard: dict, created_by: str | None = None,
                         scope: dict | None = None) -> int | None:
     """Persist a completed assessment; returns the new snapshot id (or None).

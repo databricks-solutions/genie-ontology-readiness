@@ -47,7 +47,10 @@ FINISHED_TTL_SECONDS = 15 * 60
 # A run still working after this long is cancelled (GOR_MAX_RUN_SECONDS,
 # default 3 h; parsed in server/config.py with the other deploy settings).
 MAX_RUN_SECONDS = CONFIG_MAX_RUN_SECONDS
-# How often the sweeper enforces the run cap above.
+# A run that nothing is reading, and that cannot keep going on its own (history
+# off, or a legacy one-request stream), is cancelled after this long.
+ABANDON_SECONDS = 90.0
+# How often the sweeper enforces the limits above.
 SWEEP_INTERVAL_SECONDS = 15.0
 
 
@@ -66,6 +69,15 @@ class AssessmentRun:
     exclusive: bool = True
     # Why the run was cancelled (None if it was not): USER_STOP, or a limit.
     cancel_why: Optional[str] = None
+    # A run may continue with no browser attached only when its result is saved
+    # (history on) and it is a UI run. Otherwise nobody can get the result back,
+    # so it is cancelled once nothing has read it for ABANDON_SECONDS.
+    keep_going: bool = True
+    # Browsers reading the events now, and when one last read them.
+    readers: int = 0
+    last_read: float = field(default_factory=time.monotonic)
+    # The completed result is being saved: it can no longer be stopped.
+    finishing: bool = False
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -119,6 +131,8 @@ class ActiveRunExists(Exception):
 
 
 def _cancel(run: AssessmentRun, why: str) -> None:
+    if run.finishing:
+        return
     if run.task and not run.task.done():
         logger.info("cancelling assessment run %s: %s", run.id, why)
         run.cancel_why = why
@@ -134,8 +148,9 @@ def _cancelled_event(run: AssessmentRun) -> dict:
 
 
 def _sweep(now: Optional[float] = None) -> None:
-    """Forget finished runs past their TTL, and cancel runs past the hard cap.
-    A run with no browser attached keeps going: it is saved when it completes."""
+    """Forget finished runs past their TTL, cancel runs past the hard cap, and
+    cancel a run that cannot keep going (see ``keep_going``) once nothing has
+    read it for ABANDON_SECONDS."""
     now = time.monotonic() if now is None else now
     for run_id, run in list(_runs.items()):
         if run.done:
@@ -143,6 +158,9 @@ def _sweep(now: Optional[float] = None) -> None:
                 _runs.pop(run_id, None)
         elif now - run.started_at > MAX_RUN_SECONDS:
             _cancel(run, "it ran past the run time limit")
+        elif (not run.keep_going and run.readers == 0
+              and now - run.last_read > ABANDON_SECONDS):
+            _cancel(run, "nothing was following it, and its result cannot be saved")
 
 
 async def _sweep_forever() -> None:
@@ -175,14 +193,16 @@ def active_run(principal: str) -> Optional[AssessmentRun]:
     wind down, but a new run must not be refused because of it."""
     for run in _runs.values():
         if (run.principal == principal and run.exclusive and not run.done
-                and run.cancel_why is None):
+                and not run.finishing and run.cancel_why is None):
             return run
     return None
 
 
 def cancel_run(run_id: str, principal: str) -> bool:
+    """Stop a run that is still working. False when there is nothing to stop:
+    the run is unknown, already finished, or saving its result."""
     run = get_run(run_id, principal)
-    if run is None:
+    if run is None or run.done or run.finishing:
         return False
     _cancel(run, USER_STOP)
     return True
@@ -210,6 +230,7 @@ def start_run(
     schemas: Optional[list[str]],
     exclusive: bool = True,
     scope: Optional[dict] = None,
+    keep_going: bool = True,
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
@@ -224,7 +245,8 @@ def start_run(
         if active is not None:
             raise ActiveRunExists(active.id)
 
-    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=exclusive, scope=scope)
+    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=exclusive, scope=scope,
+                        keep_going=keep_going)
     _runs[run.id] = run
     run.task = asyncio.create_task(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
@@ -250,7 +272,8 @@ async def _drive(
     try:
         async for event in run_assessment_stream():
             if event.get("type") == "complete":
-                await _save_snapshot(event, run.principal, run.scope)
+                run.finishing = True
+                await _save_snapshot_to_end(event, run)
             run.append(event)
     except asyncio.CancelledError:
         run.append(_cancelled_event(run))
@@ -263,6 +286,21 @@ async def _drive(
     finally:
         set_user_token(None)
         run.finish()
+
+
+async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
+    """Save a completed run. A stop that arrives during the write is held back
+    until the write ends: the row may already be committed, so the run is then
+    reported as completed and saved, never as stopped."""
+    save = asyncio.ensure_future(_save_snapshot(event, run.principal, run.scope))
+    while True:
+        try:
+            await asyncio.shield(save)
+            return
+        except asyncio.CancelledError:
+            if save.done():
+                raise
+            # The save is still running: keep waiting for it.
 
 
 async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:
@@ -321,23 +359,29 @@ async def stream_events(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + window
     nxt = max(0, after)
-    # Send bytes at once so the proxy sees the response start.
-    yield ": connected\n\n"
-    while True:
-        while nxt < len(run.events):
-            yield sse(run.events[nxt] if legacy else {**run.events[nxt], "seq": nxt})
-            nxt += 1
-        if run.done:
-            if not legacy:
-                yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-            yield "data: [DONE]\n\n"
-            return
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
-            return
-        if not await run.wait_for_change(min(heartbeat, remaining)):
-            yield ": keepalive\n\n"
+    run.readers += 1
+    run.last_read = time.monotonic()
+    try:
+        # Send bytes at once so the proxy sees the response start.
+        yield ": connected\n\n"
+        while True:
+            while nxt < len(run.events):
+                yield sse(run.events[nxt] if legacy else {**run.events[nxt], "seq": nxt})
+                nxt += 1
+            if run.done:
+                if not legacy:
+                    yield sse({"type": "end", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+                yield "data: [DONE]\n\n"
+                return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                yield sse({"type": "reconnect", "next": nxt, "elapsed_s": round(run.elapsed(), 1)})
+                return
+            if not await run.wait_for_change(min(heartbeat, remaining)):
+                yield ": keepalive\n\n"
+    finally:
+        run.readers -= 1
+        run.last_read = time.monotonic()
 
 
 async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
