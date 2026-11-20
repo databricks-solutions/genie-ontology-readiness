@@ -2,7 +2,6 @@
 // summary sheet. A single combined CSV would be wide and sparse (pillars have
 // different drill-down schemas), so each pillar keeps its own file and clean
 // columns; summary.csv gives the at-a-glance scorecard.
-import JSZip from 'jszip';
 import type { PillarScore } from '../types';
 import { rowsToCsv, downloadBlob } from './csv';
 
@@ -47,7 +46,9 @@ function stamp(): string {
 
 // Build and download a ZIP: summary.csv + one <pillar-key>.csv per pillar that
 // has drill-down rows (the same content that pillar's own Export CSV produces).
+// jszip is loaded on demand so it is a separate chunk, fetched only when a user exports.
 export async function downloadAllZip(pillars: PillarScore[]): Promise<void> {
+  const { default: JSZip } = await import('jszip');
   const zip = new JSZip();
   zip.file('summary.csv', buildSummaryCsv(pillars));
   for (const p of pillars) {
