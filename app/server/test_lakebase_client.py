@@ -231,10 +231,13 @@ class _Conn:
 
 class _FakePool:
     """Stands in for an asyncpg pool: each acquire() gives the next outcome (a connection, or an
-    exception to raise). Records the acquire timeouts and the released connections."""
+    exception to raise). Records the acquire timeouts and the released connections. ``wait``
+    is how long acquire blocks before it yields (a busy pool); a ``timeout`` shorter than that
+    fails it, as asyncpg does."""
 
-    def __init__(self, outcomes):
+    def __init__(self, outcomes, wait=0.0):
         self.outcomes = list(outcomes)
+        self.wait = wait
         self.timeouts, self.released = [], []
 
     def acquire(self, timeout=None):
@@ -247,6 +250,10 @@ class _FakeAcquire:
         self.pool, self.outcome, self.conn = pool, outcome, None
 
     async def __aenter__(self):
+        timeout = self.pool.timeouts[-1]
+        if timeout is not None and self.pool.wait > timeout:
+            raise asyncio.TimeoutError()
+        await asyncio.sleep(self.pool.wait)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         self.conn = self.outcome
@@ -278,7 +285,7 @@ class ConnectionRetryTest(unittest.TestCase):
             got = self._run_op(pool)
         self.assertIs(got, self.conn)
         self.assertEqual(pool.released, [self.conn])  # released after use
-        self.assertEqual(pool.timeouts, [lc.ACQUIRE_TIMEOUT, lc.ACQUIRE_TIMEOUT])
+        self.assertEqual(pool.timeouts, [None, None])  # acquire itself is never bounded
         warnings = [r for r in logs.records if r.levelname == "WARNING"]
         self.assertEqual(len(warnings), 1)  # one WARNING per retried failure
         self.assertIn("attempt 2 of 3", warnings[0].getMessage())
@@ -316,6 +323,15 @@ class ConnectionRetryTest(unittest.TestCase):
         self.assertEqual(len(pool.timeouts), 3)
         self.assertEqual(len(warnings.records), 2)  # the last failure is raised, not logged here
 
+    def test_a_busy_pool_is_waited_for_not_treated_as_a_connection_failure(self):
+        # The pool yields a connection only after longer than the connect bound: pool contention.
+        # It must succeed on the first attempt, with no retry and no WARNING.
+        pool = _FakePool([self.conn], wait=0.05)
+        with patch.object(lc, "CONNECT_TIMEOUT", 0.01), patch.object(lc.logger, "warning") as warning:
+            self.assertIs(self._run_op(pool), self.conn)
+        self.assertEqual(pool.timeouts, [None])
+        warning.assert_not_called()
+
     def test_a_caller_still_degrades_to_empty_when_retries_are_exhausted(self):
         from server import snapshots
         lc._pool = _FakePool([ConnectionRefusedError("down")] * 3)
@@ -340,6 +356,11 @@ class PoolStartRetryTest(unittest.TestCase):
             asyncio.run(lc.init_pool())
             self.assertIs(lc._pool, pool)
         self.assertEqual(e.create_pool.await_count, 2)
+
+    def test_new_connections_are_bounded_by_the_connect_timeout(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            asyncio.run(lc.init_pool())
+        self.assertEqual(e.create_pool.await_args.kwargs["timeout"], lc.CONNECT_TIMEOUT)
 
     def test_a_pool_start_with_bad_auth_is_not_retried(self):
         with _Env(self.ENV, _client([_postgres_resource()])) as e:

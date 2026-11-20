@@ -366,9 +366,11 @@ async def _connection_password() -> str:
 # Waits between attempts when a connection fails because the endpoint is still waking from
 # scale-to-zero: three attempts in all. A failure after that is raised as before.
 RETRY_DELAYS = (0.5, 1.0)
-# The longest wait for a pooled connection per attempt (a connect included). A waking endpoint
-# refuses or times out quickly; this keeps three attempts well under 10 seconds.
-ACQUIRE_TIMEOUT = 2.5
+# The longest a single new connection may take to connect (TCP, TLS, auth). A waking endpoint
+# refuses or times out quickly; this keeps three attempts well under 10 seconds. It bounds the
+# connect only: waiting for a free pooled connection is never bounded, so a busy pool is not a
+# connection failure.
+CONNECT_TIMEOUT = 2.5
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -407,7 +409,7 @@ async def _retried(call, what: str):
 
 async def _enter_connection(pool):
     """Enter ``pool.acquire()``: returns the acquire context and its connection."""
-    ctx = pool.acquire(timeout=ACQUIRE_TIMEOUT)
+    ctx = pool.acquire()
     return ctx, await ctx.__aenter__()
 
 
@@ -469,6 +471,7 @@ async def init_pool() -> None:
                     # Idle connections are closed after 5 minutes, so reconnects pick up the
                     # current credential well within its lifetime.
                     max_inactive_connection_lifetime=300,
+                    timeout=CONNECT_TIMEOUT,  # bounds each new connection's connect (see above)
                 ),
                 timeout=10,  # Don't hang for more than 10s on pool creation
             ),
