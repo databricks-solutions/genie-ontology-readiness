@@ -72,7 +72,7 @@ class _Pool:
     def __init__(self, conn):
         self.conn = conn
 
-    def acquire(self):
+    def acquire(self, timeout=None):
         return _Acquire(self.conn)
 
 

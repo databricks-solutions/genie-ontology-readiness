@@ -1,10 +1,12 @@
 """Lakebase connection: Provisioned (`database`) and Autoscaling (`postgres`) lakebase-db resources."""
 import asyncio
 import os
-import sys
+import ssl
 import types
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import asyncpg
 
 from server import lakebase_client as lc
 
@@ -47,20 +49,19 @@ class _Env:
         lc._RESOURCE = None
         lc._TARGET = None
         lc._credential.update(token="", minted_at=0.0)
+        self.create_pool = AsyncMock(return_value=object())
         self.patches = [
             patch.dict(os.environ, {"DATABRICKS_APP_NAME": "gor-test", **self.env}, clear=True),
             patch("server.config._get_workspace_client", return_value=self.client),
             patch.object(lc, "_fetch_db_credential", AsyncMock(return_value="tok")),
+            patch("asyncpg.create_pool", self.create_pool),
+            patch.object(lc, "RETRY_DELAYS", (0.0, 0.0)),  # no real waits in the retry tests
         ]
         for p in self.patches:
             p.start()
-        self.create_pool = AsyncMock(return_value=object())
-        self.asyncpg = patch.dict(sys.modules, {"asyncpg": types.SimpleNamespace(create_pool=self.create_pool)})
-        self.asyncpg.start()
         return self
 
     def __exit__(self, *a):
-        self.asyncpg.stop()
         for p in reversed(self.patches):
             p.stop()
         lc._RESOURCE = None
@@ -222,6 +223,138 @@ class CredentialTest(unittest.TestCase):
             asyncio.run(lc.init_pool())
             self.assertIsNone(lc._pool)
             e.create_pool.assert_not_awaited()
+
+
+class _Conn:
+    """A connection object the fake pool hands out (only identity matters)."""
+
+
+class _FakePool:
+    """Stands in for an asyncpg pool: each acquire() gives the next outcome (a connection, or an
+    exception to raise). Records the acquire timeouts and the released connections."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.timeouts, self.released = [], []
+
+    def acquire(self, timeout=None):
+        self.timeouts.append(timeout)
+        return _FakeAcquire(self, self.outcomes.pop(0))
+
+
+class _FakeAcquire:
+    def __init__(self, pool, outcome):
+        self.pool, self.outcome, self.conn = pool, outcome, None
+
+    async def __aenter__(self):
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        self.conn = self.outcome
+        return self.conn
+
+    async def __aexit__(self, *exc):
+        self.pool.released.append(self.conn)
+
+
+class ConnectionRetryTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = _Conn()
+        self.patch = patch.object(lc, "RETRY_DELAYS", (0.0, 0.0))
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        lc._pool = None
+
+    def _run_op(self, pool):
+        async def op():
+            async with lc.lakebase_connection(pool) as conn:
+                return conn
+        return asyncio.run(op())
+
+    def test_a_connect_refused_while_the_endpoint_wakes_is_retried_then_succeeds(self):
+        pool = _FakePool([ConnectionRefusedError("waking"), self.conn])
+        with self.assertLogs(lc.logger, "INFO") as logs:
+            got = self._run_op(pool)
+        self.assertIs(got, self.conn)
+        self.assertEqual(pool.released, [self.conn])  # released after use
+        self.assertEqual(pool.timeouts, [lc.ACQUIRE_TIMEOUT, lc.ACQUIRE_TIMEOUT])
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)  # one WARNING per retried failure
+        self.assertIn("attempt 2 of 3", warnings[0].getMessage())
+        self.assertTrue(any("succeeded on attempt 2" in r.getMessage() for r in logs.records))
+
+    def test_each_transient_kind_is_retried(self):
+        for error in (asyncio.TimeoutError(), OSError("reset"), asyncpg.CannotConnectNowError("starting"),
+                      asyncpg.TooManyConnectionsError("full"), asyncpg.ConnectionDoesNotExistError("gone")):
+            with self.subTest(error=type(error).__name__):
+                pool = _FakePool([error, self.conn])
+                with self.assertLogs(lc.logger, "WARNING"):
+                    self.assertIs(self._run_op(pool), self.conn)
+                self.assertEqual(len(pool.timeouts), 2)
+
+    def test_an_auth_failure_is_not_retried(self):
+        pool = _FakePool([asyncpg.InvalidPasswordError("bad token"), self.conn])
+        with self.assertRaises(asyncpg.InvalidPasswordError):
+            self._run_op(pool)
+        self.assertEqual(len(pool.timeouts), 1)
+
+    def test_sql_and_tls_errors_are_not_retried(self):
+        for error in (asyncpg.InsufficientPrivilegeError("no grant"), asyncpg.PostgresSyntaxError("bad sql"),
+                      ssl.SSLError("certificate verify failed")):
+            with self.subTest(error=type(error).__name__):
+                pool = _FakePool([error, self.conn])
+                with self.assertRaises(type(error)):
+                    self._run_op(pool)
+                self.assertEqual(len(pool.timeouts), 1)
+
+    def test_exhausted_retries_raise_after_three_attempts(self):
+        pool = _FakePool([ConnectionRefusedError("down")] * 3)
+        with self.assertLogs(lc.logger, "WARNING") as warnings:
+            with self.assertRaises(ConnectionRefusedError):
+                self._run_op(pool)
+        self.assertEqual(len(pool.timeouts), 3)
+        self.assertEqual(len(warnings.records), 2)  # the last failure is raised, not logged here
+
+    def test_a_caller_still_degrades_to_empty_when_retries_are_exhausted(self):
+        from server import snapshots
+        lc._pool = _FakePool([ConnectionRefusedError("down")] * 3)
+        with patch.object(snapshots, "USE_LAKEBASE", True), self.assertLogs("server.snapshots", "WARNING") as logs:
+            self.assertEqual(asyncio.run(snapshots.list_snapshots("someone@example.com")), [])
+        self.assertIn("list_snapshots failed", logs.output[0])
+
+
+    def test_a_query_without_a_pool_raises(self):
+        lc._pool = None
+        with self.assertRaises(RuntimeError):
+            asyncio.run(lc.execute_query("SELECT 1"))
+
+
+class PoolStartRetryTest(unittest.TestCase):
+    ENV = {"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}
+
+    def test_a_pool_start_that_fails_while_the_endpoint_wakes_is_retried(self):
+        pool = object()
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            e.create_pool.side_effect = [ConnectionRefusedError("waking"), pool]
+            asyncio.run(lc.init_pool())
+            self.assertIs(lc._pool, pool)
+        self.assertEqual(e.create_pool.await_count, 2)
+
+    def test_a_pool_start_with_bad_auth_is_not_retried(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            e.create_pool.side_effect = asyncpg.InvalidPasswordError("bad token")
+            asyncio.run(lc.init_pool())
+            self.assertIsNone(lc._pool)
+        self.assertEqual(e.create_pool.await_count, 1)
+
+    def test_a_pool_that_never_starts_is_forgotten_after_the_retries(self):
+        with _Env(self.ENV, _client([_postgres_resource()])) as e:
+            e.create_pool.side_effect = ConnectionRefusedError("down")
+            asyncio.run(lc.init_pool())
+            self.assertIsNone(lc._pool)
+            self.assertIsNone(lc._TARGET)
+            self.assertEqual(e.create_pool.await_count, 3)
 
 
 class ProvisionedTest(unittest.TestCase):

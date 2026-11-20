@@ -103,7 +103,7 @@ class _Pool:
     def __init__(self, conn):
         self.conn = conn
 
-    def acquire(self):
+    def acquire(self, timeout=None):
         pool = self
 
         class _Ctx:

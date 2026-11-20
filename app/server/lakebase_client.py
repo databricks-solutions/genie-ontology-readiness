@@ -3,10 +3,13 @@
 import os
 import time
 import logging
+import socket
 import ssl
 import uuid
 import asyncio
 import aiohttp
+import asyncpg
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from server.user_agent import with_ua
@@ -360,12 +363,71 @@ async def _connection_password() -> str:
     return token or _credential["token"]
 
 
+# Waits between attempts when a connection fails because the endpoint is still waking from
+# scale-to-zero: three attempts in all. A failure after that is raised as before.
+RETRY_DELAYS = (0.5, 1.0)
+# The longest wait for a pooled connection per attempt (a connect included). A waking endpoint
+# refuses or times out quickly; this keeps three attempts well under 10 seconds.
+ACQUIRE_TIMEOUT = 2.5
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for a connection-level failure that a short wait can fix: the endpoint is waking,
+    or the connection was dropped. Not auth failures, SQL errors, or TLS and DNS errors (a
+    misconfiguration does not heal in a second)."""
+    if isinstance(exc, (ssl.SSLError, socket.gaierror)):
+        return False
+    if isinstance(exc, (asyncio.TimeoutError, OSError)):
+        return True
+    return isinstance(exc, (asyncpg.CannotConnectNowError, asyncpg.TooManyConnectionsError,
+                            asyncpg.ConnectionDoesNotExistError))
+
+
+async def _retried(call, what: str):
+    """Await ``call()``; on a transient connection failure, wait and call it again.
+
+    Only for a step that failed before any statement ran (a connect or a pool start), so a retry
+    never repeats a write. Each retry logs one WARNING; a retry that succeeds logs one INFO."""
+    attempts = len(RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await call()
+        except Exception as e:
+            if attempt == attempts or not _is_transient(e):
+                raise
+            delay = RETRY_DELAYS[attempt - 1]
+            logger.warning(f"{what} failed ({type(e).__name__}); the endpoint may be waking. "
+                           f"Retrying (attempt {attempt + 1} of {attempts}) in {delay}s")
+            await asyncio.sleep(delay)
+        else:
+            if attempt > 1:
+                logger.info(f"{what} succeeded on attempt {attempt} of {attempts}")
+            return result
+
+
+async def _enter_connection(pool):
+    """Enter ``pool.acquire()``: returns the acquire context and its connection."""
+    ctx = pool.acquire(timeout=ACQUIRE_TIMEOUT)
+    return ctx, await ctx.__aenter__()
+
+
+@asynccontextmanager
+async def lakebase_connection(pool):
+    """A pooled connection for one operation, released on exit.
+
+    A connect that fails while the endpoint wakes is retried (see _retried). Only the acquire is
+    retried, never the statement, so a write is never sent twice."""
+    ctx, conn = await _retried(lambda: _enter_connection(pool), "Lakebase connection")
+    try:
+        yield conn
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
 async def init_pool() -> None:
     """Create the asyncpg connection pool. Call during app startup."""
     global _pool
     try:
-        import asyncpg
-
         config = await _target()
         password = os.environ.get("LAKEBASE_PASSWORD", "")
 
@@ -391,22 +453,26 @@ async def init_pool() -> None:
             return
 
         logger.info(f"Connecting to Lakebase at {config['host']}:{config['port']}/{config['database']}")
-        _pool = await asyncio.wait_for(
-            asyncpg.create_pool(
-                host=config["host"],
-                port=config["port"],
-                database=config["database"],
-                user=config["user"],
-                password=password,
-                ssl=_ssl_arg(),
-                min_size=2,
-                max_size=10,
-                command_timeout=30,
-                # Idle connections are closed after 5 minutes, so reconnects pick up the
-                # current credential well within its lifetime.
-                max_inactive_connection_lifetime=300,
+        # The pool opens its first connections now, so a waking endpoint fails here: retry that.
+        _pool = await _retried(
+            lambda: asyncio.wait_for(
+                asyncpg.create_pool(
+                    host=config["host"],
+                    port=config["port"],
+                    database=config["database"],
+                    user=config["user"],
+                    password=password,
+                    ssl=_ssl_arg(),
+                    min_size=2,
+                    max_size=10,
+                    command_timeout=30,
+                    # Idle connections are closed after 5 minutes, so reconnects pick up the
+                    # current credential well within its lifetime.
+                    max_inactive_connection_lifetime=300,
+                ),
+                timeout=10,  # Don't hang for more than 10s on pool creation
             ),
-            timeout=10,  # Don't hang for more than 10s on pool creation
+            "Lakebase pool start",
         )
         logger.info("Lakebase connection pool initialized successfully")
     except Exception as e:
@@ -462,7 +528,7 @@ async def prepare_history_schema() -> str:
     pool = await get_pool()
     if pool is None:
         raise RuntimeError("Lakebase pool is not available")
-    async with pool.acquire() as conn:
+    async with lakebase_connection(pool) as conn:
         row = await conn.fetchrow(legacy_probe_sql())
         schema, reason = choose_history_schema(HISTORY_TABLES if (row and row["legacy_present"]) else [])
         if schema != LEGACY_SCHEMA:
@@ -507,7 +573,7 @@ async def execute_query(query: str, params: Optional[list] = None) -> list[dict]
     if _pool is None:
         raise RuntimeError("Lakebase pool not initialized")
 
-    async with _pool.acquire() as conn:
+    async with lakebase_connection(_pool) as conn:
         if params:
             rows = await conn.fetch(query, *params)
         else:
