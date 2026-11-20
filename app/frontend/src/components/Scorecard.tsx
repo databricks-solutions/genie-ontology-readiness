@@ -13,10 +13,24 @@ import {
   Tooltip,
 } from 'recharts';
 import { ChevronDown, RefreshCw, AlertTriangle, TrendingUp, Play, Gauge as GaugeIcon, Loader2, Sparkles, ListChecks, History, Plus, Server, Download, FileDown, GitCompareArrows, Square } from 'lucide-react';
-import { ApiError, apiDeleteQuiet, apiGet } from '../hooks/useApi';
+import { ApiError, apiDelete, apiGet } from '../hooks/useApi';
 import { useCopy } from '../hooks/useCopy';
-import { AssessRunError, RUN_STOPPED_NOTICE, isUserStop, runAssessment, serverErrorDetails } from '../utils/assessRun';
-import type { PendingPillar } from '../utils/assessRun';
+import {
+  AssessRunError,
+  RUN_ALREADY_ENDED,
+  RUN_JUST_FINISHED,
+  RUN_STOPPED_EARLIER,
+  RUN_STOPPED_NOTICE,
+  STOP_CONFIRM,
+  STOP_CONFLICT_CONFIRM,
+  conflictingRunId,
+  isUserStop,
+  reattachActive,
+  runAssessment,
+  serverErrorDetails,
+  stopWithConfirm,
+} from '../utils/assessRun';
+import type { ActiveRunResponse, PendingPillar } from '../utils/assessRun';
 import type {
   AppConfig,
   Scorecard as ScorecardType,
@@ -309,11 +323,11 @@ export default function Scorecard({
       .catch(() => {});
     // A run that is still working (this tab was closed or reloaded meanwhile): show its progress again.
     let mounted = true;
-    apiGet<{ run_id: string | null }>('/assess/runs/active')
-      .then((r) => {
-        if (mounted && r.run_id) void follow({ attachTo: r.run_id });
-      })
-      .catch(() => {});
+    void reattachActive({
+      getActive: () => apiGet<ActiveRunResponse>('/assess/runs/active'),
+      attach: (id) => follow({ attachTo: id }),
+      mounted: () => mounted,
+    });
     return () => {
       mounted = false;
       abortRef.current?.abort();
@@ -488,9 +502,9 @@ export default function Scorecard({
       if (e instanceof ApiError && e.status === 409) {
         // One run per user: offer to open the one that is working, or stop it.
         idlePhase();
-        const active = await apiGet<{ run_id: string | null }>('/assess/runs/active').catch(() => ({ run_id: null }));
-        if (active.run_id) setConflictRunId(active.run_id);
-        else showError('The earlier assessment just finished. Run it again.', []);
+        const id = await conflictingRunId(() => apiGet<ActiveRunResponse>('/assess/runs/active'));
+        if (id) setConflictRunId(id);
+        else showError(RUN_JUST_FINISHED, []);
         return;
       }
       if (e instanceof AssessRunError) showError(e.message, e.details);
@@ -502,17 +516,37 @@ export default function Scorecard({
     }
   }
 
-  /** Stop the run this tab follows (after a confirmation). The run ends as stopped and is not saved. */
-  function stopRun(runId: string) {
-    if (!window.confirm('Stop this assessment? A stopped run is not saved to history.')) return;
-    void apiDeleteQuiet(`/assess/runs/${runId}`);
+  /** Stop the run this tab follows. The DELETE is checked: a failure stays on screen
+   * and the run is still shown as running. The stream then reports the stop. */
+  async function stopRun(runId: string) {
+    try {
+      const outcome = await stopWithConfirm({
+        runId,
+        message: STOP_CONFIRM,
+        confirm: (m) => window.confirm(m),
+        del: apiDelete,
+      });
+      if (outcome === 'ended') setNotice(RUN_ALREADY_ENDED);
+    } catch (e) {
+      setError(`Could not stop the assessment: ${(e as Error).message}. It is still running; try again.`);
+    }
   }
 
-  function stopConflictRun(runId: string) {
-    if (!window.confirm('Stop the assessment that is already running? A stopped run is not saved to history.')) return;
-    void apiDeleteQuiet(`/assess/runs/${runId}`);
-    setConflictRunId(null);
-    setNotice('The earlier assessment was stopped. Nothing was saved. You can run again now.');
+  /** Stop the run that blocked a new start. The banner clears only after the stop succeeds. */
+  async function stopConflictRun(runId: string) {
+    try {
+      const outcome = await stopWithConfirm({
+        runId,
+        message: STOP_CONFLICT_CONFIRM,
+        confirm: (m) => window.confirm(m),
+        del: apiDelete,
+      });
+      if (outcome === 'declined') return;
+      setConflictRunId(null);
+      setNotice(outcome === 'stopped' ? RUN_STOPPED_EARLIER : RUN_ALREADY_ENDED);
+    } catch (e) {
+      setError(`Could not stop the earlier assessment: ${(e as Error).message}. It is still running; try again.`);
+    }
   }
 
   // "New assessment": go back to the intro page so the user can set the scope
@@ -715,7 +749,7 @@ export default function Scorecard({
               <button onClick={() => void follow({ attachTo: conflictRunId })} className="btn-primary py-1 px-3 text-xs">
                 Open it
               </button>
-              <button onClick={() => stopConflictRun(conflictRunId)} className="btn-secondary py-1 px-3 text-xs">
+              <button onClick={() => void stopConflictRun(conflictRunId)} className="btn-secondary py-1 px-3 text-xs">
                 Stop it
               </button>
             </div>
@@ -758,7 +792,7 @@ export default function Scorecard({
             </div>
             {activeRunId && (
               <button
-                onClick={() => stopRun(activeRunId)}
+                onClick={() => void stopRun(activeRunId)}
                 className="btn-secondary py-1 px-3 flex items-center gap-1.5 text-xs shrink-0 self-start"
                 title="Stop this assessment (it is not saved)"
               >

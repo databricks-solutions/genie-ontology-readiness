@@ -170,9 +170,12 @@ def get_run(run_id: str, principal: str) -> Optional[AssessmentRun]:
 
 
 def active_run(principal: str) -> Optional[AssessmentRun]:
-    """The principal's exclusive run that is still working, if any."""
+    """The principal's exclusive run that is still working, if any. A run that
+    has been stopped no longer counts, at once: its task may take a moment to
+    wind down, but a new run must not be refused because of it."""
     for run in _runs.values():
-        if run.principal == principal and run.exclusive and not run.done:
+        if (run.principal == principal and run.exclusive and not run.done
+                and run.cancel_why is None):
             return run
     return None
 

@@ -161,6 +161,24 @@ class RunLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.events[-1]["reason"], "failed")
         self.assertIn("run time limit", run.events[-1]["error"])
 
+    async def test_a_stopped_run_no_longer_blocks_a_new_one(self):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            first = runs.start_run("a@x", None, None, None, None)
+            await asyncio.sleep(0)
+            self.assertTrue(runs.cancel_run(first.id, "a@x"))
+            # Still not done (the task has not wound down yet), but no longer active.
+            self.assertFalse(first.done)
+            self.assertIsNone(runs.active_run("a@x"))
+            second = runs.start_run("a@x", None, None, None, None)
+            self.assertIsNot(second, first)
+            second.task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first.task
+
     async def test_other_users_cannot_read_a_run(self):
         run = runs.AssessmentRun(id="r9", principal="a@x")
         runs._runs[run.id] = run
@@ -362,6 +380,26 @@ class RoutesTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         self.assertEqual((await self.client.get("/api/assess/runs/active")).json(), {"run_id": None})
+
+    async def test_delete_then_immediate_post_is_not_a_409(self):
+        async def slow():
+            await asyncio.sleep(30)
+            yield {}
+
+        with patch.object(runs, "run_assessment_stream", slow):
+            first = await self.client.post("/api/assess/runs", json={})
+            run_id = first.json()["run_id"]
+            stop = await self.client.delete(f"/api/assess/runs/{run_id}")
+            again = await self.client.post("/api/assess/runs", json={})
+            active = await self.client.get("/api/assess/runs/active")
+            second_id = again.json().get("run_id")
+            if second_id and second_id in runs._runs:
+                runs._runs[second_id].task.cancel()
+
+        self.assertEqual(stop.status_code, 200)
+        self.assertEqual(again.status_code, 200)
+        self.assertNotEqual(second_id, run_id)
+        self.assertEqual(active.json()["run_id"], second_id)
 
     async def test_unknown_or_foreign_run_is_a_json_404(self):
         run = runs.AssessmentRun(id="theirs", principal="b@x")

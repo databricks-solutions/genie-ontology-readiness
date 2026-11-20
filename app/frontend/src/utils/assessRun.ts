@@ -127,6 +127,62 @@ export function isUserStop(ev: AssessEvent): boolean {
   return ev.type === 'error' && ev.reason === 'cancelled';
 }
 
+export const STOP_CONFIRM = 'Stop this assessment? A stopped run is not saved to history.';
+export const STOP_CONFLICT_CONFIRM = 'Stop the assessment that is already running? A stopped run is not saved to history.';
+export const RUN_JUST_FINISHED = 'The earlier assessment just finished. Run it again.';
+export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing was saved. You can run again now.';
+export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
+
+export interface ActiveRunResponse {
+  run_id: string | null;
+}
+
+/** The run that a refused start (409) is blocked by, or null when none is found
+ * (it finished in the meantime, or the lookup failed). */
+export async function conflictingRunId(getActive: () => Promise<ActiveRunResponse>): Promise<string | null> {
+  try {
+    return (await getActive()).run_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** On page load, follow the user's run that is still working (if any). Never starts a run. */
+export async function reattachActive(opts: {
+  getActive: () => Promise<ActiveRunResponse>;
+  attach: (runId: string) => Promise<unknown>;
+  mounted: () => boolean;
+}): Promise<void> {
+  let active: ActiveRunResponse;
+  try {
+    active = await opts.getActive();
+  } catch {
+    return;
+  }
+  if (opts.mounted() && active.run_id) await opts.attach(active.run_id);
+}
+
+export type StopOutcome = 'declined' | 'stopped' | 'ended';
+
+/** Stop a run after the user confirms. Sends the DELETE only when confirmed. A 404
+ * means the run had already ended ('ended'). Any other failure rejects, so the
+ * caller keeps showing the run as it was. */
+export async function stopWithConfirm(opts: {
+  runId: string;
+  message: string;
+  confirm: (message: string) => boolean;
+  del: (path: string) => Promise<unknown>;
+}): Promise<StopOutcome> {
+  if (!opts.confirm(opts.message)) return 'declined';
+  try {
+    await opts.del(`/assess/runs/${opts.runId}`);
+    return 'stopped';
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return 'ended';
+    throw e;
+  }
+}
+
 /** Run an assessment to the end, reconnecting as needed. Resolves when the run
  * is finished (complete or server-reported error, both sent via onEvent).
  * Rejects with AssessRunError when the run can't be followed, or with the

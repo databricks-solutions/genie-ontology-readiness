@@ -1,7 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   AssessRunError,
+  RUN_JUST_FINISHED,
   RUN_LOST_MESSAGE,
+  STOP_CONFIRM,
+  conflictingRunId,
+  reattachActive,
+  stopWithConfirm,
   RUN_STOPPED_NOTICE,
   abortableSleep,
   isUserStop,
@@ -316,5 +321,154 @@ describe('serverErrorDetails', () => {
       'Run ID: r',
       'Reference: abc123 (search the app logs for it)',
     ]);
+  });
+});
+
+describe('reattach on page load', () => {
+  it('follows the active run from its first event and never starts a new one', async () => {
+    const { stream, paths } = scripted([[{ type: 'pillar', pillar: { key: 'metadata' }, seq: 0 }, { type: 'end', next: 1 }]]);
+    let starts = 0;
+    const attached: string[] = [];
+    await reattachActive({
+      getActive: async () => ({ run_id: 'live9' }),
+      attach: async (id) => {
+        attached.push(id);
+        await runAssessment({
+          body: {},
+          runId: id,
+          signal: new AbortController().signal,
+          start: async () => {
+            starts += 1;
+            return { run_id: 'nope' };
+          },
+          stream,
+          sleep: noSleep,
+          onEvent: () => undefined,
+        });
+      },
+      mounted: () => true,
+    });
+
+    expect(attached).toEqual(['live9']);
+    expect(starts).toBe(0);
+    expect(paths).toEqual(['/assess/runs/live9/events?after=0']);
+  });
+
+  it('does nothing when no run is active, the lookup fails, or the page is gone', async () => {
+    const attached: string[] = [];
+    const attach = async (id: string) => {
+      attached.push(id);
+    };
+    await reattachActive({ getActive: async () => ({ run_id: null }), attach, mounted: () => true });
+    await reattachActive({
+      getActive: async () => {
+        throw new TypeError('Failed to fetch');
+      },
+      attach,
+      mounted: () => true,
+    });
+    await reattachActive({ getActive: async () => ({ run_id: 'x' }), attach, mounted: () => false });
+    expect(attached).toEqual([]);
+  });
+});
+
+describe('a start refused with 409 (one run per user)', () => {
+  it('finds the blocking run and "Open it" follows that id', async () => {
+    const err = await runAssessment({
+      body: {},
+      signal: new AbortController().signal,
+      start: async () => {
+        throw new ApiError('An assessment is already running.', 409);
+      },
+      stream: () => (async function* () {})(),
+      sleep: noSleep,
+      onEvent: () => undefined,
+    }).catch((e) => e);
+    expect(err.status).toBe(409);
+
+    const blocking = await conflictingRunId(async () => ({ run_id: 'busy1' }));
+    expect(blocking).toBe('busy1');
+
+    const { stream, paths } = scripted([[{ type: 'end', next: 0 }]]);
+    await runAssessment({
+      body: {},
+      runId: blocking ?? undefined,
+      signal: new AbortController().signal,
+      stream,
+      sleep: noSleep,
+      onEvent: () => undefined,
+    });
+    expect(paths).toEqual(['/assess/runs/busy1/events?after=0']);
+  });
+
+  it('says "just finished" when no run is active any more, or the lookup fails', async () => {
+    expect(await conflictingRunId(async () => ({ run_id: null }))).toBeNull();
+    expect(
+      await conflictingRunId(async () => {
+        throw new TypeError('Failed to fetch');
+      })
+    ).toBeNull();
+    expect(RUN_JUST_FINISHED).toMatch(/just finished/);
+  });
+});
+
+describe('stopWithConfirm', () => {
+  it('sends nothing when the user declines', async () => {
+    const calls: string[] = [];
+    const out = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: () => false,
+      del: async (p) => {
+        calls.push(p);
+      },
+    });
+    expect(out).toBe('declined');
+    expect(calls).toEqual([]);
+  });
+
+  it('sends the DELETE for the right run once confirmed', async () => {
+    const asked: string[] = [];
+    const calls: string[] = [];
+    const out = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: (m) => {
+        asked.push(m);
+        return true;
+      },
+      del: async (p) => {
+        calls.push(p);
+        return { cancelled: true };
+      },
+    });
+    expect(asked).toEqual([STOP_CONFIRM]);
+    expect(calls).toEqual(['/assess/runs/abc']);
+    expect(out).toBe('stopped');
+  });
+
+  it('reports a run that already ended (404) as ended, not as a failure', async () => {
+    const out = await stopWithConfirm({
+      runId: 'gone',
+      message: STOP_CONFIRM,
+      confirm: () => true,
+      del: async () => {
+        throw new ApiError('Assessment run not found.', 404);
+      },
+    });
+    expect(out).toBe('ended');
+  });
+
+  it('rejects when the stop fails, so the caller keeps the run on screen', async () => {
+    const err = await stopWithConfirm({
+      runId: 'abc',
+      message: STOP_CONFIRM,
+      confirm: () => true,
+      del: async () => {
+        throw new ApiError('HTTP 500', 500);
+      },
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.status).toBe(500);
   });
 });
