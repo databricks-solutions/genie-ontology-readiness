@@ -5,8 +5,12 @@ no network, no Lakebase — so they run in the same `unittest discover` pass as 
 rest of the suite.
 """
 
+import io
+import logging
 import unittest
 from unittest.mock import patch
+
+import uvicorn
 
 from server import security
 
@@ -41,6 +45,39 @@ class LogRedactionTest(unittest.TestCase):
     def test_leaves_diagnostic_counts_intact(self):
         # Redaction must not corrupt the numbers the assessment logs for support.
         self.assertEqual(security.redact("scanned 25/1068 catalogs"), "scanned 25/1068 catalogs")
+
+
+class AccessLogFormattingTest(unittest.TestCase):
+    """#139 — every request must log one access line, with no 'Logging error'.
+
+    uvicorn's AccessFormatter unpacks record.args into (client, method, path, version,
+    status). The redaction filter must keep that shape; otherwise each request fails
+    inside the handler and prints a traceback instead of the access line.
+    """
+
+    def setUp(self):
+        # The same order as app/app.py: redaction is installed, then uvicorn
+        # configures its loggers when it starts (uvicorn.Config applies LOGGING_CONFIG).
+        security.install_log_redaction()
+        uvicorn.Config(app=lambda scope, receive, send: None)
+        self.stream = io.StringIO()
+        for handler in logging.getLogger("uvicorn.access").handlers:
+            handler.setStream(self.stream)
+
+    def test_access_line_renders_without_logging_error(self):
+        with patch.object(logging.Handler, "handleError") as handle_error:
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d', "10.0.0.1:0", "GET", "/api/config", "1.1", 200)
+        handle_error.assert_not_called()
+        self.assertIn('10.0.0.1:0 - "GET /api/config HTTP/1.1" 200', self.stream.getvalue())
+
+    def test_access_line_still_redacts_a_secret_in_the_path(self):
+        with patch.object(logging.Handler, "handleError") as handle_error:
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d', "10.0.0.1:0", "GET", "/api/x?token=s3cr3tvalue123", "1.1", 200)
+        handle_error.assert_not_called()
+        self.assertNotIn("s3cr3tvalue123", self.stream.getvalue())
+        self.assertIn('"GET /api/x?token=[REDACTED] HTTP/1.1" 200', self.stream.getvalue())
 
 
 class ErrorSanitizationTest(unittest.TestCase):
