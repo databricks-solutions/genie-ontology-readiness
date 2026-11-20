@@ -5,6 +5,7 @@ import {
   RUN_LOST_MESSAGE,
   STOP_CONFIRM,
   conflictingRunId,
+  completionEffects,
   createFollowGate,
   followFailure,
   LAST_RUN_UNSAVED_NOTICE,
@@ -389,7 +390,7 @@ describe('reload after a run was followed here', () => {
         attached.push([id, remembered !== null]);
       },
       mounted: () => true,
-      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x', startedAt: 5 }), viewer),
+      remembered: (viewer) => parseRemembered(JSON.stringify({ runId: 'old7', viewer: 'me@x' }), viewer),
     });
     expect(attached).toEqual([['old7', true]]);
   });
@@ -402,15 +403,15 @@ describe('reload after a run was followed here', () => {
         attached.push([id, remembered !== null]);
       },
       mounted: () => true,
-      remembered: () => ({ runId: 'old', startedAt: 1 }),
+      remembered: () => ({ runId: 'old' }),
     });
     expect(attached).toEqual([['live', false]]);
   });
 
   it('ignores a remembered run that belongs to another viewer (shared browser)', () => {
-    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x', startedAt: 9 });
+    const raw = JSON.stringify({ runId: 'theirs', viewer: 'alice@x' });
     expect(parseRemembered(raw, 'bob@x')).toBeNull();
-    expect(parseRemembered(raw, 'alice@x')).toEqual({ runId: 'theirs', startedAt: 9 });
+    expect(parseRemembered(raw, 'alice@x')).toEqual({ runId: 'theirs' });
     expect(parseRemembered('not json', 'alice@x')).toBeNull();
     expect(parseRemembered(null, 'alice@x')).toBeNull();
   });
@@ -627,35 +628,57 @@ describe('one follower per page', () => {
 });
 
 describe('a remembered run that finished while the page was away', () => {
+  // Newest first, as the history list returns them.
   const history = [
-    { id: 9, created_at: '2026-11-20T10:30:00Z' },
-    { id: 8, created_at: '2026-11-20T09:00:00Z' },
+    { id: 11, created_at: '2026-11-20T11:00:00Z', run_id: 'later-run' },
+    { id: 9, created_at: '2026-11-20T10:30:00Z', run_id: 'run-a' },
+    { id: 8, created_at: '2026-11-20T09:00:00Z' }, // saved before run ids were recorded
   ];
-  const at = Date.parse('2026-11-20T10:00:00Z');
+  const list = async () => history;
 
-  it('finds the newest saved result created at or after the remembered run started', async () => {
-    expect(await findFinishedWhileAway({ list: async () => history, startedAt: at })).toBe(9);
+  it('finds the saved result of exactly the remembered run', async () => {
+    expect(await findFinishedWhileAway({ list, runId: 'run-a' })).toBe(9);
+    expect(await findFinishedWhileAway({ list, runId: 'later-run' })).toBe(11);
   });
 
-  it('finds none when every saved result is from before the run started, or the list fails', async () => {
-    expect(await findFinishedWhileAway({ list: async () => history, startedAt: Date.parse('2026-11-20T11:00:00Z') })).toBeNull();
+  it('does not show another run that finished just before the remembered one started', async () => {
+    // A run finished at 10:00 (before run-b started) must not match run-b, whatever its time.
+    const rows = [{ id: 20, created_at: '2026-11-20T10:00:00Z', run_id: 'run-earlier' }];
+    expect(await findFinishedWhileAway({ list: async () => rows, runId: 'run-b' })).toBeNull();
+  });
+
+  it('finds none when the run has no saved result, or the list fails', async () => {
+    expect(await findFinishedWhileAway({ list, runId: 'never-saved' })).toBeNull();
     expect(
       await findFinishedWhileAway({
         list: async () => {
           throw new TypeError('Failed to fetch');
         },
-        startedAt: at,
+        runId: 'run-a',
       })
     ).toBeNull();
   });
 
-  it('tolerates a little clock skew between this browser and the server', async () => {
-    const justAfter = Date.parse('2026-11-20T10:30:30Z');
-    expect(await findFinishedWhileAway({ list: async () => history, startedAt: justAfter })).toBe(9);
+  it('never matches a result saved without a run id', async () => {
+    expect(await findFinishedWhileAway({ list, runId: '' })).toBeNull();
   });
 
   it('keeps the lost message for a run that did not finish (history on, no saved result)', () => {
     expect(LOST).toMatch(/didn't finish/);
     expect(LOST).toMatch(/Nothing was saved/);
+  });
+});
+
+describe('completing a run refreshes the page however it was followed', () => {
+  it('shows the saved result and refreshes history when the run was saved', () => {
+    expect(completionEffects({ snapshot_id: 65 }, true)).toEqual({ currentId: 65, refreshHistory: true });
+  });
+
+  it('still refreshes history with history on, even when the save failed (no id to show)', () => {
+    expect(completionEffects({ snapshot_id: null }, true)).toEqual({ currentId: null, refreshHistory: true });
+  });
+
+  it('does not refresh history when history is off', () => {
+    expect(completionEffects({}, false)).toEqual({ currentId: null, refreshHistory: false });
   });
 });

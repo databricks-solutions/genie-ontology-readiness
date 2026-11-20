@@ -117,6 +117,16 @@ const HINT =
   '(Compute → Apps → the app → Logs), narrow the catalog scope (New assessment → pick catalogs → ' +
   'Run assessment), or use a larger SQL warehouse.';
 
+/** What a completed run changes on the page, whichever path followed it (started, reattached,
+ * opened from the 409 banner, or finished while away): the saved result to show, and whether
+ * the history list (and its trend) must be re-read. */
+export function completionEffects(ev: { snapshot_id?: number | null }, historySaves: boolean): {
+  currentId: number | null;
+  refreshHistory: boolean;
+} {
+  return { currentId: ev.snapshot_id ?? null, refreshHistory: historySaves };
+}
+
 /** Shown when the user stops a run. A stopped run is not saved. */
 export const RUN_STOPPED_NOTICE = 'The assessment was stopped. Nothing was saved.';
 
@@ -151,29 +161,28 @@ export const RUN_STOPPED_EARLIER = 'The earlier assessment was stopped. Nothing 
 export const RUN_ALREADY_ENDED = 'That assessment had already finished.';
 
 /** The run this browser last followed. Tied to the viewer, so one user never sees
- * another's; `startedAt` (ms) finds the saved result if the run finished while away. */
+ * another's; its saved result (if any) names the run, so it can be found exactly. */
 export const RUN_ID_KEY = 'gor.assess.run';
 
 export interface RememberedRun {
   runId: string;
-  startedAt: number;
 }
 
 /** The remembered run for `viewer`, or null (another viewer's entry is ignored). */
 export function parseRemembered(raw: string | null, viewer: string): RememberedRun | null {
   if (!raw) return null;
   try {
-    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown; startedAt?: unknown };
+    const v = JSON.parse(raw) as { runId?: unknown; viewer?: unknown };
     if (v.viewer !== viewer || typeof v.runId !== 'string') return null;
-    return { runId: v.runId, startedAt: typeof v.startedAt === 'number' ? v.startedAt : 0 };
+    return { runId: v.runId };
   } catch {
     return null;
   }
 }
 
-export function rememberRun(runId: string, viewer: string, startedAt: number): void {
+export function rememberRun(runId: string, viewer: string): void {
   try {
-    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer, startedAt }));
+    localStorage.setItem(RUN_ID_KEY, JSON.stringify({ runId, viewer }));
   } catch {
     // Storage can be blocked. The notice for a run that is gone is then not shown.
   }
@@ -195,18 +204,15 @@ export function rememberedRun(viewer: string): RememberedRun | null {
   }
 }
 
-/** Slack for the clock difference between this browser and the server. */
-const CLOCK_SKEW_MS = 60_000;
-
-/** The newest saved result created at or after `startedAt` (the remembered run's start),
- * or null. `list` returns the user's history (newest first). Errors count as none. */
+/** The saved result of exactly this run (matched by the run id it was saved with), or
+ * null. Results saved before run ids were recorded never match. Errors count as none. */
 export async function findFinishedWhileAway(opts: {
-  list: () => Promise<Array<{ id: string | number; created_at: string }>>;
-  startedAt: number;
+  list: () => Promise<Array<{ id: string | number; run_id?: string | null }>>;
+  runId: string;
 }): Promise<number | null> {
   try {
     const rows = await opts.list();
-    const hit = rows.find((r) => Date.parse(r.created_at) >= opts.startedAt - CLOCK_SKEW_MS);
+    const hit = rows.find((r) => r.run_id != null && r.run_id === opts.runId);
     return hit ? Number(hit.id) : null;
   } catch {
     return null;
