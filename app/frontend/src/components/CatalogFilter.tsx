@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, useEffect } from 'react';
 import { Database, Search, Check, ChevronDown, Loader2 } from 'lucide-react';
 import type { CatalogInfo } from '../types';
+import { selectedFirst } from '../utils/pickerOrder';
 
 // Pre-run catalog filter: which catalogs the metadata pillars assess. Its options
 // are the catalogs accessible to the selected workspaces (UC bindings + OPEN),
@@ -32,6 +33,9 @@ export default function CatalogFilter({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  // Selection as of when the list was opened or the search text last changed (#65).
+  // The list is ordered by this snapshot, so ticking a box never moves that row.
+  const [pinned, setPinned] = useState<Set<string>>(() => new Set(value));
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -46,8 +50,9 @@ export default function CatalogFilter({
   const allNames = useMemo(() => catalogs.map((c) => c.name), [catalogs]);
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return q ? catalogs.filter((c) => c.name.toLowerCase().includes(q)) : catalogs;
-  }, [query, catalogs]);
+    const matches = q ? catalogs.filter((c) => c.name.toLowerCase().includes(q)) : catalogs;
+    return selectedFirst(matches, (c) => pinned.has(c.name));
+  }, [query, catalogs, pinned]);
 
   const allSelected = catalogs.length > 0 && value.length === catalogs.length;
   const summary =
@@ -69,7 +74,10 @@ export default function CatalogFilter({
       <button
         type="button"
         disabled={disabled || catalogs.length === 0}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          if (!open) setPinned(new Set(value));
+          setOpen(!open);
+        }}
         className="btn-secondary py-1.5 px-3 flex items-center gap-1.5 text-xs disabled:opacity-50"
         title="Choose which catalogs the metadata pillars assess (from the selected workspaces)"
       >
@@ -104,7 +112,10 @@ export default function CatalogFilter({
             <Search size={13} className="text-ink-400 shrink-0" />
             <input
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setPinned(new Set(value));
+              }}
               placeholder="Search catalogs…"
               className="w-full text-xs outline-hidden bg-transparent"
             />
