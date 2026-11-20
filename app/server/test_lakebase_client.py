@@ -48,7 +48,7 @@ class _Env:
     def __enter__(self):
         lc._RESOURCE = None
         lc._TARGET = None
-        lc._credential.update(token="", minted_at=0.0)
+        lc._credential.update(token="", minted_at=0.0, retry_after=0.0)
         self.create_pool = AsyncMock(return_value=object())
         self.patches = [
             patch.dict(os.environ, {"DATABRICKS_APP_NAME": "gor-test", **self.env}, clear=True),
@@ -67,7 +67,7 @@ class _Env:
         lc._RESOURCE = None
         lc._TARGET = None
         lc._pool = None
-        lc._credential.update(token="", minted_at=0.0)
+        lc._credential.update(token="", minted_at=0.0, retry_after=0.0)
 
     def run(self):
         asyncio.run(lc.init_pool())
@@ -235,9 +235,10 @@ class _FakePool:
     is how long acquire blocks before it yields (a busy pool); a ``timeout`` shorter than that
     fails it, as asyncpg does."""
 
-    def __init__(self, outcomes, wait=0.0):
+    def __init__(self, outcomes, wait=0.0, password=None):
         self.outcomes = list(outcomes)
         self.wait = wait
+        self.password = password  # asyncpg calls it inside the connect timeout for a new connection
         self.timeouts, self.released = [], []
 
     def acquire(self, timeout=None):
@@ -254,6 +255,8 @@ class _FakeAcquire:
         if timeout is not None and self.pool.wait > timeout:
             raise asyncio.TimeoutError()
         await asyncio.sleep(self.pool.wait)
+        if self.pool.password is not None:
+            await asyncio.wait_for(self.pool.password(), lc.CONNECT_TIMEOUT)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         self.conn = self.outcome
@@ -322,6 +325,33 @@ class ConnectionRetryTest(unittest.TestCase):
                 self._run_op(pool)
         self.assertEqual(len(pool.timeouts), 3)
         self.assertEqual(len(warnings.records), 2)  # the last failure is raised, not logged here
+
+    def test_a_slow_credential_mint_does_not_fail_the_connect(self):
+        # The cached credential is stale and the credentials call is slower than the connect bound.
+        # The mint runs before the connect, so the connect still succeeds.
+        async def slow_mint(**kwargs):
+            await asyncio.sleep(0.05)
+            return "fresh"
+
+        pool = _FakePool([self.conn], password=lc._connection_password)
+        env = {"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}
+        with _Env(env, _client([_postgres_resource()])), \
+                patch.object(lc, "CONNECT_TIMEOUT", 0.01), patch.object(lc, "_fetch_db_credential", slow_mint):
+            lc._TARGET = {"host": HOST, "port": 5432, "database": "d", "user": "u", "endpoint": EP, "instance": ""}
+            lc._credential.update(token="old", minted_at=0.0)  # older than CREDENTIAL_MAX_AGE
+            self.assertIs(self._run_op(pool), self.conn)
+            self.assertEqual(lc._credential["token"], "fresh")
+
+    def test_a_failed_mint_is_not_retried_during_the_cooldown(self):
+        mint = AsyncMock(return_value=None)
+        env = {"LAKEBASE_HOST": EP, "PGHOST": HOST, "PGDATABASE": "d", "PGUSER": "u"}
+        with _Env(env, _client([_postgres_resource()])), patch.object(lc, "_fetch_db_credential", mint):
+            lc._TARGET = {"host": HOST, "port": 5432, "database": "d", "user": "u", "endpoint": EP, "instance": ""}
+            lc._credential.update(token="old", minted_at=0.0)
+            asyncio.run(lc._refresh_credential())
+            asyncio.run(lc._refresh_credential())  # within MINT_RETRY_SECONDS: no second call
+            self.assertEqual(mint.await_count, 1)
+            self.assertEqual(lc._credential["token"], "old")  # a failed mint keeps the current one
 
     def test_a_busy_pool_is_waited_for_not_treated_as_a_connection_failure(self):
         # The pool yields a connection only after longer than the connect bound: pool contention.

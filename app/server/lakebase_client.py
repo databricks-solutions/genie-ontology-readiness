@@ -8,7 +8,6 @@ import ssl
 import uuid
 import asyncio
 import aiohttp
-import asyncpg
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -338,13 +337,18 @@ def _ssl_arg():
 # A Lakebase OAuth credential is valid for about 60 minutes. A new one is minted for new
 # connections after this age; open connections stay authenticated.
 CREDENTIAL_MAX_AGE = 45 * 60
-_credential = {"token": "", "minted_at": 0.0}
+_credential = {"token": "", "minted_at": 0.0, "retry_after": 0.0}
+# After a failed mint, no new mint is tried for this long: a credentials call that keeps failing
+# must not add a slow call to every request.
+MINT_RETRY_SECONDS = 30
 
 
 async def _mint_credential(config: dict) -> str:
     token = await _fetch_db_credential(instance_name=config["instance"], endpoint_name=config["endpoint"]) or ""
     if token:
         _credential.update(token=token, minted_at=time.time())
+    else:
+        _credential["retry_after"] = time.time() + MINT_RETRY_SECONDS
     return token
 
 
@@ -355,6 +359,8 @@ async def _connection_password() -> str:
     the current credential is used: it stays valid for about 15 more minutes, and the next new
     connection tries again."""
     if _credential["token"] and time.time() - _credential["minted_at"] < CREDENTIAL_MAX_AGE:
+        return _credential["token"]
+    if time.time() < _credential["retry_after"]:
         return _credential["token"]
     token = await _mint_credential(await _target())
     if not token:
@@ -377,6 +383,8 @@ def _is_transient(exc: BaseException) -> bool:
     """True for a connection-level failure that a short wait can fix: the endpoint is waking,
     or the connection was dropped. Not auth failures, SQL errors, or TLS and DNS errors (a
     misconfiguration does not heal in a second)."""
+    import asyncpg  # only reached with a running pool, so asyncpg is importable
+
     if isinstance(exc, (ssl.SSLError, socket.gaierror)):
         return False
     if isinstance(exc, (asyncio.TimeoutError, OSError)):
@@ -407,29 +415,49 @@ async def _retried(call, what: str):
             return result
 
 
-async def _enter_connection(pool):
-    """Enter ``pool.acquire()``: returns the acquire context and its connection."""
-    ctx = pool.acquire()
-    return ctx, await ctx.__aenter__()
-
-
 @asynccontextmanager
 async def lakebase_connection(pool):
     """A pooled connection for one operation, released on exit.
 
     A connect that fails while the endpoint wakes is retried (see _retried). Only the acquire is
-    retried, never the statement, so a write is never sent twice."""
-    ctx, conn = await _retried(lambda: _enter_connection(pool), "Lakebase connection")
+    retried, never the statement, so a write is never sent twice. The credential is refreshed
+    first, outside the connect timeout (see _refresh_credential)."""
+    await _refresh_credential()
+
+    async def enter():
+        ctx = pool.acquire()
+        return ctx, await ctx.__aenter__()
+
+    ctx, conn = await _retried(enter, "Lakebase connection")
     try:
         yield conn
     finally:
         await ctx.__aexit__(None, None, None)
 
 
+async def _refresh_credential() -> None:
+    """Mint a fresh credential before a connection is made, outside the connect timeout.
+
+    asyncpg awaits the password callable inside its connect timeout, so a slow credentials call
+    made there would fail the connect. Here it cannot. Does nothing while the cached credential
+    is fresh, after a recent failed mint, or when there is no endpoint or instance to mint for
+    (the target is cached by init_pool whenever a pool uses the credential)."""
+    target = _TARGET
+    if target is None or not (target["endpoint"] or target["instance"]):
+        return
+    if _credential["token"] and time.time() - _credential["minted_at"] < CREDENTIAL_MAX_AGE:
+        return
+    if time.time() < _credential["retry_after"]:
+        return
+    await _mint_credential(target)
+
+
 async def init_pool() -> None:
     """Create the asyncpg connection pool. Call during app startup."""
     global _pool
     try:
+        import asyncpg
+
         config = await _target()
         password = os.environ.get("LAKEBASE_PASSWORD", "")
 
