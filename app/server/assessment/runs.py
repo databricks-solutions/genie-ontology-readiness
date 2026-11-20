@@ -322,6 +322,9 @@ _removals: set[asyncio.Task] = set()
 
 
 async def _remove_snapshot(snapshot_id: int, principal: str) -> None:
+    """Remove a stopped run's row. delete_snapshot raises whenever the removal is not
+    confirmed (database unavailable or failing), so every exception is retried; a
+    return, True or False, means the row is removed or was already gone."""
     delay = REMOVE_RETRY_SECONDS
     for attempt in range(1, REMOVE_ATTEMPTS + 1):
         try:

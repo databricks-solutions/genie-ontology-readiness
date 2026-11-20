@@ -785,12 +785,13 @@ class _Conn:
 
 
 class SnapshotDeleteTest(unittest.IsolatedAsyncioTestCase):
-    """delete_snapshot's SQL and results (the stopped-run removal depends on them)."""
+    """delete_snapshot's SQL and results. The stopped-run removal depends on them:
+    False only when nothing is saved, and an error whenever the removal is unconfirmed."""
 
-    def _patched(self, enabled=True, pool=None):
+    def _patched(self, lakebase=True, pool=None):
         from server import snapshots
         return (
-            patch.object(snapshots, "_enabled", AsyncMock(return_value=enabled)),
+            patch.object(snapshots, "USE_LAKEBASE", lakebase),
             patch.object(snapshots, "_table", lambda: "t_hist"),
             patch("server.lakebase_client.get_pool", AsyncMock(return_value=pool)),
         )
@@ -805,25 +806,25 @@ class SnapshotDeleteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sql, "DELETE FROM t_hist WHERE id = $1 AND created_by = $2")
         self.assertEqual(args, (7, "a@x"))
 
-    async def test_false_when_no_row_matched(self):
+    async def test_false_when_the_row_is_already_gone(self):
         from server import snapshots
         a, b, c = self._patched(pool=_Pool(_Conn("DELETE 0")))
         with a, b, c:
             self.assertFalse(await snapshots.delete_snapshot(7, "someone-else@x"))
 
-    async def test_false_without_touching_the_database_when_history_is_off(self):
+    async def test_false_without_touching_the_database_when_history_is_off_by_configuration(self):
         from server import snapshots
         get_pool = AsyncMock()
-        with patch.object(snapshots, "_enabled", AsyncMock(return_value=False)), \
-             patch("server.lakebase_client.get_pool", get_pool):
+        with patch.object(snapshots, "USE_LAKEBASE", False), patch("server.lakebase_client.get_pool", get_pool):
             self.assertFalse(await snapshots.delete_snapshot(7, "a@x"))
         get_pool.assert_not_awaited()
 
-    async def test_false_when_the_pool_is_gone(self):
+    async def test_raises_when_the_database_is_configured_but_unavailable(self):
+        # Not "already gone": the row may still be there, so the caller must retry.
         from server import snapshots
         a, b, c = self._patched(pool=None)
-        with a, b, c:
-            self.assertFalse(await snapshots.delete_snapshot(7, "a@x"))
+        with a, b, c, self.assertRaises(RuntimeError):
+            await snapshots.delete_snapshot(7, "a@x")
 
     async def test_a_database_error_is_raised_so_the_caller_can_retry(self):
         from server import snapshots
@@ -835,6 +836,44 @@ class SnapshotDeleteTest(unittest.IsolatedAsyncioTestCase):
         a, b, c = self._patched(pool=_Pool(Broken()))
         with a, b, c, self.assertRaises(RuntimeError):
             await snapshots.delete_snapshot(7, "a@x")
+
+
+class ListReturnsRunIdTest(unittest.IsolatedAsyncioTestCase):
+    async def test_list_selects_the_run_id_and_returns_it_or_none_for_old_rows(self):
+        from datetime import datetime, timezone
+        from server import snapshots
+
+        rows = [
+            {"id": 2, "created_at": datetime(2026, 11, 20, 10, tzinfo=timezone.utc), "created_by": "a@x",
+             "overall_score": 61.0, "overall_level": 2, "run_id": "run-new"},
+            {"id": 1, "created_at": datetime(2026, 11, 19, 10, tzinfo=timezone.utc), "created_by": "a@x",
+             "overall_score": 40.0, "overall_level": 1},  # saved before run ids were recorded
+        ]
+
+        class Conn:
+            sql = None
+
+            async def fetch(self, sql, *args):
+                Conn.sql = sql
+                return rows
+
+        pool = _Pool(Conn())
+        with patch.object(snapshots, "_enabled", AsyncMock(return_value=True)), \
+             patch.object(snapshots, "_table", lambda: "t_hist"), \
+             patch.object(snapshots, "_scope_columns", False), \
+             patch("server.lakebase_client.get_pool", AsyncMock(return_value=pool)):
+            out = await snapshots.list_snapshots(created_by="a@x")
+
+        self.assertIn("scorecard->>'run_id' AS run_id", Conn.sql)
+        self.assertEqual([r["run_id"] for r in out], ["run-new", None])
+
+
+class RemovalNotConfirmedTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_false_return_is_treated_as_removed_or_not_saved_and_not_retried(self):
+        delete = AsyncMock(return_value=False)  # history off, or the row already gone
+        with patch.object(runs.snapshots, "delete_snapshot", delete):
+            await runs._remove_snapshot(7, "a@x")
+        self.assertEqual(delete.await_count, 1)
 
 
 class RemovalRetryTest(unittest.IsolatedAsyncioTestCase):
@@ -902,6 +941,32 @@ class SubmitWithoutWaitTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.create_task(not_a_run())
         waits = [c.kwargs["wait_seconds"] for c in execute_once.await_args_list]
         self.assertEqual(waits, [0, 50])
+
+    async def test_a_run_keeps_the_total_budget_a_default_submit_gives(self):
+        # The server wait a run skips is added to its poll budget: wait + poll is the same.
+        from server import sql_client
+
+        execute_once = AsyncMock(return_value=[])
+
+        async def run_with(poll):
+            sql_client.submit_without_wait()
+            await sql_client.execute_sql("SELECT 1", record=False, poll_seconds=poll)
+
+        async def default_with(poll):
+            await sql_client.execute_sql("SELECT 1", record=False, poll_seconds=poll)
+
+        async def budget(fn, poll):
+            execute_once.reset_mock()
+            await asyncio.create_task(fn(poll))
+            kw = execute_once.await_args.kwargs
+            return kw["wait_seconds"] + kw["poll_seconds"]
+
+        with patch.object(sql_client, "_execute_once", execute_once), \
+             patch.object(sql_client, "FORCE_SP", False), \
+             patch.object(sql_client, "get_user_token", lambda: None):
+            for poll in (sql_client.DEFAULT_POLL_SECONDS, 60):
+                self.assertEqual(await budget(run_with, poll), await budget(default_with, poll), poll)
+            self.assertEqual(await budget(run_with, sql_client.DEFAULT_POLL_SECONDS), 230)
 
     async def test_polling_starts_quickly_so_a_run_is_not_slowed(self):
         from server.sql_client import _poll_statement

@@ -137,13 +137,16 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
 async def delete_snapshot(snapshot_id: int, created_by: str) -> bool:
     """Remove one of a user's snapshots (used when a run was stopped while saving).
 
-    True when a row was removed. A database error is raised, so the caller can retry."""
-    if not await _enabled():
+    Returns True when a row was removed, False when there was no such row (already gone)
+    or history is off by configuration (nothing is saved, so nothing to remove). Raises
+    when the history database is configured but unavailable, or a query fails: the
+    caller must retry, because the row may still be there."""
+    if not USE_LAKEBASE:
         return False
     from server.lakebase_client import get_pool
     pool = await get_pool()
     if pool is None:
-        return False
+        raise RuntimeError("the history database is unavailable")
     async with pool.acquire() as conn:
         result = await conn.execute(
             f"DELETE FROM {_table()} WHERE id = $1 AND created_by = $2", snapshot_id, created_by
