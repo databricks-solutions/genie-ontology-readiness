@@ -237,8 +237,11 @@ export default function Scorecard({
   // has drill-down rows (in canonical pillar order).
   async function handleExportAll() {
     setZipBusy(true);
+    setError(null);
     try {
       await downloadAllZip(config.pillars.map((cp) => pillarsByKey[cp.key]).filter(Boolean));
+    } catch (e) {
+      setError((e as Error).message);
     } finally {
       setZipBusy(false);
     }
