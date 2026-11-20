@@ -13,7 +13,9 @@ number of the next event it needs, and the stream replays from there.
 
 The registry is in process memory. The app runs one uvicorn process, so every
 request reaches the same registry. A restart drops in-flight runs; the events
-endpoint then returns 404 and the UI says to start a new run.
+endpoint then returns 404 and the UI says the run was lost. A run keeps going
+when the browser goes away: it is saved when it completes, and the browser can
+reattach through ``GET /assess/runs/active``.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from server import snapshots
 from server.scope import scope_hash
 from server.assessment.scoring import run_assessment_stream
 from server.config import MAX_RUN_SECONDS as CONFIG_MAX_RUN_SECONDS, set_user_token
+from server.sql_client import submit_without_wait
 from server.security import safe_error
 from server.workspace_filter import set_catalog_scope, set_schema_scope, set_workspace_filter
 
@@ -45,9 +48,12 @@ FINISHED_TTL_SECONDS = 15 * 60
 # A run still working after this long is cancelled (GOR_MAX_RUN_SECONDS,
 # default 3 h; parsed in server/config.py with the other deploy settings).
 MAX_RUN_SECONDS = CONFIG_MAX_RUN_SECONDS
-# A working run with no reader for this long is abandoned (tab closed, network
-# gone) and is cancelled. Longer than the client's full reconnect backoff.
+# A run that nothing is reading, and that cannot keep going on its own (history
+# off, or a legacy one-request stream), is cancelled after this long.
 ABANDON_SECONDS = 90.0
+# The snapshot write has this long before the run gives up on saving it (it is then
+# reported as not saved, and the run ends).
+SAVE_TIMEOUT_SECONDS = 60.0
 # How often the sweeper enforces the limits above.
 SWEEP_INTERVAL_SECONDS = 15.0
 
@@ -62,10 +68,16 @@ class AssessmentRun:
     task: Optional[asyncio.Task] = None
     # Normalized request scope (server.scope), saved with the snapshot (#89).
     scope: Optional[dict] = None
-    # UI runs replace each other (one at a time per user). Legacy one-request
-    # streams are not exclusive: they never replace, and are never replaced.
+    # A user has one UI run at a time: a second one is refused until this one
+    # ends. Legacy one-request streams are not exclusive.
     exclusive: bool = True
-    # Readers attached now, and when one was last attached (abandonment check).
+    # Why the run was cancelled (None if it was not): USER_STOP, or a limit.
+    cancel_why: Optional[str] = None
+    # A run may continue with no browser attached only when its result is saved
+    # (history on) and it is a UI run. Otherwise nobody can get the result back,
+    # so it is cancelled once nothing has read it for ABANDON_SECONDS.
+    keep_going: bool = True
+    # Browsers reading the events now, and when one last read them.
     readers: int = 0
     last_read: float = field(default_factory=time.monotonic)
     _changed: asyncio.Event = field(default_factory=asyncio.Event)
@@ -108,25 +120,47 @@ class AssessmentRun:
 _runs: dict[str, AssessmentRun] = {}
 _sweeper: Optional[asyncio.Task] = None
 
+# Cancel reason for a run the user (or a script, for the legacy stream) stopped.
+USER_STOP = "stopped by the user"
+
+
+class ActiveRunExists(Exception):
+    """The user already has an exclusive run working; ``run_id`` is that run."""
+
+    def __init__(self, run_id: str):
+        super().__init__(run_id)
+        self.run_id = run_id
+
 
 def _cancel(run: AssessmentRun, why: str) -> None:
     if run.task and not run.task.done():
         logger.info("cancelling assessment run %s: %s", run.id, why)
+        run.cancel_why = why
         run.task.cancel()
 
 
+def _cancelled_event(run: AssessmentRun) -> dict:
+    """The end of a cancelled run. A user stop is a plain "stopped" (the UI shows
+    no error); a stop by a limit is a failure that says which limit."""
+    if run.cancel_why is None or run.cancel_why == USER_STOP:
+        return _error_event(run, "The assessment was stopped.", reason="cancelled")
+    return _error_event(run, f"The assessment was stopped: {run.cancel_why}.", reason="failed")
+
+
 def _sweep(now: Optional[float] = None) -> None:
-    """Forget finished runs past their TTL; cancel runs past the hard cap or
-    with no reader for ABANDON_SECONDS."""
+    """Forget finished runs past their TTL, cancel runs past the hard cap, and
+    cancel a run that cannot keep going (see ``keep_going``) once nothing has
+    read it for ABANDON_SECONDS."""
     now = time.monotonic() if now is None else now
     for run_id, run in list(_runs.items()):
         if run.done:
             if now - (run.finished_at or now) > FINISHED_TTL_SECONDS:
                 _runs.pop(run_id, None)
         elif now - run.started_at > MAX_RUN_SECONDS:
-            _cancel(run, "past the run time cap")
-        elif run.readers == 0 and now - run.last_read > ABANDON_SECONDS:
-            _cancel(run, "no reader attached")
+            _cancel(run, "it ran past the run time limit")
+        elif (not run.keep_going and run.readers == 0
+              and now - run.last_read > ABANDON_SECONDS):
+            _cancel(run, "nothing was following it, and its result cannot be saved")
 
 
 async def _sweep_forever() -> None:
@@ -153,11 +187,24 @@ def get_run(run_id: str, principal: str) -> Optional[AssessmentRun]:
     return run
 
 
+def active_run(principal: str) -> Optional[AssessmentRun]:
+    """The principal's exclusive run that is still working, if any. A run that
+    has been stopped no longer counts, at once: its task may take a moment to
+    wind down, but a new run must not be refused because of it."""
+    for run in _runs.values():
+        if (run.principal == principal and run.exclusive and not run.done
+                and run.cancel_why is None):
+            return run
+    return None
+
+
 def cancel_run(run_id: str, principal: str) -> bool:
+    """Stop a run that is still working, at once (also while its result is being
+    saved). False when there is nothing to stop: unknown, or already finished."""
     run = get_run(run_id, principal)
-    if run is None:
+    if run is None or run.done:
         return False
-    _cancel(run, "cancelled by the user")
+    _cancel(run, USER_STOP)
     return True
 
 
@@ -166,9 +213,10 @@ def _on_task_done(run: AssessmentRun, task: asyncio.Task) -> None:
     # try/finally never ran), so a run can never stay "working" forever.
     if not run.done:
         if not run.has_error():
-            reason = "cancelled" if task.cancelled() else "failed"
-            run.append(_error_event(run, "The assessment was cancelled." if task.cancelled()
-                                    else "The assessment stopped unexpectedly.", reason=reason))
+            if task.cancelled():
+                run.append(_cancelled_event(run))
+            else:
+                run.append(_error_event(run, "The assessment stopped unexpectedly.", reason="failed"))
         run.finish()
     # Drop the task (and the context that holds the user's token).
     run.task = None
@@ -180,23 +228,25 @@ def start_run(
     workspace_filter: Optional[dict],
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
-    replace_existing: bool = True,
+    exclusive: bool = True,
     scope: Optional[dict] = None,
+    keep_going: bool = True,
 ) -> AssessmentRun:
     """Start an assessment in the background and return its handle.
 
-    With ``replace_existing`` (the UI), a user's earlier UI run that is still
-    working is cancelled first: the UI shows one run at a time, and leftover
-    runs would compete for the warehouse. A legacy stream run is never
-    cancelled this way (it stops when its own client disconnects)."""
+    With ``exclusive`` (the UI), the user may have one such run at a time: if one
+    is still working, ``ActiveRunExists`` is raised and the caller offers to open
+    or stop it. A legacy stream run is not exclusive and never blocks or is
+    blocked by one."""
     _ensure_sweeper()
     _sweep()
-    if replace_existing:
-        for other in list(_runs.values()):
-            if other.principal == principal and other.exclusive and not other.done:
-                _cancel(other, "replaced by a new run")
+    if exclusive:
+        active = active_run(principal)
+        if active is not None:
+            raise ActiveRunExists(active.id)
 
-    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=replace_existing, scope=scope)
+    run = AssessmentRun(id=uuid.uuid4().hex, principal=principal, exclusive=exclusive, scope=scope,
+                        keep_going=keep_going)
     _runs[run.id] = run
     run.task = asyncio.create_task(
         _drive(run, user_token, workspace_filter, catalogs, schemas),
@@ -213,6 +263,9 @@ async def _drive(
     catalogs: Optional[list[str]],
     schemas: Optional[list[str]],
 ) -> None:
+    # Statements of this run are submitted without a server-side wait, so each one's id
+    # is known at once and a Stop can cancel it (see sql_client.execute_sql).
+    submit_without_wait()
     # create_task copied the caller's context, so these settings stay local to
     # this run and reach the probe tasks it creates.
     set_user_token(user_token)
@@ -222,10 +275,10 @@ async def _drive(
     try:
         async for event in run_assessment_stream():
             if event.get("type") == "complete":
-                await _save_snapshot(event, run.principal, run.scope)
+                await _save_snapshot_to_end(event, run)
             run.append(event)
     except asyncio.CancelledError:
-        run.append(_error_event(run, "The assessment was cancelled.", reason="cancelled"))
+        run.append(_cancelled_event(run))
         raise
     except Exception as e:
         # The message is generic on purpose: warehouse errors quote statements
@@ -237,8 +290,72 @@ async def _drive(
         run.finish()
 
 
-async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None) -> None:
-    scorecard = {"overall": event["overall"], "pillars": event["pillars"], "top_gaps": event["top_gaps"]}
+async def _save_bounded(event: dict, run: AssessmentRun) -> None:
+    """The snapshot write, for at most SAVE_TIMEOUT_SECONDS."""
+    try:
+        await asyncio.wait_for(_save_snapshot(event, run.principal, run.scope, run.id), SAVE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("snapshot save for run %s took longer than %ss; giving up on it", run.id, SAVE_TIMEOUT_SECONDS)
+        event.setdefault("scope", run.scope)
+        event.setdefault("scope_hash", scope_hash(run.scope))
+        event["snapshot_saved"] = False
+
+
+async def _save_snapshot_to_end(event: dict, run: AssessmentRun) -> None:
+    """Save a completed run. A stop (or a limit) ends the run at once. If the write
+    is still in flight then, it finishes in the background and its row is removed
+    (see _remove_if_stopped): a stopped run is never in history."""
+    save = asyncio.ensure_future(_save_bounded(event, run))
+    try:
+        await asyncio.shield(save)
+    except asyncio.CancelledError:
+        save.add_done_callback(lambda _t: _remove_if_stopped(event, run))
+        raise
+
+
+# A stopped run's row is removed. A failed removal is retried, then logged as an error.
+REMOVE_ATTEMPTS = 3
+REMOVE_RETRY_SECONDS = 2.0
+REMOVE_TIMEOUT_SECONDS = 30.0
+# Strong references to the removals in flight (a task nobody holds can be dropped).
+_removals: set[asyncio.Task] = set()
+
+
+async def _remove_snapshot(snapshot_id: int, principal: str) -> None:
+    """Remove a stopped run's row. delete_snapshot raises whenever the removal is not
+    confirmed (database unavailable or failing), so every exception is retried; a
+    return, True or False, means the row is removed or was already gone."""
+    delay = REMOVE_RETRY_SECONDS
+    for attempt in range(1, REMOVE_ATTEMPTS + 1):
+        try:
+            await asyncio.wait_for(snapshots.delete_snapshot(snapshot_id, principal), REMOVE_TIMEOUT_SECONDS)
+            return
+        except Exception as e:
+            if attempt == REMOVE_ATTEMPTS:
+                logger.error(
+                    "could not remove snapshot %s of a stopped run after %d attempts (%s): it is still in history",
+                    snapshot_id, attempt, e,
+                )
+                return
+            logger.warning("removing snapshot %s failed (attempt %d): %s; retrying", snapshot_id, attempt, e)
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+def _remove_if_stopped(event: dict, run: AssessmentRun) -> None:
+    sid = event.get("snapshot_id")
+    if sid is not None and run.cancel_why is not None:
+        logger.info("run %s was stopped while saving; removing snapshot %s", run.id, sid)
+        task = asyncio.ensure_future(_remove_snapshot(sid, run.principal))
+        _removals.add(task)
+        task.add_done_callback(_removals.discard)
+
+
+async def _save_snapshot(event: dict, principal: str, scope: Optional[dict] = None,
+                         run_id: Optional[str] = None) -> None:
+    # run_id names the run in its saved result, so a page can find its own result exactly.
+    scorecard = {"overall": event["overall"], "pillars": event["pillars"], "top_gaps": event["top_gaps"],
+                 "run_id": run_id}
     event["scope"] = scope
     event["scope_hash"] = scope_hash(scope)
     try:
@@ -326,4 +443,4 @@ async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
             yield chunk
     finally:
         if not run.done:
-            _cancel(run, "legacy stream client disconnected")
+            _cancel(run, USER_STOP)

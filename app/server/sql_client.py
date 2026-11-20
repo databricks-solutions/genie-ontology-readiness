@@ -55,6 +55,14 @@ def record_rest_identity() -> None:
 # capture: the scorer calls start_query_capture() at the head of each probe task,
 # execute_sql appends each statement, and captured_queries() returns them.
 _query_recorder: contextvars.ContextVar = contextvars.ContextVar("query_recorder", default=None)
+# Set for an assessment run: its statements are submitted with no server-side wait, so the
+# statement id is known at once and a Stop can cancel the statement (see execute_sql).
+_submit_without_wait: contextvars.ContextVar = contextvars.ContextVar("submit_without_wait", default=False)
+
+
+def submit_without_wait() -> None:
+    """Make the statements of this task (and the tasks it starts) submit without waiting."""
+    _submit_without_wait.set(True)
 
 
 def start_query_capture() -> None:
@@ -136,6 +144,8 @@ def resolved_identity() -> Optional[dict]:
 # (~160-180 s in practice); 180 s keeps that, so slow probes such as the Genie audit
 # scan on a large account don't start timing out.
 DEFAULT_POLL_SECONDS = 180
+# The server-side wait on submit, when a caller does not choose one.
+DEFAULT_SUBMIT_WAIT_SECONDS = 50
 
 
 class StatementTimeout(Exception):
@@ -153,7 +163,7 @@ _TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 
 async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, force_sp: bool = False,
                       record: bool = True, poll_seconds: int = DEFAULT_POLL_SECONDS,
-                      wait_seconds: int = 50) -> list[dict]:
+                      wait_seconds: Optional[int] = None) -> list[dict]:
     """Execute a SQL query against the Databricks SQL Warehouse.
 
     Identity model — every signal defaults to on-behalf-of-user (OBO):
@@ -179,6 +189,15 @@ async def execute_sql(query: str, parameters: Optional[dict[str, Any]] = None, f
     # a single representative query instead of one row per near-identical batch.
     if record:
         record_query(query, parameters)
+    if wait_seconds is None:
+        if _submit_without_wait.get():
+            # An assessment run submits with no wait (its statement id is known, so Stop can
+            # cancel it). The server wait it skips is added to the poll budget, so the
+            # statement keeps the total time a default submit gives it.
+            wait_seconds = 0
+            poll_seconds = poll_seconds + DEFAULT_SUBMIT_WAIT_SECONDS
+        else:
+            wait_seconds = DEFAULT_SUBMIT_WAIT_SECONDS
 
     # Override: SP only, no OBO attempt, no fallback. Either the per-call override
     # (force_sp) or the deploy-time FORCE_SP knob (SP-only mode for the whole app).
@@ -243,7 +262,8 @@ def _is_authz_error(exc: Exception) -> bool:
 
 
 async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_sp: bool,
-                        poll_seconds: int = DEFAULT_POLL_SECONDS, wait_seconds: int = 50) -> list[dict]:
+                        poll_seconds: int = DEFAULT_POLL_SECONDS,
+                        wait_seconds: int = DEFAULT_SUBMIT_WAIT_SECONDS) -> list[dict]:
     """Run the query once with a single resolved identity (OBO or SP).
 
     ``wait_seconds`` is the server-side wait on submit (0-50). 0 returns the
@@ -332,9 +352,12 @@ async def _poll_statement(session: aiohttp.ClientSession, host: str, auth_header
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(1.0, float(poll_seconds))
     finished = False
+    # Start quickly (a statement that is already done is read sooner), then settle at 1 s.
+    poll_delay = 0.1
     try:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(poll_delay)
+            poll_delay = min(poll_delay * 2, 1.0)
             # Bound each status read by the time left (the session allows 90 s per
             # read), so a query ends near its deadline; there is always one read at
             # or after the deadline, so a statement that just finished isn't lost.
