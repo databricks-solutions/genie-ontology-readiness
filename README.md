@@ -22,10 +22,20 @@ The assessment is **read-only** and degrades gracefully when a signal isn't avai
 
 The app has three tabs. Each walkthrough below is a short, sped-up screen capture.
 
+### About — what the tool does, then each capability
+
+Start here. An overview explains the tool at a high level (understand → assess → plan) and links
+into each section. Each capability is covered from a technical and a business angle, with best
+practices, downloadable guides, and the public Databricks accelerators that raise each pillar's score.
+
+![About tab walkthrough: browsing a capability's technical and business value, best practices, accelerators, and the downloadable AI-ready-semantics handbook.](assets/learn-cuj.gif)
+
 ### Assess — the 7-pillar readiness scorecard
 
 Run a read-only assessment that scores your workspace across seven pillars, rolls up to a
-0–100 readiness score and maturity stage, and expands each pillar to its signals and gaps.
+0–100 readiness score and maturity stage, and expands each pillar to its signals and gaps. The
+pillar-maturity radar labels every point with its score and sits beside the pillar list; the top
+gaps to close follow at the bottom.
 
 ![Assess tab walkthrough: running the readiness assessment, viewing the overall score and pillar-maturity radar, and expanding a pillar to see its signals and gaps.](assets/assess-cuj.gif)
 
@@ -35,13 +45,6 @@ Generate a prioritized, tactical action plan from a saved assessment — grounde
 scores and gaps and powered by your workspace's own Foundation Model API.
 
 ![Plan tab walkthrough: selecting an assessment and generating an AI action plan with prioritized recommendations, a suggested sequence, and example Genie use cases.](assets/plan-cuj.gif)
-
-### Learn — enablement and accelerators
-
-Explore each capability from a technical and a business angle, with best practices, downloadable
-guides, and the public Databricks accelerators that raise each pillar's score.
-
-![Learn tab walkthrough: browsing a capability's technical and business value, best practices, accelerators, and the downloadable AI-ready-semantics handbook.](assets/learn-cuj.gif)
 
 ## Quick start
 

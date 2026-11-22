@@ -46,6 +46,7 @@ import CatalogFilter from './CatalogFilter';
 import SchemaFilter from './SchemaFilter';
 import CompareModal from './CompareModal';
 import { buildLines } from './BuildWatermark';
+import { useElementHeight, useElementSize, useMediaQuery } from '../hooks/useElementSize';
 
 /** Error line plus optional expandable detail lines (with a copy button). */
 function ErrorNotice({ message, details, centered }: { message: string; details?: string[]; centered?: boolean }) {
@@ -166,6 +167,53 @@ function RadarTick(props: any) {
   );
 }
 
+// Custom radar dot: the point itself plus its score, nudged outward from the
+// chart centre so the number sits just outside the filled shape.
+export function RadarScoreDot(props: any) {
+  const { cx, cy, value, points, index } = props;
+  if (typeof cx !== 'number' || typeof cy !== 'number' || Number.isNaN(cx) || Number.isNaN(cy)) return null;
+  const centre = points?.[index] ?? points?.[0];
+  const ox = typeof centre?.cx === 'number' ? centre.cx : cx;
+  const oy = typeof centre?.cy === 'number' ? centre.cy : cy;
+  const dx = cx - ox;
+  const dy = cy - oy;
+  const len = Math.hypot(dx, dy);
+  // A score of 0 sits on the centre: put its label just above it.
+  const ux = len < 1 ? 0 : dx / len;
+  const uy = len < 1 ? -1 : dy / len;
+  const offset = 13;
+  const score = Math.round(Number(value) || 0);
+  return (
+    <g>
+      <circle cx={cx} cy={cy} r={3.5} fill="#FF3621" stroke="#fff" strokeWidth={1.5} />
+      <text
+        x={cx + ux * offset}
+        y={cy + uy * offset}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={11}
+        fontWeight={700}
+        fill={scoreColor(score)}
+        stroke="#fff"
+        strokeWidth={3}
+        paintOrder="stroke"
+        data-testid="radar-score-label"
+      >
+        {score}
+      </text>
+    </g>
+  );
+}
+
+// Radar height bounds (px). Between these, the chart follows the Pillars list height.
+const RADAR_MIN_HEIGHT = 340;
+const RADAR_MAX_HEIGHT = 760;
+// Card chrome around the chart (p-5 padding top+bottom = 40, title + mb-2 = 30)
+// so the radar card's bottom lines up with the Pillars list.
+const RADAR_CARD_CHROME = 70;
+// Vertical gap between the radar card and the trend card (space-y-6).
+const RADAR_STACK_GAP = 24;
+
 export default function Scorecard({
   config,
   scorecard,
@@ -224,6 +272,28 @@ export default function Scorecard({
   const [zipBusy, setZipBusy] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
+  // The radar sits beside the Pillars list on wide screens and follows its height.
+  // It tracks the COLLAPSED list height so opening a pillar's detail doesn't blow
+  // the chart up; the trend card (if shown) shares the left column, so it's
+  // subtracted to keep both column bottoms aligned.
+  const [pillarsRef, pillarsHeight] = useElementHeight<HTMLDivElement>();
+  const [trendRef, trendHeight] = useElementHeight<HTMLDivElement>();
+  const [radarBoxRef, radarBox] = useElementSize<HTMLDivElement>();
+  const [collapsedPillarsHeight, setCollapsedPillarsHeight] = useState(0);
+  useEffect(() => {
+    if (expanded === null && pillarsHeight > 0) setCollapsedPillarsHeight(pillarsHeight);
+  }, [expanded, pillarsHeight]);
+  const sideBySide = useMediaQuery('(min-width: 1024px)');
+  // Space the chart area gets so the card's bottom meets the Pillars list.
+  const alignedHeight = (collapsedPillarsHeight || pillarsHeight) - RADAR_CARD_CHROME - (trendHeight > 0 ? trendHeight + RADAR_STACK_GAP : 0);
+  const radarAreaHeight = sideBySide && pillarsHeight > 0
+    ? Math.min(RADAR_MAX_HEIGHT, Math.max(RADAR_MIN_HEIGHT, Math.round(alignedHeight)))
+    : RADAR_MIN_HEIGHT;
+  // The radar is round, so it never needs to be taller than it is wide; any
+  // spare height is padding (chart centred) rather than empty chart margin.
+  const radarHeight = radarBox.width > 0
+    ? Math.max(RADAR_MIN_HEIGHT, Math.min(radarAreaHeight, Math.round(radarBox.width * 0.9)))
+    : radarAreaHeight;
 
   function refreshHistory() {
     // No persistence without Lakebase — nothing to fetch or list.
@@ -775,27 +845,48 @@ export default function Scorecard({
         )}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
-        {/* Left column: pillar maturity, then readiness-over-time beneath it */}
-        <div className="space-y-6">
-          <div className="card p-5">
+      {/* Pillar maturity (left) beside the Pillars list (right). On narrow screens they stack. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+        {/* Left column: pillar maturity, then readiness-over-time beneath it. Sticky so
+            the chart stays in view while a tall pillar detail is open. */}
+        <div className="space-y-6 min-w-0 lg:sticky lg:top-6">
+          <div className="card p-5" data-testid="pillar-maturity">
             <h3 className="text-sm font-semibold text-ink-700 mb-2">Pillar maturity</h3>
-            <ResponsiveContainer width="100%" height={340}>
-              <RadarChart data={radarData} outerRadius="62%" margin={{ top: 24, right: 56, bottom: 24, left: 56 }}>
+            {/* The chart area follows the Pillars column height (clamped), so the card
+                grows and shrinks with the page and its bottom lines up with the pillar
+                list; the chart is centred in it and sized to the card width. */}
+            <div
+              ref={radarBoxRef}
+              className="flex items-center justify-center"
+              style={{ height: radarAreaHeight }}
+            >
+            <ResponsiveContainer width="100%" height={radarHeight}>
+              <RadarChart data={radarData} outerRadius="80%" margin={{ top: 28, right: 64, bottom: 28, left: 64 }}>
                 <PolarGrid stroke="#e5e7eb" />
                 <PolarAngleAxis dataKey="pillar" tick={<RadarTick />} />
                 {/* Place the 0–100 radius ladder in the gap BETWEEN the top two
                     spokes (~64° for 7 pillars) so it doesn't collide with the
                     top "Unity Catalog Foundation" label. */}
                 <PolarRadiusAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#97afb2' }} angle={64} />
-                <Radar name="Score" dataKey="score" stroke="#FF3621" fill="#FF3621" fillOpacity={0.25} strokeWidth={2} />
+                {/* Each point is labelled with its pillar score (e.g. Metadata Richness 47). */}
+                <Radar
+                  name="Score"
+                  dataKey="score"
+                  stroke="#FF3621"
+                  fill="#FF3621"
+                  fillOpacity={0.25}
+                  strokeWidth={2}
+                  dot={<RadarScoreDot />}
+                  isAnimationActive={false}
+                />
                 <Tooltip />
               </RadarChart>
             </ResponsiveContainer>
+            </div>
           </div>
 
           {config.lakebase_enabled && trendScopes.some((o) => o.runs > 1) && (
-            <div className="card p-5">
+            <div ref={trendRef} className="card p-5">
               <div className="flex items-center gap-2 mb-2">
                 <TrendingUp size={15} className="text-databricks-500" />
                 <h3 className="text-sm font-semibold text-ink-700">Readiness over time</h3>
@@ -835,112 +926,113 @@ export default function Scorecard({
           )}
         </div>
 
-        {/* Right column: top gaps, extended to match the left column's height */}
-        <div className="card p-5 flex flex-col">
-          <h3 className="text-sm font-semibold text-ink-700 mb-3">Top gaps to close</h3>
-          {running ? (
-            <p className="text-sm text-ink-400">Identifying gaps as pillars complete…</p>
-          ) : topGaps.length === 0 ? (
-            <p className="text-sm text-ink-400">No major gaps detected.</p>
-          ) : (
-            <ul className="space-y-2">
-              {topGaps.map((g, i) => (
-                <li key={i} className="flex items-start gap-2 text-sm">
-                  <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-500" />
-                  <span>
-                    <span className="font-medium text-ink-800">{g.pillar}:</span>{' '}
-                    <span className="text-ink-600">{g.gap}</span>
-                    {g.impact && (
-                      <span className="block text-xs text-ink-500 mt-0.5 leading-relaxed">
-                        <span className="font-medium text-ink-600">Impact for Genie Ontology: </span>
-                        {g.impact}
-                      </span>
+        {/* Right column: pillar cards — all pillars in canonical order; skeleton until
+            each arrives. Its height drives the radar height on the left. */}
+        <div ref={pillarsRef} className="space-y-3 min-w-0 self-start" data-testid="pillars-column">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
+            {phase === 'done' && Object.values(pillarsByKey).some((p) => (p.drill_down?.rows?.length ?? 0) > 0) && (
+              <button
+                onClick={handleExportAll}
+                disabled={zipBusy}
+                className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs disabled:opacity-60"
+                title="Download a ZIP with a summary sheet and one CSV per pillar"
+              >
+                {zipBusy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                Export all to CSV
+              </button>
+            )}
+          </div>
+          {config.pillars.map((cp) => {
+            const p = pillarsByKey[cp.key];
+            if (!p) {
+              const prog = progressByKey[cp.key];
+              return (
+                <div key={cp.key} className="card flex items-center gap-4 px-4 py-3 opacity-70">
+                  <Loader2 size={16} className="animate-spin text-ink-300 shrink-0 w-12" />
+                  <div className="flex-1 min-w-0">
+                    <span className="font-semibold text-ink-500">{cp.name}</span>
+                    <p className="text-xs text-ink-400 mt-0.5 truncate" title={prog || undefined}>{prog || 'Checking…'}</p>
+                  </div>
+                </div>
+              );
+            }
+            const open = expanded === p.key;
+            const s = levelStyle(p.level);
+            return (
+              <div key={p.key} className={`card overflow-hidden ${!p.available ? 'opacity-80' : ''}`}>
+                <button
+                  onClick={() => setExpanded(open ? null : p.key)}
+                  className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
+                >
+                  <div className="w-12 text-center shrink-0">
+                    {p.score_excluded ? (
+                      <div className="text-lg font-bold text-ink-400" title={NOT_SCORED_EXPLAINER}>
+                        —
+                      </div>
+                    ) : (
+                      <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
+                        {Math.round(p.score)}
+                      </div>
                     )}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-ink-900">{p.name}</span>
+                      {!p.score_excluded && <LevelBadge level={p.level} label={p.level_label} />}
+                      {p.score_excluded ? (
+                        <span className="text-[11px] text-ink-500 italic">not scored</span>
+                      ) : (
+                        !p.available && <span className="text-[11px] text-ink-400 italic">not available</span>
+                      )}
+                      {p.identity && <IdentityBadge identity={p.identity} />}
+                    </div>
+                    <p className="text-xs text-ink-500 mt-0.5 truncate">
+                      {p.score_excluded ? p.score_excluded_reason || NOT_SCORED_EXPLAINER : p.short}
+                    </p>
+                  </div>
+                  <div className="hidden sm:block w-24 shrink-0">
+                    {!p.score_excluded && (
+                      <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                        <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
+                      </div>
+                    )}
+                  </div>
+                  <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+                </button>
+                {open && <PillarDetail pillar={p} config={config} />}
+              </div>
+            );
+          })}
         </div>
       </div>
 
-      {/* Pillar cards — all pillars in canonical order; skeleton until each arrives */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold text-ink-700">Pillars</h3>
-          {phase === 'done' && Object.values(pillarsByKey).some((p) => (p.drill_down?.rows?.length ?? 0) > 0) && (
-            <button
-              onClick={handleExportAll}
-              disabled={zipBusy}
-              className="btn-secondary py-1.5 px-3 inline-flex items-center gap-1.5 text-xs disabled:opacity-60"
-              title="Download a ZIP with a summary sheet and one CSV per pillar"
-            >
-              {zipBusy ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
-              Export all to CSV
-            </button>
-          )}
-        </div>
-        {config.pillars.map((cp) => {
-          const p = pillarsByKey[cp.key];
-          if (!p) {
-            const prog = progressByKey[cp.key];
-            return (
-              <div key={cp.key} className="card flex items-center gap-4 px-4 py-3 opacity-70">
-                <Loader2 size={16} className="animate-spin text-ink-300 shrink-0 w-12" />
-                <div className="flex-1 min-w-0">
-                  <span className="font-semibold text-ink-500">{cp.name}</span>
-                  <p className="text-xs text-ink-400 mt-0.5 truncate" title={prog || undefined}>{prog || 'Checking…'}</p>
-                </div>
-              </div>
-            );
-          }
-          const open = expanded === p.key;
-          const s = levelStyle(p.level);
-          return (
-            <div key={p.key} className={`card overflow-hidden ${!p.available ? 'opacity-80' : ''}`}>
-              <button
-                onClick={() => setExpanded(open ? null : p.key)}
-                className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
-              >
-                <div className="w-12 text-center shrink-0">
-                  {p.score_excluded ? (
-                    <div className="text-lg font-bold text-ink-400" title={NOT_SCORED_EXPLAINER}>
-                      —
-                    </div>
-                  ) : (
-                    <div className="text-lg font-bold tabular-nums" style={{ color: scoreColor(p.score) }}>
-                      {Math.round(p.score)}
-                    </div>
+      {/* Top gaps to close — at the bottom, after the radar and pillar detail */}
+      <div className="card p-5 flex flex-col" data-testid="top-gaps">
+        <h3 className="text-sm font-semibold text-ink-700 mb-3">Top gaps to close</h3>
+        {running ? (
+          <p className="text-sm text-ink-400">Identifying gaps as pillars complete…</p>
+        ) : topGaps.length === 0 ? (
+          <p className="text-sm text-ink-400">No major gaps detected.</p>
+        ) : (
+          <ul className="space-y-2">
+            {topGaps.map((g, i) => (
+              <li key={i} className="flex items-start gap-2 text-sm">
+                <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-500" />
+                <span>
+                  <span className="font-medium text-ink-800">{g.pillar}:</span>{' '}
+                  <span className="text-ink-600">{g.gap}</span>
+                  {g.impact && (
+                    <span className="block text-xs text-ink-500 mt-0.5 leading-relaxed">
+                      <span className="font-medium text-ink-600">Impact for Genie Ontology: </span>
+                      {g.impact}
+                    </span>
                   )}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-semibold text-ink-900">{p.name}</span>
-                    {!p.score_excluded && <LevelBadge level={p.level} label={p.level_label} />}
-                    {p.score_excluded ? (
-                      <span className="text-[11px] text-ink-500 italic">not scored</span>
-                    ) : (
-                      !p.available && <span className="text-[11px] text-ink-400 italic">not available</span>
-                    )}
-                    {p.identity && <IdentityBadge identity={p.identity} />}
-                  </div>
-                  <p className="text-xs text-ink-500 mt-0.5 truncate">
-                    {p.score_excluded ? p.score_excluded_reason || NOT_SCORED_EXPLAINER : p.short}
-                  </p>
-                </div>
-                <div className="hidden sm:block w-24 shrink-0">
-                  {!p.score_excluded && (
-                    <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                      <div className="h-full rounded-full" style={{ width: `${p.score}%`, backgroundColor: s.hex }} />
-                    </div>
-                  )}
-                </div>
-                <ChevronDown size={18} className={`shrink-0 text-ink-400 transition-transform ${open ? 'rotate-180' : ''}`} />
-              </button>
-              {open && <PillarDetail pillar={p} config={config} />}
-            </div>
-          );
-        })}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {error && <ErrorNotice message={error} details={shownDetails} />}
@@ -952,7 +1044,7 @@ export default function Scorecard({
   // no cross-run navigation, so drop the sidebar and go single-column.
   if (!config.lakebase_enabled) {
     return (
-      <div className="min-w-0 max-w-4xl mx-auto">
+      <div className={`min-w-0 w-full ${phase === 'idle' ? 'max-w-4xl mx-auto' : ''}`}>
         {phase === 'idle' ? idleMain : resultsMain}
       </div>
     );

@@ -171,7 +171,7 @@ app/
     content/methodology.py   — build methodology (5 phases); grounds the Plan LLM
     routes/
       config.py  assess.py  content.py  plan.py  chat.py  genie.py  _shared.py
-  frontend/                  — React + Vite + Tailwind (4 tabs: Assess/Learn/Plan/Assistant)
+  frontend/                  — React + Vite + Tailwind (tabs: About/Assess/Plan)
 scripts/
   post_deploy.py             — render app/app.yaml, grant SP, publish
   setup_app_permissions.py   — UC read grants for the app SP

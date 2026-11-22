@@ -305,7 +305,7 @@ CAPABILITIES: dict[str, dict] = {
     },
 }
 
-# Display order for the Learn tab.
+# Display order for the About tab.
 CAPABILITY_ORDER = [
     "ontology", "unity_catalog", "metadata", "relationships",
     "metric_views", "genie_agents", "domains", "adoption",
@@ -342,7 +342,7 @@ def _with_cloud_sources(cap: dict) -> dict:
 
 
 def list_capabilities() -> list[dict]:
-    """All capabilities in display order (for the Learn tab)."""
+    """All capabilities in display order (for the About tab)."""
     return [_with_cloud_sources({"key": k, **CAPABILITIES[k]}) for k in CAPABILITY_ORDER if k in CAPABILITIES]
 
 

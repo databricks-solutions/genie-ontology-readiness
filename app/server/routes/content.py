@@ -1,4 +1,4 @@
-"""Content endpoints — capability explainers (Learn tab) and pillar accelerators."""
+"""Content endpoints — capability explainers (About tab) and pillar accelerators."""
 
 from pathlib import Path
 

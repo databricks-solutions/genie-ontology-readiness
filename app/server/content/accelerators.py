@@ -4,7 +4,7 @@ Where the content library (`library.py`) explains *what* a pillar is and *why* i
 matters, accelerators give the customer something *runnable* to close the gap: a
 notebook, SQL script, dashboard, DAB, or external repo. Each accelerator is tied
 to the capability (pillar) it improves and to the assessment signal(s) it lifts,
-so the Learn tab can surface it per-pillar and the Plan can recommend it by name.
+so the About tab can surface it per-pillar and the Plan can recommend it by name.
 
 This is a data registry (like `library.py`) — add accelerators here via PR. Keep
 `key` stable; it is the API/UI identity. Set `valid_as_of` and use

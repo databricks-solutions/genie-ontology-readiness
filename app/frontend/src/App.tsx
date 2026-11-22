@@ -17,17 +17,18 @@ import HelpButton from './components/HelpButton';
 import BuildWatermark from './components/BuildWatermark';
 import Spinner from './components/Spinner';
 
-type Tab = 'assess' | 'plan' | 'learn';
+type Tab = 'about' | 'assess' | 'plan';
 
+// About comes first: it introduces the tool and links into each section.
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
+  { id: 'about', label: 'About', icon: <BookOpen size={17} /> },
   { id: 'assess', label: 'Assess', icon: <Gauge size={17} /> },
   { id: 'plan', label: 'Plan', icon: <Map size={17} /> },
-  { id: 'learn', label: 'Learn', icon: <BookOpen size={17} /> },
 ];
 
 export default function App() {
   const { config, error, loading } = useConfig();
-  const [tab, setTab] = useState<Tab>('assess');
+  const [tab, setTab] = useState<Tab>('about');
   const [model, setModel] = useState<string>('');
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [scorecard, setScorecard] = useState<ScorecardType | null>(null);
@@ -61,12 +62,16 @@ export default function App() {
 
   const activeModel = model || config.default_model;
   const activeModelLabel = config.ai_models.find((m) => m.id === activeModel)?.label || activeModel;
+  // Assess uses a wide, fluid layout (radar + pillars side by side); the other
+  // tabs keep the narrower reading width. The header always spans the wide width
+  // so the logo and tabs don't shift when switching tabs.
+  const widthClass = tab === 'assess' ? 'max-w-[1920px]' : 'max-w-7xl';
 
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
       <header className="bg-ink-900 text-white">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+        <div className="max-w-[1920px] mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center gap-3">
               <div className="w-9 h-9 rounded-lg bg-databricks-500 flex items-center justify-center shadow-sm">
@@ -114,7 +119,10 @@ export default function App() {
       </header>
 
       {/* Content */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+      <main className={`flex-1 ${widthClass} w-full mx-auto px-4 sm:px-6 lg:px-8 py-6`}>
+        {tab === 'about' && (
+          <CapabilityExplainer scorecard={scorecard} onNavigate={(t) => setTab(t)} />
+        )}
         {/* Keep Scorecard mounted (hidden when inactive) so an in-progress or
             completed run and expanded pillar persist across tab switches. */}
         <div className={tab === 'assess' ? '' : 'hidden'}>
@@ -125,7 +133,6 @@ export default function App() {
             <PlanWizard model={activeModel} active={tab === 'plan'} scorecard={scorecard} />
           </div>
         )}
-        {tab === 'learn' && <CapabilityExplainer scorecard={scorecard} />}
       </main>
 
       <HelpButton config={config} />
