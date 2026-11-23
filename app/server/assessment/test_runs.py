@@ -715,6 +715,54 @@ class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertEqual(sorted(cancelled), ["a", "b"])
 
+    async def test_a_stop_during_the_submit_cancels_the_statement_the_submit_returns(self):
+        from server import sql_client
+
+        submitted = asyncio.Event()
+
+        async def slow_submit(session, url, payload, headers, submit_kwargs):
+            submitted.set()
+            await asyncio.sleep(0.2)  # the reply (and its statement id) comes after the cancel
+            return {"statement_id": "stmt-S", "status": {"state": "PENDING"}}
+
+        cancel = AsyncMock()
+        with patch.object(sql_client, "_post_statement", slow_submit), \
+             patch.object(sql_client, "_cancel_statement", cancel), \
+             patch.object(sql_client, "get_workspace_host", lambda: "https://h"), \
+             patch.object(sql_client, "get_auth_headers", lambda **kw: {"Authorization": "t"}), \
+             patch.object(sql_client, "_poll_statement", AsyncMock(return_value={})):
+            task = asyncio.create_task(sql_client._execute_once("SELECT 1", None, True, wait_seconds=0))
+            await submitted.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):  # never swallowed
+                await task
+
+        cancel.assert_awaited_once()
+        self.assertEqual(cancel.await_args.args[1], "https://h/api/2.0/sql/statements/stmt-S")
+        self.assertEqual(cancel.await_args.args[3], "stmt-S")
+
+    async def test_a_submit_that_never_replies_does_not_hang_the_cancel(self):
+        from server import sql_client
+
+        submitted = asyncio.Event()
+
+        async def hung_submit(*args, **kwargs):
+            submitted.set()
+            await asyncio.Event().wait()
+
+        cancel = AsyncMock()
+        with patch.object(sql_client, "_post_statement", hung_submit), \
+             patch.object(sql_client, "_cancel_statement", cancel), \
+             patch.object(sql_client, "SUBMIT_CANCEL_WAIT_SECONDS", 0.05), \
+             patch.object(sql_client, "get_workspace_host", lambda: "https://h"), \
+             patch.object(sql_client, "get_auth_headers", lambda **kw: {"Authorization": "t"}):
+            task = asyncio.create_task(sql_client._execute_once("SELECT 1", None, True, wait_seconds=0))
+            await submitted.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)  # returns promptly, does not hang
+        cancel.assert_not_awaited()  # no id was ever named, so there is nothing to cancel
+
     async def test_a_cancelled_poll_cancels_its_warehouse_statement(self):
         from server.sql_client import _poll_statement
 
