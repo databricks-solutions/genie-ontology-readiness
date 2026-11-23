@@ -79,6 +79,13 @@ class RedactingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
+            if record.name == "uvicorn.access" and isinstance(record.args, tuple):
+                # uvicorn's AccessFormatter unpacks record.args (client, method, path,
+                # version, status) and never reads msg, so the args must keep their
+                # shape (#139). Each field is redacted on its own: a request line is
+                # one path, so a secret in it is still matched.
+                record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+                return True
             record.msg = redact(record.getMessage())
             record.args = ()
             if record.exc_info:
