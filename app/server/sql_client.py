@@ -323,7 +323,13 @@ async def _execute_once(query: str, parameters: Optional[dict[str, Any]], force_
         try:
             result = await asyncio.shield(submit)
         except asyncio.CancelledError:
-            await _cancel_submit_in_flight(session, host, auth_headers, submit)
+            if wait_seconds <= 0:
+                # A no-wait submit names its statement at once, so a cancel can cancel it.
+                await _cancel_submit_in_flight(session, host, auth_headers, submit)
+            else:
+                # A waiting submit only names its statement after its server wait, so there
+                # is nothing to cancel in time: stop it and let the cancel through at once.
+                submit.cancel()
             raise
 
         status = result.get("status", {}).get("state", "")

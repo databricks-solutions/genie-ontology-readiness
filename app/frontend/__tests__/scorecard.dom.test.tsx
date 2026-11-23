@@ -213,6 +213,66 @@ describe('Assess page: Stop', () => {
   });
 });
 
+describe('Assess page: stopping the run that blocked a start', () => {
+  async function blockedByBusy1() {
+    active = { run_id: null, viewer: VIEWER };
+    api.post.mockRejectedValue(new ApiError('An assessment is already running.', 409));
+    page();
+    await waitFor(() => expect(runButton().disabled).toBe(false));
+    active = { run_id: 'busy1', viewer: VIEWER, shared: false };
+    fireEvent.click(runButton());
+    await screen.findByRole('button', { name: /stop it/i });
+  }
+
+  it('Stop it: confirm, DELETE the blocking run, clear the banner, and say it was stopped', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await blockedByBusy1();
+
+    fireEvent.click(screen.getByRole('button', { name: /stop it/i }));
+    await waitFor(() => expect(api.del).toHaveBeenCalledWith('/assess/runs/busy1'));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText('The earlier assessment was stopped. Nothing was saved. You can run again now.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /stop it/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /open it/i })).toBeNull();
+  });
+
+  it('Stop it on a run that already finished (404): says so, and clears the banner', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    api.del.mockRejectedValue(new ApiError('This assessment is no longer running.', 404));
+    await blockedByBusy1();
+
+    fireEvent.click(screen.getByRole('button', { name: /stop it/i }));
+    expect(await screen.findByText('That assessment had already finished.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /stop it/i })).toBeNull();
+  });
+
+  it('Stop it, declined: nothing is sent and the banner stays', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false);
+    await blockedByBusy1();
+
+    fireEvent.click(screen.getByRole('button', { name: /stop it/i }));
+    expect(api.del).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /stop it/i })).toBeTruthy();
+  });
+});
+
+describe('Assess page: a failed stop', () => {
+  it('a DELETE that fails (not a 404) is shown, and the run stays on screen', async () => {
+    active = { run_id: 'live3', viewer: VIEWER };
+    api.stream.mockImplementation(() => gated([progress(0)], new Promise(() => undefined)));
+    api.del.mockRejectedValue(new ApiError('HTTP 500', 500));
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    page();
+    await screen.findByText(/Assessing your workspace/);
+
+    fireEvent.click(screen.getByRole('button', { name: /^stop$/i }));
+    expect(await screen.findByText(/Could not stop the assessment: HTTP 500\. It is still running/)).toBeTruthy();
+    // The run is still shown as running, with its Stop button, so the user can try again.
+    expect(screen.getByText(/Assessing your workspace/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^stop$/i })).toBeTruthy();
+  });
+});
+
 describe('Assess page: a remembered run that is gone', () => {
   const remember = () => localStorage.setItem(REMEMBER_KEY, JSON.stringify({ runId: 'old7', viewer: VIEWER }));
   const goneStream = () =>

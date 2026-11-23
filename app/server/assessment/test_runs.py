@@ -720,7 +720,10 @@ class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
 
         submitted = asyncio.Event()
 
+        sent = {}
+
         async def slow_submit(session, url, payload, headers, submit_kwargs):
+            sent["auth"] = headers.get("Authorization")
             submitted.set()
             await asyncio.sleep(0.2)  # the reply (and its statement id) comes after the cancel
             return {"statement_id": "stmt-S", "status": {"state": "PENDING"}}
@@ -739,16 +742,23 @@ class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
 
         cancel.assert_awaited_once()
         self.assertEqual(cancel.await_args.args[1], "https://h/api/2.0/sql/statements/stmt-S")
+        self.assertEqual(cancel.await_args.args[2], {"Authorization": "t"})  # the same identity as the submit
+        self.assertEqual(sent["auth"], "t")
         self.assertEqual(cancel.await_args.args[3], "stmt-S")
 
     async def test_a_submit_that_never_replies_does_not_hang_the_cancel(self):
         from server import sql_client
 
         submitted = asyncio.Event()
+        state = {"abandoned": False}
 
         async def hung_submit(*args, **kwargs):
             submitted.set()
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                state["abandoned"] = True  # the abandoned submit is cancelled, not left running
+                raise
 
         cancel = AsyncMock()
         with patch.object(sql_client, "_post_statement", hung_submit), \
@@ -761,7 +771,42 @@ class StopCancelsWorkTest(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 5)  # returns promptly, does not hang
+            for _ in range(3):
+                await asyncio.sleep(0)
         cancel.assert_not_awaited()  # no id was ever named, so there is nothing to cancel
+        self.assertTrue(state["abandoned"])
+
+    async def test_a_waiting_submit_is_not_held_up_by_a_cancel(self):
+        # A caller with a server wait (50 s) names its statement only after that wait, so a
+        # cancel must not pay the in-flight bound: it is re-raised at once, and the submit is stopped.
+        from server import sql_client
+
+        submitted = asyncio.Event()
+        state = {"stopped": False}
+
+        async def waiting_submit(*args, **kwargs):
+            submitted.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                state["stopped"] = True
+                raise
+
+        cancel = AsyncMock()
+        with patch.object(sql_client, "_post_statement", waiting_submit), \
+             patch.object(sql_client, "_cancel_statement", cancel), \
+             patch.object(sql_client, "SUBMIT_CANCEL_WAIT_SECONDS", 30.0), \
+             patch.object(sql_client, "get_workspace_host", lambda: "https://h"), \
+             patch.object(sql_client, "get_auth_headers", lambda **kw: {"Authorization": "t"}):
+            task = asyncio.create_task(sql_client._execute_once("SELECT 1", None, True, wait_seconds=50))
+            await submitted.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)  # well under the 30 s in-flight bound
+            for _ in range(3):
+                await asyncio.sleep(0)
+        cancel.assert_not_awaited()
+        self.assertTrue(state["stopped"])
 
     async def test_a_cancelled_poll_cancels_its_warehouse_statement(self):
         from server.sql_client import _poll_statement
