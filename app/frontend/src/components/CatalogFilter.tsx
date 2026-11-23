@@ -57,7 +57,9 @@ export default function CatalogFilter({
   const allSelected = catalogs.length > 0 && value.length === catalogs.length;
   const summary =
     catalogs.length === 0
-      ? 'No catalogs'
+      ? loading
+        ? 'Loading…'
+        : 'No catalogs'
       : value.length === 0 || allSelected
       ? `All ${catalogs.length} catalogs` // empty = no filter = assess all
       : `${value.length} of ${catalogs.length} catalogs`;

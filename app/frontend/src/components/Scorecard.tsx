@@ -254,7 +254,9 @@ export default function Scorecard({
   // when the workspace selection changes. Value = selected catalog names ([] = all).
   const [catalogs, setCatalogs] = useState<CatalogInfo[]>([]);
   const [catalogsAvailable, setCatalogsAvailable] = useState(true);
-  const [catalogsLoading, setCatalogsLoading] = useState(false);
+  // True from the first render: the catalog list is fetched on mount, so the picker must
+  // not read "No catalogs" before that first answer.
+  const [catalogsLoading, setCatalogsLoading] = useState(true);
   const [catFilter, setCatFilter] = useState<string[]>([]);
   const [schemas, setSchemas] = useState<SchemaInfo[]>([]);
   const [schemasAvailable, setSchemasAvailable] = useState(true);
@@ -415,7 +417,9 @@ export default function Scorecard({
   const scopedWorkspaceName = useMemo(() => {
     const id = wsFilter.workspace_ids[0];
     const w = workspaces.find((ws) => ws.is_current) || (id ? workspaces.find((ws) => ws.id === id) : undefined);
-    return w?.name || id || null;
+    // Never the bare id: until /workspaces answers (it can take a few seconds on a cold
+    // warehouse), the label reads "the deployed workspace".
+    return w?.name || null;
   }, [workspaces, wsFilter]);
 
   const scopedWorkspaceLabel = (
@@ -736,8 +740,9 @@ export default function Scorecard({
         <h2 className="text-xl font-bold text-ink-900">Assess your Genie Ontology readiness</h2>
         <p className="text-sm text-ink-600 mt-2 leading-relaxed">
           This reads your Unity Catalog metadata (catalogs, comments, constraints, metric views,
-          Genie Agents, tags) to score your readiness across seven pillars. It runs read-only as the
-          app's service principal and typically takes 30–60 seconds.
+          Genie Agents, tags) to score your readiness across seven pillars. It is read-only. It reads
+          with your own access when the app can act as you, and as the app's service principal
+          otherwise. A run usually takes a few minutes; fewer catalogs make it faster.
         </p>
       </div>
 
