@@ -155,8 +155,10 @@ app/
     config.py                — SP/local auth, host resolution, env config
     sql_client.py            — Statement Execution API
     genie_client.py          — Genie Conversation API (answer-quality test)
-    lakebase_client.py       — optional history pool (Autoscaling or Provisioned lakebase-db;
-                               a fresh credential per new connection)
+    lakebase_client.py       — optional history pool (Autoscaling or Provisioned lakebase-db);
+                               reuses a credential while valid, minted before the connect;
+                               lakebase_connection() retries only the connect (3 tries,
+                               15 s each), never a statement
     snapshots.py             — optional assessment history (Lakebase)
     pillars.py               — canonical 7 readiness pillars + maturity model
     signal_spec.py           — per-pillar signal SQL/thresholds/gap text shared with the skill

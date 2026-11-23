@@ -39,11 +39,11 @@ async def _enabled() -> bool:
 async def ensure_table() -> None:
     if not await _enabled():
         return
-    from server.lakebase_client import get_pool
+    from server.lakebase_client import get_pool, lakebase_connection
     pool = await get_pool()
     if pool is None:
         return
-    async with pool.acquire() as conn:
+    async with lakebase_connection(pool) as conn:
         await conn.execute(
             f"""CREATE TABLE IF NOT EXISTS {_table()} (
                     id BIGSERIAL PRIMARY KEY,
@@ -107,7 +107,7 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
     if not await _enabled():
         return None
     try:
-        from server.lakebase_client import get_pool
+        from server.lakebase_client import get_pool, lakebase_connection
         pool = await get_pool()
         if pool is None:
             return None
@@ -119,7 +119,7 @@ async def save_snapshot(scorecard: dict, created_by: str | None = None,
             cols += ", scope, scope_hash"
             values += [json.dumps(scope) if scope is not None else None, scope_hash(scope)]
         params = ", ".join(f"${i}" for i in range(1, len(values) + 1))
-        async with pool.acquire() as conn:
+        async with lakebase_connection(pool) as conn:
             row = await conn.fetchrow(
                 f"INSERT INTO {_table()} ({cols}) VALUES ({params}) RETURNING id", *values
             )
@@ -137,11 +137,11 @@ async def list_snapshots(created_by: str | None = None, limit: int = 50) -> list
     if not await _enabled():
         return []
     try:
-        from server.lakebase_client import get_pool
+        from server.lakebase_client import get_pool, lakebase_connection
         pool = await get_pool()
         if pool is None:
             return []
-        async with pool.acquire() as conn:
+        async with lakebase_connection(pool) as conn:
             rows = await conn.fetch(
                 f"SELECT id, created_at, created_by, overall_score, overall_level{_scope_select()} "
                 f"FROM {_table()} WHERE lower(created_by) IS NOT DISTINCT FROM lower($1) "
@@ -170,11 +170,11 @@ async def get_snapshot(snapshot_id: int, created_by: str | None = None) -> dict 
     if not await _enabled():
         return None
     try:
-        from server.lakebase_client import get_pool
+        from server.lakebase_client import get_pool, lakebase_connection
         pool = await get_pool()
         if pool is None:
             return None
-        async with pool.acquire() as conn:
+        async with lakebase_connection(pool) as conn:
             row = await conn.fetchrow(
                 f"SELECT id, created_at, created_by, scorecard{_scope_select()} FROM {_table()} "
                 f"WHERE id = $1 AND lower(created_by) IS NOT DISTINCT FROM lower($2)",
