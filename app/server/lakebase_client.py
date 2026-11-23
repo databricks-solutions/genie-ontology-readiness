@@ -372,11 +372,13 @@ async def _connection_password() -> str:
 # Waits between attempts when a connection fails because the endpoint is still waking from
 # scale-to-zero: three attempts in all. A failure after that is raised as before.
 RETRY_DELAYS = (0.5, 1.0)
-# The longest a single new connection may take to connect (TCP, TLS, auth). A waking endpoint
-# refuses or times out quickly; this keeps three attempts well under 10 seconds. It bounds the
-# connect only: waiting for a free pooled connection is never bounded, so a busy pool is not a
-# connection failure.
-CONNECT_TIMEOUT = 2.5
+# The longest a single new connection may take to connect (TCP, TLS, auth). A wake from
+# scale-to-zero holds the first connect open until the compute is up, so this must be long
+# enough for a slow wake to finish inside one attempt; a shorter limit would fail a wake that
+# succeeds with no limit at all. The retries then only add tolerance for refused or dropped
+# connections. It bounds the connect only: waiting for a free pooled connection is never
+# bounded, so a busy pool is not a connection failure.
+CONNECT_TIMEOUT = 15.0
 
 
 def _is_transient(exc: BaseException) -> bool:
