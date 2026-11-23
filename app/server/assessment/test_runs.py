@@ -265,6 +265,8 @@ class LimitsTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertTrue(run.done)
         self.assertEqual(run.events[-1]["reason"], "cancelled")
+        # Logged as a disconnect, not as a user's Stop.
+        self.assertEqual(run.cancel_why, runs.CLIENT_GONE)
 
 
 class ContextHandOffTest(unittest.IsolatedAsyncioTestCase):

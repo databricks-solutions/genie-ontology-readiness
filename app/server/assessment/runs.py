@@ -71,7 +71,7 @@ class AssessmentRun:
     # A user has one UI run at a time: a second one is refused until this one
     # ends. Legacy one-request streams are not exclusive.
     exclusive: bool = True
-    # Why the run was cancelled (None if it was not): USER_STOP, or a limit.
+    # Why the run was cancelled (None if it was not): USER_STOP, CLIENT_GONE, or a limit.
     cancel_why: Optional[str] = None
     # A run may continue with no browser attached only when its result is saved
     # (history on) and it is a UI run. Otherwise nobody can get the result back,
@@ -122,6 +122,8 @@ _sweeper: Optional[asyncio.Task] = None
 
 # Cancel reason for a run the user (or a script, for the legacy stream) stopped.
 USER_STOP = "stopped by the user"
+# The legacy stream's client went away (closed, or cut by a proxy): not a user's Stop.
+CLIENT_GONE = "the client disconnected"
 
 
 class ActiveRunExists(Exception):
@@ -140,9 +142,10 @@ def _cancel(run: AssessmentRun, why: str) -> None:
 
 
 def _cancelled_event(run: AssessmentRun) -> dict:
-    """The end of a cancelled run. A user stop is a plain "stopped" (the UI shows
-    no error); a stop by a limit is a failure that says which limit."""
-    if run.cancel_why is None or run.cancel_why == USER_STOP:
+    """The end of a cancelled run. A user stop (or a legacy client going away) is a
+    plain "stopped" (the UI shows no error); a stop by a limit is a failure that says
+    which limit."""
+    if run.cancel_why in (None, USER_STOP, CLIENT_GONE):
         return _error_event(run, "The assessment was stopped.", reason="cancelled")
     return _error_event(run, f"The assessment was stopped: {run.cancel_why}.", reason="failed")
 
@@ -443,4 +446,4 @@ async def stream_whole_run(run: AssessmentRun) -> AsyncIterator[str]:
             yield chunk
     finally:
         if not run.done:
-            _cancel(run, USER_STOP)
+            _cancel(run, CLIENT_GONE)

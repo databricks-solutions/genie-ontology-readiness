@@ -364,3 +364,39 @@ describe('Assess page: history off', () => {
     expect(note.textContent).toMatch(/keep this tab open until the assessment finishes/);
   });
 });
+
+describe('Assess page: before the catalog and workspace lists arrive', () => {
+  it('the catalog picker says Loading, not "No catalogs", and the scope never shows a bare id', async () => {
+    const catalogs = gateControl();
+    const workspaces = gateControl();
+    api.get.mockImplementation(async (path: string) => {
+      if (path.startsWith('/catalogs')) {
+        await catalogs.gate;
+        return { catalogs: [{ name: 'main' }], available: true };
+      }
+      if (path.startsWith('/workspaces')) {
+        await workspaces.gate;
+        return { workspaces: [{ id: '1', name: 'prod-ws', is_current: true }], current_workspace_id: '1' };
+      }
+      return routeGet(path);
+    });
+    page();
+
+    const picker = await screen.findByRole('button', { name: /catalogs:/i });
+    expect(picker.textContent).toMatch(/Loading/);
+    expect(picker.textContent).not.toMatch(/No catalogs/);
+    expect(screen.getByText(/Scoped to/).textContent).toMatch(/the deployed workspace/);
+    expect(screen.getByText(/Scoped to/).textContent).not.toMatch(/\b1\b/);
+
+    catalogs.release();
+    workspaces.release();
+    await waitFor(() => expect(picker.textContent).toMatch(/All 1 catalogs/));
+    await waitFor(() => expect(screen.getByText(/Scoped to/).textContent).toMatch(/prod-ws/));
+  });
+
+  it('an empty catalog list, once loaded, says "No catalogs"', async () => {
+    page();
+    const picker = await screen.findByRole('button', { name: /catalogs:/i });
+    await waitFor(() => expect(picker.textContent).toMatch(/No catalogs/));
+  });
+});
