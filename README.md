@@ -27,6 +27,11 @@ The app has three tabs. Each walkthrough below is a short, sped-up screen captur
 Run a read-only assessment that scores your workspace across seven pillars, rolls up to a
 0–100 readiness score and maturity stage, and expands each pillar to its signals and gaps.
 
+With Lakebase history on, a run keeps going if you close the tab or reload the page. Open the app
+again to see its progress, or the result when it finishes. Without history, keep the tab open:
+the run stops within about a minute of the tab closing. Use **Stop** to end a run. A stopped run is not saved.
+You can run one assessment at a time. If the app gets no signed-in user, all users share one slot per workspace: a second run is offered the one that is working, so anyone can open or stop it.
+
 ![Assess tab walkthrough: running the readiness assessment, viewing the overall score and pillar-maturity radar, and expanding a pillar to see its signals and gaps.](assets/assess-cuj.gif)
 
 ### Plan — a tailored action plan
@@ -371,9 +376,10 @@ defaults to **on-behalf-of-user (OBO)** with an automatic **SP fallback**:
   see. If a given read fails because you lack a grant the app SP holds (system
   tables are the common case), that read **falls back to the app SP** rather than
   dropping the signal.
-- **Scheduled / unattended** — snapshot history or any background run with no user
-  present (also local dev). With no forwarded token every read runs as the app
-  **service principal (SP)**, so the SP must hold the grants below.
+- **Unattended** — a run with no user token: the app got no signed-in user, or OBO
+  is off (also local dev). Every read then runs as the app **service principal (SP)**,
+  so the SP must hold the grants below. A run that you start and then leave (close the
+  tab) is not unattended: it keeps your identity until it finishes.
 
 A few reads are **always** the SP (they can't run OBO): the Genie REST API (not
 covered by the `sql` user scope) and Lakebase credential minting. The Domains REST API

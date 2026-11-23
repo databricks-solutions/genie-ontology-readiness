@@ -98,7 +98,8 @@ def env_seconds(name: str, default: float) -> float:
 
 # Hard cap on one background assessment run (see assessment/runs.py). Scan time
 # grows with the number of columns, so a very large metastore can take most of an
-# hour; the no-progress and no-reader stops end stuck or abandoned runs sooner.
+# hour. A run whose result cannot be saved (history off) and that nothing reads is
+# cancelled after 90 s instead (the no-reader stop).
 MAX_RUN_SECONDS = env_seconds("GOR_MAX_RUN_SECONDS", 3 * 60 * 60)
 
 # Lakebase toggle — only used to persist assessment snapshots over time.

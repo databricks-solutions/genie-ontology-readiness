@@ -165,9 +165,12 @@ app/
     assessment/
       probes.py              — read-only SQL/REST probes (graceful degradation)
       scoring.py             — combine technical + self-assessment → scorecard
-      runs.py                — background assessment runs + reconnectable SSE windows;
-                               run cap GOR_MAX_RUN_SECONDS (default 3 h)
-                               (outlives the Apps proxy's ~300s stream cut)
+      runs.py                — background assessment runs + reconnectable SSE windows
+                               (outlives the Apps proxy's ~300s stream cut); a run keeps
+                               the starter's identity after the tab closes; one run per
+                               user, one shared slot when there is no user; Stop cancels
+                               the run's statements and saves nothing; run cap
+                               GOR_MAX_RUN_SECONDS (default 3 h)
     content/library.py       — embedded technical+business enablement content
     content/accelerators.py  — runnable accelerators that lift a pillar's score
     content/methodology.py   — build methodology (5 phases); grounds the Plan LLM

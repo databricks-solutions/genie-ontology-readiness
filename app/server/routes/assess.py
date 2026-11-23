@@ -14,6 +14,7 @@ from server.assessment import runs
 from server.assessment.scoring import run_assessment
 from server.impact import OVERALL_FRAMING, pillar_impact
 from server.routes._shared import _cache_get, _cache_set, current_principal
+from server.security import UNATTRIBUTED_PRINCIPAL
 from server.config import ASSESS_CATALOGS, set_user_token
 from server.pdf import (
     build_pdf_document,
@@ -120,12 +121,37 @@ async def assess_run_start(
 
     Read its events with ``GET /assess/runs/{run_id}/events``. The run is not tied
     to one request, so it survives the Apps proxy's ~300s cut on streamed
-    responses. Every completed run is auto-saved to the user's history (when
-    Lakebase is enabled)."""
+    responses, and it keeps going when the browser goes away. Every completed run
+    is auto-saved to the user's history (when Lakebase is enabled).
+
+    One run per user at a time: while one is working this returns 409 with its
+    ``run_id``, so the page can open it (``GET /assess/runs/active``) or stop it."""
     wsf, cat_scope, sch_scope = _scope_from(req)
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
-                         scope=_run_scope(wsf, cat_scope, sch_scope))
+    # Without a forwarded identity every request is the shared bucket: one slot for the
+    # whole workspace (the users cannot be told apart, so the slot is shared by all).
+    try:
+        run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope,
+                             scope=_run_scope(wsf, cat_scope, sch_scope),
+                             keep_going=await snapshots.saves_history())
+    except runs.ActiveRunExists as e:
+        return JSONResponse(
+            {"error": "An assessment is already running. Open it, or stop it first.", "run_id": e.run_id},
+            status_code=409,
+        )
     return {"run_id": run.id}
+
+
+@router.get("/assess/runs/active")
+async def assess_run_active(principal: str = Depends(current_principal)):
+    """The current user's assessment run that is still working, so the page can
+    show its progress again after a reload. ``run_id`` is null when there is none."""
+    # ``viewer`` ties a remembered run id to this user; ``shared`` marks the one slot that
+    # all users share when no identity is forwarded (the page words its notice for that).
+    shared = principal == UNATTRIBUTED_PRINCIPAL
+    run = runs.active_run(principal)
+    if run is None:
+        return {"run_id": None, "viewer": principal, "shared": shared}
+    return {"run_id": run.id, "elapsed_s": round(run.elapsed(), 1), "viewer": principal, "shared": shared}
 
 
 @router.get("/assess/runs/{run_id}/events")
@@ -146,9 +172,10 @@ async def assess_run_events(run_id: str, after: int = 0, principal: str = Depend
 
 @router.delete("/assess/runs/{run_id}")
 async def assess_run_cancel(run_id: str, principal: str = Depends(current_principal)):
-    """Cancel a run that is still working (no-op if it already finished)."""
+    """Stop a run that is still working. 404 when there is nothing to stop (it
+    already finished, is saving its result, or is not this user's)."""
     if not runs.cancel_run(run_id, principal):
-        return JSONResponse({"error": "Assessment run not found."}, status_code=404)
+        return JSONResponse({"error": "This assessment is no longer running."}, status_code=404)
     return {"cancelled": True}
 
 
@@ -168,8 +195,8 @@ async def assess_stream(
     scopes the activity-based signals; omit / empty for all workspaces."""
     wsf, cat_scope, sch_scope = _scope_from(req)
     # Not exclusive: a script must not cancel the same user's run in the browser.
-    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, replace_existing=False,
-                         scope=_run_scope(wsf, cat_scope, sch_scope))
+    run = runs.start_run(principal, x_forwarded_access_token, wsf, cat_scope, sch_scope, exclusive=False,
+                         scope=_run_scope(wsf, cat_scope, sch_scope), keep_going=False)
     return StreamingResponse(runs.stream_whole_run(run), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
