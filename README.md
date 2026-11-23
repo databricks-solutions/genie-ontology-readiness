@@ -376,9 +376,10 @@ defaults to **on-behalf-of-user (OBO)** with an automatic **SP fallback**:
   see. If a given read fails because you lack a grant the app SP holds (system
   tables are the common case), that read **falls back to the app SP** rather than
   dropping the signal.
-- **Scheduled / unattended** — snapshot history or any background run with no user
-  present (also local dev). With no forwarded token every read runs as the app
-  **service principal (SP)**, so the SP must hold the grants below.
+- **Unattended** — a run with no user token: the app got no signed-in user, or OBO
+  is off (also local dev). Every read then runs as the app **service principal (SP)**,
+  so the SP must hold the grants below. A run that you start and then leave (close the
+  tab) is not unattended: it keeps your identity until it finishes.
 
 A few reads are **always** the SP (they can't run OBO): the Genie REST API (not
 covered by the `sql` user scope) and Lakebase credential minting. The Domains REST API
