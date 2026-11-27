@@ -416,6 +416,21 @@ also runs as the SP.
 > want consistent, workspace-wide system-table signals (e.g. Adoption) that don't
 > vary by who's viewing. The SP must hold the grants below. Default is `false`.
 
+> [!NOTE]
+> **Binding-aware catalog scoping.** When you narrow to specific workspaces, the app
+> automatically scopes the metadata pillars to the catalogs *bound* to those
+> workspaces (READ / READ_WRITE bindings, plus OPEN catalogs), and the catalog picker
+> shows an access badge per catalog. This uses the Unity Catalog catalog/bindings REST
+> APIs, which need **either** the app service principal to have **metastore read** on
+> catalogs and bindings (an account- or metastore-admin grant), **or** **user
+> authorization (OBO)** enabled so the app forwards the viewer's token to those APIs.
+> Without one of these — the common case for a plain, workspace-scoped app SP — the app
+> **falls back to a SQL-enumerated catalog list**: the picker still works as a manual
+> scope control, but there are **no access badges and no automatic workspace→catalog
+> scoping**, and the UI shows a note saying so. The fallback needs only catalog-level
+> `SELECT`, so the assessment itself is unaffected. See **[CLAUDE.md](./CLAUDE.md)** for
+> the resolution path (`app/server/bindings.py`).
+
 `scripts/setup_app_permissions.py` (run by `post_deploy.py`) applies the SP grants; see
 **[CLAUDE.md](./CLAUDE.md)** for the exact statements and the OBO details.
 

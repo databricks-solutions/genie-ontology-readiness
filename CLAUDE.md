@@ -134,6 +134,22 @@ catalog-level SELECT is needed). Pillars whose data the SP can't read degrade
 gracefully to "not available" plus a self-assessment fallback — they never crash
 the app.
 
+**Binding-aware catalog scoping.** When the run narrows to specific workspaces, the
+catalog-metadata pillars auto-scope to the catalogs *bound* to those workspaces —
+READ/READ_WRITE bindings plus OPEN catalogs — and the pre-run catalog filter shows an
+access badge (RW / R / open) per catalog. This resolution runs through the Unity Catalog
+catalog/bindings REST APIs (`GET /api/2.1/unity-catalog/catalogs` and
+`/bindings/catalog/{name}`, in `app/server/bindings.py`), which Databricks gates behind
+**either** the app SP holding **metastore read** on catalogs/bindings (an account- or
+metastore-admin grant) **or** **user authorization (OBO)** enabled so the viewer's token
+can read them. When neither is available — the common case for a plain, workspace-scoped
+app SP (e.g. the fins-canada FEVM deployment) — `app/server/routes/catalogs.py` falls back
+to a **SQL-enumerated** catalog list (`sql_enumerate_catalogs`, which needs only
+catalog-level `SELECT`) and returns `available: false`. The filter then works as a **manual
+scope control** with no access badges and no automatic workspace→catalog scoping, and the
+UI shows a note saying so. The assessment itself is unaffected. See the **Permissions
+required** section of the [README](./README.md).
+
 **Genie Agents (pillar 5):** Genie Agents have their own ACLs. The app needs
 `CAN_RUN` on an agent to **list and count** it. Reading an agent's **curation
 detail** (instructions, sample questions, example/verified SQL, functions,

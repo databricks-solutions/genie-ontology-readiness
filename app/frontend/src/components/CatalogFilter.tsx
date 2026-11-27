@@ -1,7 +1,31 @@
 import { useMemo, useRef, useState, useEffect } from 'react';
-import { Database, Search, Check, ChevronDown, Loader2 } from 'lucide-react';
+import { Database, Search, Check, ChevronDown, Loader2, AlertTriangle } from 'lucide-react';
 import type { CatalogInfo } from '../types';
 import { selectedFirst } from '../utils/pickerOrder';
+
+// Shown when the catalog list came from the SQL fallback (available === false):
+// the app couldn't read the UC catalog/bindings REST APIs, so there's no binding
+// info — no access badges and no automatic workspace->catalog scoping. The filter
+// still works as a plain manual scope control. Binding-aware scoping needs either
+// the app SP to hold metastore read on catalogs/bindings, or user authorization
+// (OBO) turned on. See README "Permissions required" / CLAUDE.md.
+export const CATALOG_FALLBACK_NOTE =
+  "Manual catalog scope: the app couldn't read workspace-to-catalog bindings, so there " +
+  'are no access badges and no automatic workspace scoping — pick the catalogs to assess ' +
+  "below. Binding-aware scoping needs the app's service principal to have metastore read " +
+  'on catalogs/bindings, or user authorization (OBO) turned on.';
+
+export function CatalogFallbackNote() {
+  return (
+    <p
+      data-testid="catalog-fallback"
+      className="flex items-start gap-1.5 rounded-sm border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800"
+    >
+      <AlertTriangle size={12} className="mt-0.5 shrink-0 text-amber-500" />
+      <span>{CATALOG_FALLBACK_NOTE}</span>
+    </p>
+  );
+}
 
 // Pre-run catalog filter: which catalogs the metadata pillars assess. Its options
 // are the catalogs accessible to the selected workspaces (UC bindings + OPEN),
@@ -91,12 +115,7 @@ export default function CatalogFilter({
 
       {open && (
         <div className="absolute z-20 mt-1 w-72 rounded-lg border border-gray-200 bg-white shadow-lg p-3 space-y-2">
-          {!available && (
-            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-sm px-2 py-1.5">
-              Couldn't resolve catalog bindings (needs privilege to read them). Showing all
-              catalogs the app can see.
-            </p>
-          )}
+          {!available && <CatalogFallbackNote />}
           <div className="flex items-center justify-between gap-2 text-[11px]">
             {/* Lever: select every catalog, or clear back to no filter (= all). */}
             <button
