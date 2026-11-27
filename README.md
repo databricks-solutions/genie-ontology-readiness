@@ -418,18 +418,37 @@ also runs as the SP.
 
 > [!NOTE]
 > **Binding-aware catalog scoping.** When you narrow to specific workspaces, the app
-> automatically scopes the metadata pillars to the catalogs *bound* to those
-> workspaces (READ / READ_WRITE bindings, plus OPEN catalogs), and the catalog picker
-> shows an access badge per catalog. This uses the Unity Catalog catalog/bindings REST
-> APIs, which need **either** the app service principal to have **metastore read** on
-> catalogs and bindings (an account- or metastore-admin grant), **or** **user
-> authorization (OBO)** enabled so the app forwards the viewer's token to those APIs.
-> Without one of these — the common case for a plain, workspace-scoped app SP — the app
-> **falls back to a SQL-enumerated catalog list**: the picker still works as a manual
-> scope control, but there are **no access badges and no automatic workspace→catalog
-> scoping**, and the UI shows a note saying so. The fallback needs only catalog-level
-> `SELECT`, so the assessment itself is unaffected. See **[CLAUDE.md](./CLAUDE.md)** for
-> the resolution path (`app/server/bindings.py`).
+> *tries* to scope the metadata pillars to the catalogs *bound* to those workspaces
+> (READ / READ_WRITE bindings, plus OPEN catalogs) and to show an access badge per
+> catalog. This resolution calls the Unity Catalog catalog/bindings REST APIs using
+> **whatever identity the app already has** — the forwarded viewer (OBO) token when one
+> is present, otherwise the app service principal — with **no SP fallback** for this
+> read (unlike the SQL signals above, there is no OBO→SP retry here). So it only works
+> when **that identity is itself authorized to read the UC catalog/bindings APIs**, and
+> neither path below is a guaranteed switch:
+>
+> - **Via OBO** — only if the app carries a user scope that authorizes UC
+>   catalog/bindings reads **and** the viewer holds metastore/catalog read. The app
+>   presently declares only the `sql` user scope (see `databricks.yml`), which does
+>   **not** authorize these UC REST calls, so a forwarded viewer token generally can't
+>   read them today.
+> - **Via the service principal** — grant the app SP metastore read on catalogs/bindings.
+>   This takes effect only when the **SP identity is actually used**: no viewer token is
+>   forwarded, or `FORCE_SP=true`. If an under-privileged viewer token *is* forwarded,
+>   the resolution still runs as that viewer and can fail even though the SP is granted.
+>
+> When the **top-level catalogs list** can't be read with the current identity, the app
+> **falls back to a SQL-enumerated catalog list** (`available: false`): the picker still
+> works as a manual scope control, with no access badges and no automatic
+> workspace→catalog scoping, and the UI shows a note saying so. That SQL fallback needs
+> only catalog-level `SELECT`, so the assessment itself is unaffected.
+>
+> **Known limitation:** the `available: false` SQL fallback and its notice cover only a
+> failure to read the **catalogs list**. If the catalogs list reads fine but an
+> individual catalog's **bindings** read fails, that failure is swallowed (treated as no
+> bindings), so the affected *isolated* catalog is **silently omitted** from the scoped
+> list while `available` stays `true` — there is no SQL fallback and no notice for that
+> case. See **[CLAUDE.md](./CLAUDE.md)** for the resolution path (`app/server/bindings.py`).
 
 `scripts/setup_app_permissions.py` (run by `post_deploy.py`) applies the SP grants; see
 **[CLAUDE.md](./CLAUDE.md)** for the exact statements and the OBO details.

@@ -135,20 +135,34 @@ gracefully to "not available" plus a self-assessment fallback — they never cra
 the app.
 
 **Binding-aware catalog scoping.** When the run narrows to specific workspaces, the
-catalog-metadata pillars auto-scope to the catalogs *bound* to those workspaces —
+catalog-metadata pillars *try* to auto-scope to the catalogs *bound* to those workspaces —
 READ/READ_WRITE bindings plus OPEN catalogs — and the pre-run catalog filter shows an
 access badge (RW / R / open) per catalog. This resolution runs through the Unity Catalog
 catalog/bindings REST APIs (`GET /api/2.1/unity-catalog/catalogs` and
-`/bindings/catalog/{name}`, in `app/server/bindings.py`), which Databricks gates behind
-**either** the app SP holding **metastore read** on catalogs/bindings (an account- or
-metastore-admin grant) **or** **user authorization (OBO)** enabled so the viewer's token
-can read them. When neither is available — the common case for a plain, workspace-scoped
-app SP (e.g. the fins-canada FEVM deployment) — `app/server/routes/catalogs.py` falls back
-to a **SQL-enumerated** catalog list (`sql_enumerate_catalogs`, which needs only
-catalog-level `SELECT`) and returns `available: false`. The filter then works as a **manual
-scope control** with no access badges and no automatic workspace→catalog scoping, and the
-UI shows a note saying so. The assessment itself is unaffected. See the **Permissions
-required** section of the [README](./README.md).
+`/bindings/catalog/{name}`, in `app/server/bindings.py`). `accessible_catalogs()` calls
+`get_auth_headers()` with **no `force_sp` and no SP retry**, so it uses whatever identity
+the app already has — the forwarded viewer (OBO) token when present, otherwise the app SP —
+and that identity must itself be **authorized for the UC catalog/bindings APIs**. Neither
+path is a guaranteed fix:
+
+- **OBO** authorizes these reads only if the app carries a user scope that covers UC
+  catalog/bindings **and** the viewer has metastore/catalog read. The app declares only
+  the `sql` scope (`databricks.yml`), which does *not* authorize these UC REST calls, so a
+  forwarded viewer token generally can't read them today.
+- **SP metastore read** on catalogs/bindings helps only when the SP identity is the one
+  used — no viewer token forwarded, or `FORCE_SP=true`. With an under-privileged viewer
+  token forwarded, resolution still runs as that viewer and can fail despite the SP grant.
+
+When the **top-level catalogs list** can't be read with the current identity,
+`app/server/routes/catalogs.py` falls back to a **SQL-enumerated** catalog list
+(`sql_enumerate_catalogs`, which needs only catalog-level `SELECT`) and returns
+`available: false`; the filter then works as a **manual scope control** (no badges, no auto
+scoping) and the UI shows a note. **Known limitation:** that `available: false` fallback and
+notice cover only a failure to read the catalogs list. A failed per-catalog *bindings* read
+is swallowed into an empty bindings list (`_bindings`), so the affected *isolated* catalog
+is silently omitted from the scoped list while `available` stays `true` — no SQL fallback,
+no notice. The assessment itself is unaffected. See the **Permissions required** section of
+the [README](./README.md).
 
 **Genie Agents (pillar 5):** Genie Agents have their own ACLs. The app needs
 `CAN_RUN` on an agent to **list and count** it. Reading an agent's **curation
