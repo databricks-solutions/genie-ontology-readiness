@@ -217,11 +217,18 @@ UC_FOUNDATION = _index({
         },
         {
             "id": "tables",
-            "comment": "table footprint + managed share",
+            "comment": (
+                "table footprint + managed share. The denominator counts physical tables\n"
+                "only: exclude VIEW and METRIC_VIEW. This is an exclusion (NOT IN), not an\n"
+                "allowlist, so unknown/future physical table types still count. Streaming\n"
+                "tables and materialized views are UC-managed, so they count toward both\n"
+                "the total and the managed numerator (DLT/dlt-meta pipelines create many\n"
+                "of these alongside views — see issue #87)."
+            ),
             "sql": (
                 "SELECT COUNT(*) AS total,\n"
-                "       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed\n"
-                "FROM <TABLES> WHERE {schema_filter};"
+                "       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE','STREAMING_TABLE','MATERIALIZED_VIEW') THEN 1 ELSE 0 END) AS managed\n"
+                "FROM <TABLES> WHERE {schema_filter} AND table_type NOT IN ('VIEW','METRIC_VIEW');"
             ),
             "shared": True,
         },

@@ -31,10 +31,15 @@ SELECT COUNT(*) AS n_schemas
 FROM <SCHEMATA>
 WHERE schema_name <> 'information_schema';
 
--- table footprint + managed share
+-- table footprint + managed share. The denominator counts physical tables
+-- only: exclude VIEW and METRIC_VIEW. This is an exclusion (NOT IN), not an
+-- allowlist, so unknown/future physical table types still count. Streaming
+-- tables and materialized views are UC-managed, so they count toward both
+-- the total and the managed numerator (DLT/dlt-meta pipelines create many
+-- of these alongside views — see issue #87).
 SELECT COUNT(*) AS total,
-       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed
-FROM <TABLES> WHERE table_schema <> 'information_schema';
+       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE','STREAMING_TABLE','MATERIALIZED_VIEW') THEN 1 ELSE 0 END) AS managed
+FROM <TABLES> WHERE table_schema <> 'information_schema' AND table_type NOT IN ('VIEW','METRIC_VIEW');
 
 -- legacy (non-UC) footprint still in the workspace-local Hive metastore (best-effort;
 -- omit this signal if hive_metastore.information_schema isn't readable — e.g. it

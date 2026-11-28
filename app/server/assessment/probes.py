@@ -509,8 +509,14 @@ async def probe_uc_foundation() -> dict:
         sch = _src("schemata", s)
         n_schemas = await _scalar(render_sql(q["schemas"]["sql"], {"<SCHEMATA>": sch},
                                              schema_filter=_schema_sql(s, "schema_name")).rstrip(";"))
+        # Scope the headline total the same way as the per-schema drill-down: in
+        # system mode the metastore-wide view also returns internal catalogs
+        # (system / samples / __databricks_internal / __-prefixed), so exclude
+        # them here too, otherwise the headline total over-counts relative to the
+        # drill-down (#87). In per-catalog union mode the filter is a no-op.
         rows = await execute_sql(
-            render_sql(q["tables"]["sql"], {"<TABLES>": tbl}, schema_filter=_schema_sql(s)).rstrip(";")
+            render_sql(q["tables"]["sql"], {"<TABLES>": tbl},
+                       schema_filter=f"{_schema_sql(s)} {_internal_catalog_filter(s)}".rstrip()).rstrip(";")
         )
         total = int(rows[0].get("total") or 0)
         managed = int(rows[0].get("managed") or 0)
@@ -588,8 +594,8 @@ async def probe_uc_foundation() -> dict:
         try:
             crows = await execute_sql(
                 f"SELECT table_catalog AS catalog, table_schema AS schema, COUNT(*) AS tables, "
-                f"       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed "
-                f"FROM {tbl} WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}"
+                f"       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE','STREAMING_TABLE','MATERIALIZED_VIEW') THEN 1 ELSE 0 END) AS managed "
+                f"FROM {tbl} WHERE {_schema_sql(s)} AND table_type NOT IN ('VIEW','METRIC_VIEW') {_internal_catalog_filter(s)}"
                 f"GROUP BY table_catalog, table_schema ORDER BY tables DESC LIMIT 500"
             )
             drill_rows = [
