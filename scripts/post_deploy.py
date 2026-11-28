@@ -23,7 +23,7 @@ Usage (first install):
                                  # redirect grants to another environment; the
                                  # target is the sole source of truth.)
     # For TARGET=preview, also export PREVIEW_SLUG=159 (PR number or branch slug).
-    # Slugs are trimmed, must use only lowercase letters/digits/hyphens, and
+    # Slugs are trimmed, use lowercase letters/digits/hyphens, start/end with a letter or digit, and
     # must fit the 30-character app name limit (gor-pr- + at most 23 characters).
     export WAREHOUSE_ID=<warehouse_id>           # required on a first install
     # optional:
@@ -74,7 +74,7 @@ from server.user_agent import git_version  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deploy_settings  # noqa: E402
-from preview import validate_slug  # noqa: E402
+from preview import clear_local_preview_state, validate_slug  # noqa: E402
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
 # Bundle target (dev|stg|prod|preview). The app name is pinned per target in
@@ -200,6 +200,8 @@ def _workspace_id_default():
 
 
 def _cli_cmd(*args):
+    if TARGET == "preview" and args[:2] in (("bundle", "summary"), ("bundle", "deploy"), ("bundle", "destroy")):
+        clear_local_preview_state(APP_DIR.parent)
     cmd = ["databricks", *args]
     if PROFILE:
         cmd += ["--profile", PROFILE]

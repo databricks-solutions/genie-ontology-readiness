@@ -100,9 +100,11 @@ PYTHON=.venv/bin/python bash scripts/preview.sh destroy --profile <your-profile>
 
 Deploy builds the frontend, publishes the local checkout, and prints the app URL. `--pr` takes
 precedence over `--slug`; with neither, the script lowercases the current git branch and replaces
-invalid characters with hyphens. Slugs must contain only `[a-z0-9-]` and fit 23 characters; use
-`--pr` or a shorter `--slug` for a long branch. Destroy prompts for confirmation and needs no warehouse.
-Keep the same explicit slug when tearing down after switching branches.
+invalid characters with hyphens. Slugs must contain only `[a-z0-9-]`, start/end with a letter or digit, and fit 23 characters; use
+`--pr` or a shorter `--slug` for a long branch. Destroy needs no warehouse and prompts for confirmation by default.
+For unattended/agent teardown, pass `--yes` (alias `--auto-approve`) to skip the prompt.
+Keep the same explicit slug when tearing down after switching branches. The script clears the local
+preview bundle cache before summary/deploy/destroy so sequential slugs cannot reuse stale local state.
 
 `--profile` overrides `DATABRICKS_PROFILE`; if both are absent, normal CLI default auth applies,
 including `DATABRICKS_HOST` with credentials. No workspace or profile is built in. Optional

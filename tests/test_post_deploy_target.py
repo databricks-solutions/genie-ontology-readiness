@@ -8,6 +8,8 @@ APP_NAME env must never redirect the run. They also pin the exact
 drift that would make the "read the name back from the bundle" guarantee inert
 fails a test instead of silently always using the fallback.
 """
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,7 +69,7 @@ def test_resolve_ignores_explicit_app_name_env(monkeypatch):
     assert post_deploy.resolve_app_name() == "genie-ontology-readiness-dev"
 
 
-@pytest.mark.parametrize("slug", ["159", "feature-test", "legit-pr-", "a" * 23])
+@pytest.mark.parametrize("slug", ["159", "feature-test", "legit-pr", "a" * 23])
 def test_preview_resolves_from_bundle_summary(monkeypatch, slug):
     monkeypatch.setattr(post_deploy, "TARGET", "preview")
     monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
@@ -97,6 +99,7 @@ def test_preview_requires_bundle_summary(monkeypatch, summary):
     ("", "non-empty"), (" ", "non-empty"), ("\t\n", "non-empty"),
     ("Feature/X", "lowercase"), ("a_b", "lowercase"), ("ABC", "lowercase"),
     ("a" * 24, "at most 23 characters"),
+    ("-", "start/end"), ("a-", "start/end"), ("-a", "start/end"),
 ])
 def test_preview_rejects_invalid_slug(monkeypatch, slug, message):
     monkeypatch.setattr(post_deploy, "PREVIEW_SLUG", slug)
@@ -201,3 +204,45 @@ def test_render_preview_has_no_unbound_lakebase_reference(monkeypatch, tmp_path,
         assert entries["LAKEBASE_HOST"] == {"name": "LAKEBASE_HOST", "value": ""}
     else:
         assert entries["LAKEBASE_HOST"]["valueFrom"] == "lakebase-db"
+
+
+def test_preview_bundle_calls_discard_previous_slug_local_state(monkeypatch, tmp_path):
+    """The real CLI builders clear cache even when a new slug has no remote state."""
+    monkeypatch.setattr(post_deploy, "TARGET", "preview")
+    monkeypatch.setattr(post_deploy, "PROFILE", "")
+    monkeypatch.setattr(post_deploy, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
+    cache = tmp_path / ".databricks" / "bundle" / "preview"
+    other = cache.parent / "prod" / "terraform.tfstate"
+    other.parent.mkdir(parents=True)
+    other.write_text("prod state")
+
+    def run(cmd, **kwargs):
+        assert not cache.exists(), "Every bundle call must start without another slug's state"
+        assert other.read_text() == "prod state"
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(_bundle_summary(f"gor-pr-{post_deploy.PREVIEW_SLUG}")))
+
+    monkeypatch.setattr(post_deploy.subprocess, "run", run)
+    for slug in ("159", "160"):
+        monkeypatch.setattr(post_deploy, "PREVIEW_SLUG", slug)
+        for action in ("summary", "deploy", "destroy"):
+            # Simulate a previous slug's cached Terraform state with no matching remote state.
+            cache.mkdir(parents=True)
+            (cache / "terraform.tfstate").write_text("gor-pr-other-slug")
+            if action == "summary":
+                assert post_deploy.resolve_app_name() == f"gor-pr-{slug}"
+            else:
+                assert post_deploy.cli("bundle", action, "-t", "preview", *post_deploy._preview_var_args()) == 0
+
+
+@pytest.mark.parametrize("target", ["dev", "stg", "prod"])
+def test_non_preview_bundle_calls_preserve_local_cache(monkeypatch, tmp_path, target):
+    monkeypatch.setattr(post_deploy, "TARGET", target)
+    monkeypatch.setattr(post_deploy, "APP_DIR", tmp_path / "app")
+    cache = tmp_path / ".databricks" / "bundle" / "preview"
+    cache.mkdir(parents=True)
+    state = cache / "terraform.tfstate"
+    state.write_text("preview state")
+    for action in ("summary", "deploy", "destroy"):
+        post_deploy._cli_cmd("bundle", action, "-t", target)
+        assert state.read_text() == "preview state"
