@@ -72,10 +72,10 @@ PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
 # name — is what selects the environment.
 TARGET = os.environ.get("TARGET", "dev")
 # The bundle targets defined in databricks.yml. Kept here to validate TARGET and
-# to derive a deterministic fallback app name (prod -> bare, else -<target>) that
+# to derive a deterministic fallback app name (prod -> bare, dev/stg -> suffixed) that
 # matches the yaml, so a failed `bundle summary` never silently falls back to the
-# live prod app name for a dev/stg deploy.
-VALID_TARGETS = ("dev", "stg", "prod")
+# live prod app name for a dev/stg deploy. Preview requires bundle summary.
+VALID_TARGETS = ("dev", "stg", "prod", "preview")
 # Placeholder only — main() reassigns this via resolve_app_name(), which resolves
 # the name from the bundle target. An explicit APP_NAME env is IGNORED there (only
 # warned about), never honored, so it cannot redirect this run to another env.
@@ -530,7 +530,10 @@ def _fallback_app_name():
 
     Used only when `bundle summary` can't be read; it mirrors the yaml (prod ->
     bare, dev/stg -> suffixed) so a transient failure never resolves a dev/stg
-    deploy to the live prod app name."""
+    deploy to the live prod app name. Preview requires the summary because its
+    name depends on preview_slug, not just TARGET."""
+    if TARGET == "preview":
+        raise SystemExit("ERROR: preview app name must be resolved from bundle summary; check preview_slug.")
     return "genie-ontology-readiness" if TARGET == "prod" else f"genie-ontology-readiness-{TARGET}"
 
 

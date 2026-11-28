@@ -15,6 +15,9 @@ sync:
     # written only during a CLI publish and restored afterwards.
 
 variables:
+  preview_slug:
+    description: "Per-PR identifier (PR number or branch slug) for the isolated preview app and state"
+    default: ""
   warehouse_id:
     description: "SQL Warehouse ID used for assessment queries (databricks api get /api/2.0/sql/warehouses)"
     # Empty default so `databricks bundle validate` (the local quality gate's CHECK 2)
@@ -36,11 +39,12 @@ variables:
 resources:
   apps:
     ontology_readiness:
-      # App name is fixed PER TARGET (see the `targets:` block below), NOT a
+      # App name is fixed PER TARGET for dev/stg/prod (see below), NOT a
       # variable — so it cannot be overridden with `--var app_name=…`. That
       # override, combined with shared Terraform state, is what let a deploy
       # rename/destroy another environment's app. `bundle deploy -t <target>`
-      # can now only ever touch that target's own pinned app name.
+      # can now only ever touch that target's own pinned app name. Preview
+      # parameterizes both its app name and state path with preview_slug.
       #
       # This base value is a deliberate non-environment placeholder: every target
       # overrides it, so it is never deployed. If a future target forgets its
@@ -78,8 +82,9 @@ resources:
 targets:
   # Each environment is its OWN target, so it gets its OWN bundle/Terraform state
   # (…/.bundle/${bundle.name}/<target>) and pins its own app name via a resource
-  # override (not a variable — there is nothing to `--var`). A `bundle deploy` to
-  # one target therefore can NEVER rename or destroy another target's app — the
+  # override (literal for dev/stg/prod). Preview also isolates state by slug.
+  # A `bundle deploy` to one target therefore can NEVER rename or destroy
+  # another target's app — the
   # shared-state footgun that silently deletes apps.
   #
   # Routine redeploys should use `databricks apps deploy <name>` (code-only,
@@ -107,3 +112,12 @@ targets:
       apps:
         ontology_readiness:
           name: genie-ontology-readiness
+  # Per-PR previews are stateless: leave lakebase_instance_name unset. The same
+  # slug must select both the app and its isolated bundle/Terraform state.
+  preview:
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/preview-${var.preview_slug}
+    resources:
+      apps:
+        ontology_readiness:
+          name: genie-ontology-readiness-pr-${var.preview_slug}

@@ -9,6 +9,9 @@ drift that would make the "read the name back from the bundle" guarantee inert
 fails a test instead of silently always using the fallback.
 """
 import sys
+
+import pytest
+import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -20,7 +23,9 @@ def _bundle_summary(name):
 
 
 def test_valid_targets_matches_yaml():
-    assert post_deploy.VALID_TARGETS == ("dev", "stg", "prod")
+    config = yaml.safe_load((Path(__file__).resolve().parent.parent / "databricks.yml").read_text())
+    assert set(post_deploy.VALID_TARGETS) == set(config["targets"])
+    assert "preview" in post_deploy.VALID_TARGETS
 
 
 def test_fallback_prod_is_bare(monkeypatch):
@@ -60,3 +65,40 @@ def test_resolve_ignores_explicit_app_name_env(monkeypatch):
                         lambda *a: _bundle_summary("genie-ontology-readiness-dev"))
     monkeypatch.setenv("APP_NAME", "genie-ontology-readiness")  # stale prod name
     assert post_deploy.resolve_app_name() == "genie-ontology-readiness-dev"
+
+
+@pytest.mark.parametrize("slug", ["159", "feature-test"])
+def test_preview_resolves_from_bundle_summary(monkeypatch, slug):
+    monkeypatch.setattr(post_deploy, "TARGET", "preview")
+    monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
+    monkeypatch.setenv("APP_NAME", "genie-ontology-readiness")
+    name = f"genie-ontology-readiness-pr-{slug}"
+
+    def summary(*args):
+        assert args == ("bundle", "summary", "-t", "preview")
+        return _bundle_summary(name)
+
+    monkeypatch.setattr(post_deploy, "cli_json", summary)
+    assert post_deploy.resolve_app_name() == name
+
+
+@pytest.mark.parametrize("summary", [None, {}, _bundle_summary("")])
+def test_preview_requires_bundle_summary(monkeypatch, summary):
+    monkeypatch.setattr(post_deploy, "TARGET", "preview")
+    monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
+    monkeypatch.setattr(post_deploy, "cli_json", lambda *args: summary)
+    with pytest.raises(SystemExit, match="preview app name must be resolved from bundle summary"):
+        post_deploy.resolve_app_name()
+
+
+def test_preview_bundle_is_parameterized_and_stateless():
+    config = yaml.safe_load((Path(__file__).resolve().parent.parent / "databricks.yml").read_text())
+    assert config["variables"]["preview_slug"]["default"] == ""
+    assert config["variables"]["lakebase_instance_name"]["default"] == ""
+    preview = config["targets"]["preview"]
+    assert preview == {
+        "workspace": {"root_path": "~/.bundle/${bundle.name}/preview-${var.preview_slug}"},
+        "resources": {"apps": {"ontology_readiness": {
+            "name": "genie-ontology-readiness-pr-${var.preview_slug}",
+        }}},
+    }
