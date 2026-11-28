@@ -1183,9 +1183,29 @@ async def probe_metrics() -> dict:
         except Exception:
             commented = 0
 
-        # Score formula (see the spec's `score`): base + coverage ramp + quality.
+        # Gold-table coverage (#23): count gold tables in the SAME scope/filters as the
+        # metric-view count (apples-to-apples), reusing the Relationships gold heuristic.
+        # A read failure is treated as "no gold layer detected" (0 -> no penalty).
+        gold_tables = 0
+        try:
+            gold_tables = await _scalar(
+                render_sql(q["gold_tables"]["sql"], {"<TABLES>": tbl},
+                           schema_filter=_schema_sql(s)).rstrip(";")
+            ) or 0
+        except Exception as e:
+            logger.info(f"metrics gold-table count failed: {str(e)[:80]}")
+            gold_tables = 0
+
+        # Coverage multiplier: a thin semantic layer over a large gold layer shouldn't
+        # overstate maturity. cov scales only the quantity ramp. G==0 (no gold detected)
+        # and M>=G both yield cov=1.0 (no penalty); lower coverage strictly lowers the ramp.
+        has_gold = bool(gold_tables and gold_tables > 0)
+        coverage_ratio = (metric_views / float(gold_tables)) if has_gold else None
+        cov = min(coverage_ratio, 1.0) if has_gold else 1.0
+
+        # Score formula (see the spec's `score`): base + coverage-scaled quantity ramp + quality.
         score = float(METRIC_BASE_POINTS)
-        score += METRIC_RAMP_POINTS * min(metric_views, METRIC_RAMP_VIEWS) / float(METRIC_RAMP_VIEWS)
+        score += METRIC_RAMP_POINTS * min(metric_views, METRIC_RAMP_VIEWS) / float(METRIC_RAMP_VIEWS) * cov
         score += METRIC_QUALITY_POINTS * (float(commented) / float(metric_views)) if metric_views > 0 else 0.0
         score = round(min(score, 100.0), 1)
 
@@ -1199,6 +1219,19 @@ async def probe_metrics() -> dict:
                 "value": _pct(commented, metric_views),
                 "unit": "%",
                 "detail": "Share of metric views with a description",
+            })
+        if has_gold:
+            signals.append({
+                "label": label["gold_coverage"],
+                "value": round(cov * 100.0, 1),
+                "unit": "%",
+                "detail": f"{metric_views} metric views / {gold_tables} gold tables (count-based proxy)",
+            })
+        else:
+            signals.append({
+                "label": label["gold_coverage"],
+                "value": "n/a",
+                "detail": "No gold tables detected",
             })
 
         # Build gaps
@@ -1236,7 +1269,8 @@ async def probe_metrics() -> dict:
             "gaps": gaps,
             "gap_ids": gap_ids,
             "note": None,
-            "metrics": {"metric_views": metric_views, "metric_views_commented": commented},
+            "metrics": {"metric_views": metric_views, "metric_views_commented": commented,
+                        "gold_tables": gold_tables, "coverage_ratio": coverage_ratio},
             "drill_down": _drill(
                 "Metric views by schema",
                 [{"key": "catalog", "label": "Catalog"},

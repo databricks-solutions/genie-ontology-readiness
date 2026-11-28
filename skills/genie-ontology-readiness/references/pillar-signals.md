@@ -235,19 +235,27 @@ WHERE table_type = 'METRIC_VIEW' AND table_schema <> 'information_schema';
 SELECT COUNT(*) AS commented
 FROM <TABLES>
 WHERE table_type = 'METRIC_VIEW' AND comment IS NOT NULL AND trim(comment) <> '' AND table_schema <> 'information_schema';
+
+-- gold/mart layer in the SAME scope/filters as the metric-view count, for the coverage ratio (same gold heuristic as Relationships, detected by schema or table naming)
+SELECT COUNT(*) AS gold_tables
+FROM <TABLES>
+WHERE table_schema <> 'information_schema'
+  AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
+       OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)');
 ```
 
 `uncommented = metric_views - commented`.
+`cov = min(metric_views / gold_tables, 1.0)` when `gold_tables > 0`, else `1.0` (no penalty when no gold layer is detected, and `cov == 1.0` whenever `metric_views >= gold_tables`).
 
 **Score:**
 
 If `metric_views == 0`, the score is **0** and only the gap below applies.
 
-Otherwise:
+Otherwise, `cov` scales only the quantity ramp — the part that would otherwise let a thin semantic layer over a large gold layer overstate maturity:
 
-`30 + 40 * min(metric_views, 10) / 10 + 30 * (commented / metric_views)`, rounded to 1 decimal and capped at 100.
+`30 + 40 * min(metric_views, 10) / 10 * cov + 30 * (commented / metric_views)`, rounded to 1 decimal and capped at 100.
 
-**Signals to display:** Metric views (`metric_views`) and Commented (`pct(commented, metric_views)`%) when `metric_views > 0`.
+**Signals to display:** Metric views (`metric_views`), Commented (`pct(commented, metric_views)`%) when `metric_views > 0`, and Gold-table coverage (`round(cov * 100, 1)`%) when `gold_tables > 0`; otherwise `n/a` / "No gold tables detected".
 
 **Gaps:**
 - `metric_views == 0` → "No metric views found. Metric views are the GA foundation that feeds Genie Ontology — define KPIs centrally here."

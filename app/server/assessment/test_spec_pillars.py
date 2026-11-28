@@ -216,13 +216,16 @@ class RelationshipsParityTest(unittest.TestCase):
                     self.assertEqual(out["gaps"], [text for _, text in expected])
 
 
-def _metric_routes(count, commented):
-    """``count`` / ``commented`` are counts, or an exception when that read is refused."""
+def _metric_routes(count, commented, gold=0):
+    """``count`` / ``commented`` / ``gold`` are counts, or an exception when that read is
+    refused. ``gold`` is the gold-table count used for the coverage ratio (#23); it defaults
+    to 0 (no gold layer detected -> coverage multiplier 1.0 -> the pre-#23 score)."""
     def answer(v):
         return v if isinstance(v, Exception) else [{"c": str(v)}]
     return (
-        (lambda q: "table_type = '" in q and "comment" not in q, answer(count)),
+        (lambda q: "table_type = '" in q and "comment" not in q and "RLIKE" not in q, answer(count)),
         (lambda q: "comment IS NOT NULL" in q and "GROUP BY" not in q, answer(commented)),
+        (lambda q: "RLIKE" in q and "GROUP BY" not in q, answer(gold)),
     )
 
 
@@ -245,26 +248,45 @@ class MetricsGoldenTest(unittest.TestCase):
         self.assertEqual([s["label"] for s in out["signals"]], ["Metric views"])
 
     def test_some_metric_views_one_described(self):
-        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(4, 1))
-        self.assertEqual(out["score"], 53.5)
+        # Thin layer: 4 metric views over 8 gold tables -> cov = 0.5, so the quantity ramp
+        # is halved. Pre-#23 this scored 53.5 (30 + 40*0.4 + 7.5); coverage drops it to 45.5
+        # (30 + 40*0.4*0.5 + 7.5), strictly lower.
+        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(4, 1, gold=8))
+        self.assertEqual(out["score"], 45.5)
         self.assertEqual(out["gaps"], [self._uncommented(3)])
         self.assertEqual([(s["label"], s["value"]) for s in out["signals"]],
-                         [("Metric views", 4), ("Commented", 25.0)])
+                         [("Metric views", 4), ("Commented", 25.0), ("Gold-table coverage", 50.0)])
+        self.assertEqual(out["metrics"]["gold_tables"], 8)
+        self.assertEqual(out["metrics"]["coverage_ratio"], 0.5)
 
     def test_few_metric_views_all_described(self):
-        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(2, 2))
-        self.assertEqual(out["score"], 68.0)
+        # 2 metric views over 4 gold tables -> cov = 0.5. Pre-#23: 68.0 (30 + 40*0.2 + 30);
+        # coverage drops the ramp by half -> 64.0 (30 + 40*0.2*0.5 + 30).
+        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(2, 2, gold=4))
+        self.assertEqual(out["score"], 64.0)
         self.assertEqual(out["gaps"], [self._FEW])
+        self.assertEqual([(s["label"], s["value"]) for s in out["signals"]],
+                         [("Metric views", 2), ("Commented", 100.0), ("Gold-table coverage", 50.0)])
 
     def test_mature_semantic_layer(self):
-        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(12, 12))
+        # 12 metric views over 10 gold tables -> metric_views >= gold_tables -> cov = 1.0,
+        # so the score equals the pre-#23 formula (no penalty): capped at 100.
+        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(12, 12, gold=10))
         self.assertEqual(out["score"], 100.0)
         self.assertEqual(out["gaps"], [])
+        self.assertEqual([(s["label"], s["value"]) for s in out["signals"]][-1],
+                         ("Gold-table coverage", 100.0))
 
     def test_commented_read_refused_counts_as_undescribed(self):
+        # No gold layer detected (gold=0) -> cov = 1.0 -> no penalty, so this matches the
+        # pre-#23 score 50.0 and the coverage signal reads n/a.
         out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(5, RuntimeError("refused")))
         self.assertEqual(out["score"], 50.0)
         self.assertEqual(out["gaps"], [self._uncommented(5)])
+        self.assertEqual(out["metrics"]["gold_tables"], 0)
+        self.assertIsNone(out["metrics"]["coverage_ratio"])
+        self.assertEqual([(s["label"], s["value"]) for s in out["signals"]][-1],
+                         ("Gold-table coverage", "n/a"))
 
     def test_metric_view_type_is_unrecognised(self):
         out = _run(probes.probe_metrics, _sources(["main"]),

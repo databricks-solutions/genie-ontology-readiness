@@ -362,6 +362,12 @@ METRIC_RAMP_POINTS = 40
 METRIC_RAMP_VIEWS = 10
 METRIC_QUALITY_POINTS = 30
 METRIC_FEW_VIEWS = 3
+# Gold-table coverage (#23): a count-based proxy, coverage = metric_views / gold_tables.
+# It scales only the quantity ramp, so a thin semantic layer over a large gold layer can't
+# overstate maturity. `cov` is capped at 1.0 (coverage never *raises* the ramp above its
+# un-penalised value) and is 1.0 when no gold layer is detected (no penalty). Gold tables are
+# counted with the SAME heuristic as Relationships (GOLD_SCHEMA_PATTERN / GOLD_TABLE_PATTERN)
+# within the metric-view scope, so the ratio is apples-to-apples.
 
 METRICS = _index({
     "key": "metrics",
@@ -388,24 +394,44 @@ METRICS = _index({
             ),
             "shared": True,
         },
+        {
+            "id": "gold_tables",
+            "comment": ("gold/mart layer in the SAME scope/filters as the metric-view count, for the "
+                        "coverage ratio (same gold heuristic as Relationships, detected by schema or "
+                        "table naming)"),
+            "sql": (
+                "SELECT COUNT(*) AS gold_tables\n"
+                "FROM <TABLES>\n"
+                "WHERE {schema_filter}\n"
+                f"  AND (lower(table_schema) RLIKE '{GOLD_SCHEMA_PATTERN}'\n"
+                f"       OR lower(table_name) RLIKE '{GOLD_TABLE_PATTERN}');"
+            ),
+            "shared": True,
+        },
     ],
     "derived": [
         "`uncommented = metric_views - commented`.",
+        ("`cov = min(metric_views / gold_tables, 1.0)` when `gold_tables > 0`, else `1.0` "
+         "(no penalty when no gold layer is detected, and `cov == 1.0` whenever "
+         "`metric_views >= gold_tables`)."),
     ],
     "score": [
         "If `metric_views == 0`, the score is **0** and only the gap below applies.",
         "",
-        "Otherwise:",
+        "Otherwise, `cov` scales only the quantity ramp — the part that would otherwise let a thin "
+        "semantic layer over a large gold layer overstate maturity:",
         "",
         ("code",
          f"{METRIC_BASE_POINTS} + {METRIC_RAMP_POINTS} * min(metric_views, {METRIC_RAMP_VIEWS}) / "
-         f"{METRIC_RAMP_VIEWS} + {METRIC_QUALITY_POINTS} * (commented / metric_views)",
+         f"{METRIC_RAMP_VIEWS} * cov + {METRIC_QUALITY_POINTS} * (commented / metric_views)",
          ", rounded to 1 decimal and capped at 100."),
     ],
     "signals": [
         {"id": "metric_views", "label": "Metric views", "value": "`metric_views`"},
         {"id": "commented", "label": "Commented", "value": "`pct(commented, metric_views)`%",
          "when": "when `metric_views > 0`"},
+        {"id": "gold_coverage", "label": "Gold-table coverage", "value": "`round(cov * 100, 1)`%",
+         "when": "when `gold_tables > 0`; otherwise `n/a` / \"No gold tables detected\""},
     ],
     "gaps": [
         {
