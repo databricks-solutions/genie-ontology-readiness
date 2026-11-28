@@ -9,6 +9,10 @@ A Git deploy in the Apps UI has no ``.git``, so the commit comes from, in order:
    service principal (``GET /api/2.0/apps/{DATABRICKS_APP_NAME}``), then
 3. ``git rev-parse`` (local development).
 Every step is best-effort: when nothing is known the build is just the version.
+
+Slice 1 of the #60 SDK migration. Discover data-domains (``/api/2.0/domains``),
+FMAPI SSE chat streaming, and autoscaling Lakebase postgres credentials remain
+on raw HTTP due to SDK gaps / streaming and are out of scope.
 """
 
 from __future__ import annotations
@@ -19,14 +23,12 @@ import os
 import subprocess
 from typing import Optional
 
-import aiohttp
-
-from server.config import get_auth_headers, get_workspace_host
-from server.user_agent import PRODUCT_VERSION, with_ua
+from server._async import run_sync
+from server.config import _get_workspace_client
+from server.user_agent import PRODUCT_VERSION
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # A lookup that found no commit is retried after this long (a transient Apps
 # API failure at startup must not hide the commit until the next restart).
 _RETRY_SECONDS = 60.0
@@ -54,16 +56,12 @@ def _git_sha() -> Optional[str]:
 async def _active_deployment(app_name: str) -> dict:
     """The app's own active deployment, or {} (no access, not on Apps, timeout)."""
     try:
-        # Both can do blocking network I/O (SDK host/token resolution): off the loop.
-        host = await asyncio.to_thread(get_workspace_host)
-        headers = await asyncio.to_thread(get_auth_headers, True)
-        url = f"{host}/api/2.0/apps/{app_name}"
-        async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=with_ua()) as s:
-            async with s.get(url, headers=headers) as r:
-                if r.status != 200:
-                    logger.info("build info: apps get %s returned HTTP %s", app_name, r.status)
-                    return {}
-                return (await r.json()).get("active_deployment") or {}
+        # Client/auth initialization and the SDK request can both block.
+        # Bound caller latency even if SDK retries continue in the worker thread.
+        app = await asyncio.wait_for(
+            run_sync(lambda: _get_workspace_client().apps.get(app_name)), timeout=5,
+        )
+        return app.active_deployment.as_dict() if app and app.active_deployment else {}
     except Exception as e:  # never block the UI on this
         logger.info("build info: could not read the active deployment: %s", type(e).__name__)
         return {}
