@@ -102,9 +102,13 @@ def read_resources(app):
         if name == WAREHOUSE_RESOURCE and (r.get("sql_warehouse") or {}).get("id"):
             out["WAREHOUSE_ID"] = str(r["sql_warehouse"]["id"])
         elif name == LAKEBASE_RESOURCE and "postgres" in r:
-            # Lakebase Autoscaling: not a setting this script manages (see read_live's
-            # `autoscaling` flag and AUTOSCALING_STOP).
-            continue
+            # Lakebase Autoscaling (the default path): the branch and database are resource
+            # names, not Postgres names, so they are not app.yaml settings this script resolves.
+            # They are recorded here only so an Autoscaling upgrade can tell a reuse (same
+            # branch/database) from a repoint (different one) — see _autoscaling_problems.
+            pg = r.get("postgres") or {}
+            out["LAKEBASE_BRANCH"] = pg.get("branch") or ""
+            out["LAKEBASE_DATABASE_RESOURCE"] = pg.get("database") or ""
         elif name == LAKEBASE_RESOURCE:
             db = r.get("database") or {}
             out["LAKEBASE_INSTANCE_NAME"] = db.get("instance_name") or ""
@@ -159,18 +163,23 @@ def choose_mode(app_exists, infra):
     return "bundle" if (infra or not app_exists) else "upgrade"
 
 
-def effective_lakebase(value, instance):
-    """Whether history is on for a run. `auto` (or empty) is on when an instance is set."""
+def effective_lakebase(value, instance, autoscaling=False):
+    """Whether history is on for a run.
+
+    `true`/`false` force it. `auto` (or empty) is on when a Provisioned instance is set, or
+    when the app has a Lakebase Autoscaling database attached (the default path, which has no
+    instance name)."""
     value = (value or "auto").strip().lower()
     if value in ("true", "false"):
         return value == "true"
-    return bool((instance or "").strip())
+    return bool((instance or "").strip()) or bool(autoscaling)
 
 
-def uses_lakebase(live_env, live_resources):
-    """True when the deployed app keeps its history in Lakebase."""
+def uses_lakebase(live_env, live_resources, autoscaling=False):
+    """True when the deployed app keeps its history in Lakebase (Provisioned or Autoscaling)."""
     return (live_env.get("USE_LAKEBASE", "").strip().lower() == "true"
-            or "LAKEBASE_INSTANCE_NAME" in live_resources)
+            or "LAKEBASE_INSTANCE_NAME" in live_resources
+            or bool(autoscaling))
 
 
 def _deployed_value(key, live_env, live_resources):
@@ -231,21 +240,42 @@ def _lakebase_problems(values, live_env, live_resources):
 
 
 AUTOSCALING_STOP = (
-    "The app's lakebase-db resource is a Lakebase Autoscaling database. This script manages "
-    "Provisioned Lakebase only, and an update could detach the app's history. Upgrade this app "
-    "in the Apps UI instead: Deploy, Deploy using a different source, From Git (README: "
-    "Upgrade to a new release)."
+    "This run would detach or repoint the app's Lakebase Autoscaling history. The deployed app "
+    "keeps its assessment history in a Lakebase Autoscaling database (now the default path); "
+    "turning history off, switching to a Provisioned instance, or pointing at a different "
+    "Autoscaling branch/endpoint would orphan that history. Keep USE_LAKEBASE on, leave "
+    "LAKEBASE_INSTANCE_NAME unset, and keep LAKEBASE_ENDPOINT_NAME on the deployed branch. "
+    "To start fresh on purpose, set RESET_SETTINGS=true."
 )
+
+
+def _autoscaling_problems(values, live):
+    """Safety stops for an app whose history is a Lakebase Autoscaling database.
+
+    Autoscaling is the default path, so a correctly-triggered reuse run proceeds: it re-ensures
+    the same project/branch/endpoint/database/role idempotently. The stops here preserve the
+    original safety intent — never silently detach or repoint an existing history:
+
+    - explicit USE_LAKEBASE=false would turn history off (detach);
+    - LAKEBASE_INSTANCE_NAME set would switch to a Provisioned instance (repoint);
+    - an explicit LAKEBASE_ENDPOINT_NAME on a different branch would repoint the compute.
+    """
+    if (values["USE_LAKEBASE"].value or "").strip().lower() == "false":
+        return [AUTOSCALING_STOP]
+    if (values["LAKEBASE_INSTANCE_NAME"].value or "").strip():
+        return [AUTOSCALING_STOP]
+    deployed_branch = (live.get("resources", {}).get("LAKEBASE_BRANCH") or "").rstrip("/")
+    want_endpoint = (values["LAKEBASE_ENDPOINT_NAME"].value or "").strip()
+    if want_endpoint and deployed_branch and not want_endpoint.startswith(deployed_branch + "/"):
+        return [AUTOSCALING_STOP]
+    return []
 
 
 def find_problems(values, live, *, reset=False):
     """Return the plain-text reasons to stop before changing anything. Empty = go ahead.
 
     With reset=True the deployed settings were ignored on purpose, so the checks that
-    compare against them are skipped. An Autoscaling lakebase-db always stops: resetting
-    would detach the history."""
-    if live.get("autoscaling"):
-        return [AUTOSCALING_STOP]
+    compare against them are skipped (idempotent reuse never detaches history)."""
     if reset:
         return []
     if live.get("git") and not live.get("yml_readable"):
@@ -261,6 +291,8 @@ def find_problems(values, live, *, reset=False):
             "read, so its settings are unknown. Check that you can read that folder, then run again. "
             "To ignore the deployed settings, set RESET_SETTINGS=true."
         ]
+    if live.get("autoscaling"):
+        return _autoscaling_problems(values, live)
     return _lakebase_problems(values, live.get("env", {}), live.get("resources", {}))
 
 

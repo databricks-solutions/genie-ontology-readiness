@@ -45,6 +45,7 @@ history steps additionally require asyncpg.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +87,9 @@ WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", os.environ.get("DATABRICKS_WAREHOU
 USE_LAKEBASE = False
 LAKEBASE_INSTANCE = ""
 LAKEBASE_DATABASE = "ontology_readiness"
+# An explicit Autoscaling endpoint resource name to reuse (set in _main from the resolved
+# settings). Empty = derive the project/branch/endpoint ids from the app name.
+LAKEBASE_ENDPOINT_NAME = ""
 # These provisioning connections carry a live Lakebase credential over the public
 # internet. `require` encrypts but verifies nothing, so it gives no protection
 # against an in-path attacker — see app/server/lakebase_client.py for the runtime
@@ -115,8 +119,37 @@ def _lakebase_ssl():
         ctx.check_hostname = False
     return ctx
 
-# Populated by setup_lakebase() when USE_LAKEBASE is on.
-_LAKEBASE = {"host": "", "sp_client_id": "", "user_email": ""}
+# The Autoscaling database resource id. Its hyphenated resource id (databricks-postgres) is
+# NOT the Postgres database name — the actual name (databricks_postgres, underscore) is read
+# back from `postgres get-database ... .status.postgres_database` and rendered into
+# LAKEBASE_DATABASE. Rendering the hyphenated id fails pool init with
+# `database "databricks-postgres" does not exist`.
+AUTOSCALING_DATABASE_ID = "databricks-postgres"
+# Default branch/endpoint ids for a new Autoscaling project (reused when they already exist).
+AUTOSCALING_BRANCH_ID = "production"
+AUTOSCALING_ENDPOINT_ID = "primary"
+
+# Populated by setup_lakebase()/setup_lakebase_autoscaling() when USE_LAKEBASE is on.
+# Provisioned fills host/sp_client_id/user_email; Autoscaling additionally fills endpoint
+# (credential target), branch + database_resource (the attach payload), and database (the
+# resolved underscore Postgres name rendered into LAKEBASE_DATABASE).
+_LAKEBASE = {"host": "", "sp_client_id": "", "user_email": "",
+             "endpoint": "", "branch": "", "database_resource": "", "database": ""}
+
+
+def _pg_id(value):
+    """A valid Lakebase resource id from a name: 1-63 chars, starts with a lowercase letter,
+    only lowercase letters, digits and hyphens."""
+    out = re.sub(r"[^a-z0-9-]", "-", (value or "").lower()).strip("-") or "gor"
+    if not out[0].isalpha():
+        out = "gor-" + out
+    return out[:63]
+
+
+def _pg_role_id(sp_client_id):
+    """A Postgres role_id for the app SP. Must start with a letter, so it is `gor_<sp>` with the
+    SP client-id UUID sanitized. The role's `postgres_role` stays the raw SP client-id UUID."""
+    return ("gor_" + re.sub(r"[^A-Za-z0-9]", "_", sp_client_id or ""))[:63]
 
 
 def _stop(lines):
@@ -165,6 +198,12 @@ def render_app_yml(values):
     rendered = {name: setting.value for name, setting in values.items()}
     rendered["USE_LAKEBASE"] = "true" if (USE_LAKEBASE and _LAKEBASE["host"]) else "false"
     rendered["LAKEBASE_USER"] = _LAKEBASE["sp_client_id"] or values["LAKEBASE_USER"].value
+    # Autoscaling: pin the credential endpoint and the RESOLVED underscore database name
+    # (never the hyphenated resource id) so pool init connects to the real Postgres database.
+    if _LAKEBASE.get("endpoint"):
+        rendered["LAKEBASE_ENDPOINT_NAME"] = _LAKEBASE["endpoint"]
+    if _LAKEBASE.get("database"):
+        rendered["LAKEBASE_DATABASE"] = _LAKEBASE["database"]
     text, missing = deploy_settings.render(ORIGINAL_APP_CONFIG, rendered)
     for name in missing:
         print(f"  (warning) could not set {name} in app.yaml — leaving the committed value")
@@ -279,6 +318,115 @@ def _credential(instance):
     return cred.get("token") if isinstance(cred, dict) else None
 
 
+def _credential_autoscaling(endpoint):
+    """An OAuth credential for a Lakebase Autoscaling compute endpoint (mirrors the runtime
+    POST /api/2.0/postgres/credentials). None if it cannot be minted."""
+    cred = cli_json("postgres", "generate-database-credential", endpoint)
+    return cred.get("token") if isinstance(cred, dict) else None
+
+
+def _pg_exists(got):
+    """True when a `postgres get-*` read returned a real resource (has a `name`)."""
+    return isinstance(got, dict) and bool(got.get("name"))
+
+
+def _ensure_project(project_id):
+    """Idempotently ensure an Autoscaling project. Returns its resource name."""
+    name = f"projects/{project_id}"
+    if _pg_exists(cli_json("postgres", "get-project", name)):
+        print(f"  reuse project {name}")
+    else:
+        print(f"  create project {name}")
+        cli("postgres", "create-project", project_id, check=False)
+    return name
+
+
+def _ensure_branch(project_name, branch_id):
+    """Idempotently ensure a branch of the project. Returns its resource name."""
+    name = f"{project_name}/branches/{branch_id}"
+    if _pg_exists(cli_json("postgres", "get-branch", name)):
+        print(f"  reuse branch {name}")
+    else:
+        print(f"  create branch {name}")
+        cli("postgres", "create-branch", project_name, branch_id, "--no-expiry", check=False)
+    return name
+
+
+def _ensure_endpoint(branch_name, endpoint_id):
+    """Idempotently ensure a read-write compute endpoint of the branch. Returns its resource name."""
+    name = f"{branch_name}/endpoints/{endpoint_id}"
+    if _pg_exists(cli_json("postgres", "get-endpoint", name)):
+        print(f"  reuse endpoint {name}")
+    else:
+        print(f"  create endpoint {name}")
+        cli("postgres", "create-endpoint", branch_name, endpoint_id, "--replace-existing", check=False)
+    return name
+
+
+def _ensure_database(branch_name, database_id):
+    """Idempotently ensure a database of the branch. Returns its resource name."""
+    name = f"{branch_name}/databases/{database_id}"
+    if _pg_exists(cli_json("postgres", "get-database", name)):
+        print(f"  reuse database {name}")
+    else:
+        print(f"  create database {name}")
+        cli("postgres", "create-database", branch_name, "--database-id", database_id,
+            "--replace-existing", check=False)
+    return name
+
+
+def _ensure_role(branch_name, role_id, sp_client_id):
+    """Idempotently ensure the app SP's Postgres role on the branch. Returns its resource name.
+
+    role_id starts with a letter (`gor_<sp>`); postgres_role is the raw SP client-id UUID. The
+    role is created with default privileges only — schema grants follow via _grant_history."""
+    name = f"{branch_name}/roles/{role_id}"
+    if _pg_exists(cli_json("postgres", "get-role", name)):
+        print(f"  reuse SP Postgres role {name}")
+    else:
+        print(f"  create SP Postgres role {name}")
+        body = json.dumps({"spec": {"identity_type": "SERVICE_PRINCIPAL",
+                                    "postgres_role": sp_client_id,
+                                    "auth_method": "LAKEBASE_OAUTH_V1"}})
+        cli("postgres", "create-role", branch_name, "--role-id", role_id, "--json", body, check=False)
+    return name
+
+
+def _endpoint_host(endpoint):
+    """The host name of an Autoscaling endpoint, or "" if it cannot be read."""
+    ep = cli_json("postgres", "get-endpoint", endpoint)
+    if isinstance(ep, dict):
+        return (((ep.get("status") or {}).get("hosts") or {}).get("host")) or ""
+    return ""
+
+
+def _postgres_database_name(database_resource):
+    """The resolved Postgres database name (underscore) of an Autoscaling database resource.
+
+    Read from `postgres get-database <resource> .status.postgres_database` — NEVER the
+    hyphenated resource id. "" if it cannot be read."""
+    db = cli_json("postgres", "get-database", database_resource)
+    if isinstance(db, dict):
+        for part in (db.get("status") or {}, db.get("spec") or {}):
+            name = part.get("postgres_database")
+            if name:
+                return name
+    return ""
+
+
+def _autoscaling_ids(endpoint_setting):
+    """(project_id, branch_id, endpoint_id) for the Autoscaling branch.
+
+    An explicit LAKEBASE_ENDPOINT_NAME (projects/<p>/branches/<b>/endpoints/<e>) names an
+    existing project/branch/endpoint to reuse; otherwise ids are derived from the app name."""
+    ep = (endpoint_setting or "").strip()
+    if ep.startswith("projects/") and "/endpoints/" in ep:
+        parts = ep.split("/")
+        if len(parts) >= 6:
+            return parts[1], parts[3], parts[5]
+    return _pg_id(APP_NAME), AUTOSCALING_BRANCH_ID, AUTOSCALING_ENDPOINT_ID
+
+
 def setup_lakebase():
     """Create the app's database on the shared instance and record host + SP client id
     for app.yaml rendering. Idempotent: an existing database is reused."""
@@ -333,6 +481,45 @@ def setup_lakebase():
     _LAKEBASE["user_email"] = user_email
 
 
+def setup_lakebase_autoscaling():
+    """Default Lakebase path: idempotently ensure the Autoscaling project / branch / endpoint /
+    database / SP Postgres role, then record the host, credential endpoint, database resource,
+    and resolved underscore database name for the attach + app.yaml rendering.
+
+    Idempotent create-or-reuse: a get-then-create for each resource works whether it already
+    exists (reuse) or is missing (create); none fails on "already exists". The app may not exist
+    yet on a first install, so the SP role is created on the follow-up upgrade run (as the README
+    notes for Lakebase)."""
+    me = cli_json("current-user", "me")
+    user_email = me.get("userName", "") if isinstance(me, dict) else ""
+    app = cli_json("apps", "get", APP_NAME)
+    sp = app.get("service_principal_client_id", "") if isinstance(app, dict) else ""
+
+    project_id, branch_id, endpoint_id = _autoscaling_ids(LAKEBASE_ENDPOINT_NAME)
+    print(f"\n[Lakebase] Autoscaling (default path): project '{project_id}', branch '{branch_id}', "
+          f"endpoint '{endpoint_id}'")
+    project = _ensure_project(project_id)
+    branch = _ensure_branch(project, branch_id)
+    endpoint = _ensure_endpoint(branch, endpoint_id)
+    database_resource = _ensure_database(branch, AUTOSCALING_DATABASE_ID)
+    if sp:
+        _ensure_role(branch, _pg_role_id(sp), sp)
+    else:
+        print("  WARNING: the app's service principal id is not known yet (first install). "
+              "The SP Postgres role is created on the follow-up upgrade run.")
+
+    host = _endpoint_host(endpoint)
+    database = _postgres_database_name(database_resource)
+    _LAKEBASE.update(host=host, sp_client_id=sp, user_email=user_email, endpoint=endpoint,
+                     branch=branch, database_resource=database_resource, database=database)
+    if not host:
+        print("  WARNING: could not resolve the endpoint host — history will stay off this run.")
+    if database:
+        print(f"  database: resource '{database_resource}' -> Postgres name '{database}'")
+    else:
+        print(f"  WARNING: could not resolve the Postgres name of '{database_resource}'.")
+
+
 def _grant_history():
     """Grant the app SP full DML on the history objects. Idempotent, so it runs on every
     publish.
@@ -360,10 +547,15 @@ def _grant_history():
             f'ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT ALL ON SEQUENCES TO "{sp}"',
         ]
 
+    endpoint = _LAKEBASE.get("endpoint")
+    # Autoscaling connects to the resolved underscore Postgres name and mints an endpoint
+    # credential; Provisioned uses the instance credential and LAKEBASE_DATABASE.
+    database = (_LAKEBASE.get("database") or LAKEBASE_DATABASE) if endpoint else LAKEBASE_DATABASE
+
     async def _grant():
         import asyncpg
-        token = _credential(LAKEBASE_INSTANCE)
-        conn = await asyncpg.connect(host=host, port=5432, database=LAKEBASE_DATABASE,
+        token = _credential_autoscaling(endpoint) if endpoint else _credential(LAKEBASE_INSTANCE)
+        conn = await asyncpg.connect(host=host, port=5432, database=database,
                                      user=user_email, password=token, ssl=_lakebase_ssl())
         done = 0
         try:
@@ -382,11 +574,13 @@ def _grant_history():
         print(f"  WARNING: grant step failed: {str(e)[:120]}")
 
 
-def _update_resources(warehouse_id=None, lakebase=None):
+def _update_resources(warehouse_id=None, lakebase=None, postgres=None):
     """Set the app's resources. Keeps every resource this script does not manage.
 
     warehouse_id  new sql-warehouse id, or None to keep the current resource
-    lakebase      {"instance": ..., "database": ...} to attach lakebase-db, or None to detach it
+    lakebase      {"instance": ..., "database": ...} to attach a Provisioned lakebase-db, or None
+    postgres      {"branch": ..., "database": ...} to attach an Autoscaling lakebase-db, or None
+                  (branch/database are resource names; mutually exclusive with `lakebase`)
     """
     app = cli_json("apps", "get", APP_NAME)
     resources = []
@@ -394,7 +588,7 @@ def _update_resources(warehouse_id=None, lakebase=None):
         if r["name"] == "lakebase-db" or (r["name"] == "sql-warehouse" and warehouse_id):
             continue
         item = {"name": r["name"]}
-        for k in ("sql_warehouse", "database", "secret", "serving_endpoint", "job"):
+        for k in ("sql_warehouse", "database", "postgres", "secret", "serving_endpoint", "job"):
             if r.get(k) is not None:
                 item[k] = r[k]
         resources.append(item)
@@ -406,6 +600,13 @@ def _update_resources(warehouse_id=None, lakebase=None):
             "name": "lakebase-db",
             "database": {"instance_name": lakebase["instance"],
                          "database_name": lakebase["database"],
+                         "permission": "CAN_CONNECT_AND_CREATE"},
+        })
+    if postgres:
+        resources.append({
+            "name": "lakebase-db",
+            "postgres": {"branch": postgres["branch"],
+                         "database": postgres["database"],
                          "permission": "CAN_CONNECT_AND_CREATE"},
         })
     # Retry: `apps update` can transiently conflict right after a deploy.
@@ -421,21 +622,8 @@ def _update_resources(warehouse_id=None, lakebase=None):
     return False
 
 
-def attach_lakebase():
-    """Bundle path: attach the lakebase-db resource, grant the app SP, and restart.
-
-    Runs AFTER `bundle deploy`/`run`, because `bundle deploy` reconciles the app's
-    resources from databricks.yml (which intentionally omits lakebase-db) and would
-    otherwise strip it. Pinned LAKEBASE_* env stays in app.yaml; the resource
-    provides the SP's Postgres role + network path, so we restart to reconnect.
-    """
-    if not _LAKEBASE.get("host"):
-        return
-    print("\n[Lakebase] Attaching lakebase-db resource (post-publish)")
-    _update_resources(lakebase={"instance": LAKEBASE_INSTANCE, "database": LAKEBASE_DATABASE})
-    _grant_history()
-
-    # Restart the app so its lifespan re-runs init_pool with the resource present.
+def _restart_app():
+    """Restart the app so its lifespan re-runs init_pool with the lakebase-db resource present."""
     app = cli_json("apps", "get", APP_NAME)
     app_path = ""
     if isinstance(app, dict):
@@ -444,6 +632,39 @@ def attach_lakebase():
         cli("apps", "deploy", APP_NAME, "--source-code-path", app_path, check=False)
     else:
         print("  WARNING: could not resolve app source path to restart; the app may need a manual redeploy.")
+
+
+def attach_lakebase():
+    """Bundle path (Provisioned, legacy): attach the lakebase-db resource, grant the app SP, and
+    restart.
+
+    Runs AFTER `bundle deploy`/`run`, because `bundle deploy` reconciles the app's
+    resources from databricks.yml (which intentionally omits lakebase-db) and would
+    otherwise strip it. Pinned LAKEBASE_* env stays in app.yaml; the resource
+    provides the SP's Postgres role + network path, so we restart to reconnect.
+    """
+    if not _LAKEBASE.get("host"):
+        return
+    print("\n[Lakebase] Attaching lakebase-db resource (Provisioned, post-publish)")
+    _update_resources(lakebase={"instance": LAKEBASE_INSTANCE, "database": LAKEBASE_DATABASE})
+    _grant_history()
+    _restart_app()
+
+
+def attach_lakebase_autoscaling():
+    """Bundle path (Autoscaling, default): attach the `postgres` lakebase-db resource, grant the
+    app SP, and restart.
+
+    Mirrors attach_lakebase and runs AFTER `bundle deploy`/`run` for the same reason (bundle
+    deploy strips lakebase-db). The resource carries the branch + database resource names so NO
+    manual `apps update` is needed; the rendered app.yaml pins the endpoint + underscore database."""
+    if not _LAKEBASE.get("host"):
+        return
+    print("\n[Lakebase] Attaching lakebase-db resource (Autoscaling, post-publish)")
+    _update_resources(postgres={"branch": _LAKEBASE["branch"],
+                                "database": _LAKEBASE["database_resource"]})
+    _grant_history()
+    _restart_app()
 
 
 def stage_source():
@@ -470,20 +691,31 @@ def stage_source():
 
 
 def upgrade_app(values, live):
-    """Upgrade mode: update resources only if they changed, grant, sync and deploy."""
+    """Upgrade mode: update resources only if they changed, grant, sync and deploy.
+
+    Lakebase is attached as a Provisioned (`database`) or an Autoscaling (`postgres`) resource,
+    the same shapes the bundle-path attach uses."""
     warehouse = values["WAREHOUSE_ID"].value
-    want_lb = ({"instance": LAKEBASE_INSTANCE, "database": LAKEBASE_DATABASE}
-               if (USE_LAKEBASE and _LAKEBASE["host"]) else None)
+    on = bool(USE_LAKEBASE and _LAKEBASE["host"])
+    autoscaling = bool(on and not LAKEBASE_INSTANCE)
+    want_lb = {"instance": LAKEBASE_INSTANCE, "database": LAKEBASE_DATABASE} if (on and not autoscaling) else None
+    want_pg = {"branch": _LAKEBASE["branch"], "database": _LAKEBASE["database_resource"]} if autoscaling else None
     have_wh = live["resources"].get("WAREHOUSE_ID")
     have_lb = ({"instance": live["resources"]["LAKEBASE_INSTANCE_NAME"],
                 "database": live["resources"].get("LAKEBASE_DATABASE", "")}
                if "LAKEBASE_INSTANCE_NAME" in live["resources"] else None)
-    if have_wh != warehouse or have_lb != want_lb:
+    have_pg = ({"branch": live["resources"].get("LAKEBASE_BRANCH", ""),
+                "database": live["resources"].get("LAKEBASE_DATABASE_RESOURCE", "")}
+               if live.get("autoscaling") else None)
+    if have_wh != warehouse or have_lb != want_lb or have_pg != want_pg:
         print("  the warehouse or Lakebase resource changed; updating the app's resources")
-        _update_resources(warehouse_id=warehouse if have_wh != warehouse else None, lakebase=want_lb)
+        kwargs = {"warehouse_id": warehouse if have_wh != warehouse else None, "lakebase": want_lb}
+        if want_pg is not None or have_pg is not None:
+            kwargs["postgres"] = want_pg
+        _update_resources(**kwargs)
     else:
         print("  app resources already match the settings; not changed")
-    if want_lb:
+    if want_lb or want_pg:
         _grant_history()
 
     remote = stage_source()
@@ -545,7 +777,8 @@ def main():
 
 
 def _main():
-    global APP_NAME, WAREHOUSE_ID, USE_LAKEBASE, LAKEBASE_INSTANCE, LAKEBASE_DATABASE, LAKEBASE_SSL_MODE
+    global APP_NAME, WAREHOUSE_ID, USE_LAKEBASE, LAKEBASE_INSTANCE, LAKEBASE_DATABASE
+    global LAKEBASE_SSL_MODE, LAKEBASE_ENDPOINT_NAME
     if not PROFILE:
         print("ERROR: DATABRICKS_PROFILE not set.")
         sys.exit(1)
@@ -571,17 +804,23 @@ def _main():
 
     WAREHOUSE_ID = values["WAREHOUSE_ID"].value
     USE_LAKEBASE = deploy_settings.effective_lakebase(
-        values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value)
+        values["USE_LAKEBASE"].value, values["LAKEBASE_INSTANCE_NAME"].value,
+        autoscaling=live.get("autoscaling"))
     LAKEBASE_INSTANCE = values["LAKEBASE_INSTANCE_NAME"].value
     LAKEBASE_DATABASE = values["LAKEBASE_DATABASE"].value
     LAKEBASE_SSL_MODE = values["LAKEBASE_SSL_MODE"].value
+    LAKEBASE_ENDPOINT_NAME = values["LAKEBASE_ENDPOINT_NAME"].value
 
     if USE_LAKEBASE:
-        setup_lakebase()
+        # Autoscaling is the default; Provisioned (legacy) runs only when an instance name is set.
+        if LAKEBASE_INSTANCE:
+            setup_lakebase()
+        else:
+            setup_lakebase_autoscaling()
     if (USE_LAKEBASE and not _LAKEBASE["host"]
-            and deploy_settings.uses_lakebase(live["env"], live["resources"])):
+            and deploy_settings.uses_lakebase(live["env"], live["resources"], live.get("autoscaling"))):
         _stop(["Lakebase is not available. This run would turn history off. Nothing was deployed. "
-               "Make the instance AVAILABLE, then run again."])
+               "Make the instance/endpoint AVAILABLE, then run again."])
 
     print("\n[1/3] Rendering app.yaml...")
     render_app_yml(values)
@@ -621,7 +860,10 @@ def _main():
 
     # Attach Lakebase AFTER publishing so `bundle deploy` doesn't strip the resource.
     if USE_LAKEBASE and _LAKEBASE["host"]:
-        attach_lakebase()
+        if LAKEBASE_INSTANCE:
+            attach_lakebase()
+        else:
+            attach_lakebase_autoscaling()
         if not _LAKEBASE["sp_client_id"]:
             print("\nLakebase: this was the first install, so the app's service principal id was not known.\n"
                   "Run the upgrade command once more to finish the Lakebase setup. See the README.")
