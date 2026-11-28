@@ -81,6 +81,38 @@ user's grants, so signals gated behind grants a viewer lacks (notably the worksp
 system tables) can read lower for a restricted viewer than for the SP — use `FORCE_SP=true` when you
 need a single, viewer-independent workspace-wide score.
 
+## Contributor previews (sanctioned isolated path)
+
+Use `scripts/preview.sh` to test your checked-out PR branch in **any workspace you target**.
+This is the sanctioned exception to the “never deploy by hand” rule for the shared dev/stg/prod
+apps and to the no-destroy rule for their history. The script selects only the `preview` target:
+`gor-pr-<slug>` and per-slug bundle state cannot affect dev/stg/prod. Previews are stateless
+(no Lakebase). You need permission to deploy Databricks Apps, CLI authentication, a SQL warehouse
+you can use in that same workspace, Node/npm, and Python dependencies:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+PYTHON=.venv/bin/python WAREHOUSE_ID=<your-warehouse-id> bash scripts/preview.sh deploy --profile <your-profile> --pr 159
+# Tear down using the same workspace, slug, and deploying identity:
+PYTHON=.venv/bin/python bash scripts/preview.sh destroy --profile <your-profile> --pr 159
+```
+
+Deploy builds the frontend, publishes the local checkout, and prints the app URL. `--pr` takes
+precedence over `--slug`; with neither, the script lowercases the current git branch and replaces
+invalid characters with hyphens. Slugs must contain only `[a-z0-9-]`, start/end with a letter or digit, and fit 23 characters; use
+`--pr` or a shorter `--slug` for a long branch. Destroy needs no warehouse and prompts for confirmation by default.
+For unattended/agent teardown, pass `--yes` (alias `--auto-approve`) to skip the prompt.
+Keep the same explicit slug when tearing down after switching branches. The script clears the local
+preview bundle cache before summary/deploy/destroy so sequential slugs cannot reuse stale local state.
+
+`--profile` overrides `DATABRICKS_PROFILE`; if both are absent, normal CLI default auth applies,
+including `DATABRICKS_HOST` with credentials. No workspace or profile is built in. Optional
+`ASSESS_CATALOGS` and `GENIE_SPACE_ID` default to empty. Automatic catalog/system grants are skipped
+for previews, so restricted data is reported as unavailable; an admin can apply the app's
+`/api/setup/grants` SQL separately if needed. Always run `destroy` when finished. See
+`bash scripts/preview.sh --help` for inputs.
+
 ## Auth: on-behalf-of-user by default, service-principal fallback
 
 The assessment runs **on-behalf-of-user (OBO)** by default, falling back to the

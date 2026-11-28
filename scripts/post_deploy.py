@@ -15,13 +15,16 @@ Two modes (see deploy_settings.choose_mode):
 
 Usage (first install):
     export DATABRICKS_PROFILE=<profile>
-    export TARGET=dev            # bundle target: dev (default) | stg | prod.
+    export TARGET=dev            # bundle target: dev (default) | stg | prod | preview.
                                  # The app name is fixed per target in
                                  # databricks.yml and read back from the bundle;
                                  # do NOT pass an app name. (An APP_NAME env is
                                  # IGNORED — only warned about — so it can never
                                  # redirect grants to another environment; the
                                  # target is the sole source of truth.)
+    # For TARGET=preview, also export PREVIEW_SLUG=159 (PR number or branch slug).
+    # Slugs are trimmed, use lowercase letters/digits/hyphens, start/end with a letter or digit, and
+    # must fit the 30-character app name limit (gor-pr- + at most 23 characters).
     export WAREHOUSE_ID=<warehouse_id>           # required on a first install
     # optional:
     #   export ASSESS_CATALOGS="cat_a,cat_b"
@@ -33,10 +36,16 @@ Usage (first install):
     #   export LAKEBASE_DATABASE=ontology_readiness
     python3 scripts/post_deploy.py
 
-Usage (upgrade to a new release): set only DATABRICKS_PROFILE and TARGET. Each
+Usage (upgrade to a new release): set DATABRICKS_PROFILE and TARGET (also
+PREVIEW_SLUG for preview). Each
 setting that you do not set is reused from the deployed app. To change one
 setting, export just that variable. To ignore the deployed settings, set
 RESET_SETTINGS=true. Set INFRA=true only when the release changed databricks.yml.
+
+For contributor previews, prefer scripts/preview.sh: it builds the frontend, forces
+stateless settings, and uses your CLI auth (a named profile is optional for preview).
+Preview skips automatic catalog/system grants; an admin can grant additional reads
+separately using /api/setup/grants.
 
 Python 3.9+. Requires databricks-sdk>=0.36.0 (the SP-grant step,
 setup_app_permissions.py, resolves the app SP via the SDK). The Lakebase
@@ -65,17 +74,19 @@ from server.user_agent import git_version  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deploy_settings  # noqa: E402
+from preview import clear_local_preview_state, validate_slug  # noqa: E402
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
-# Bundle target (dev|stg|prod). The app name is pinned per target in
+# Bundle target (dev|stg|prod|preview). The app name is pinned per target in
 # databricks.yml and resolved from the bundle in main(); TARGET — not an app
 # name — is what selects the environment.
 TARGET = os.environ.get("TARGET", "dev")
+PREVIEW_SLUG = os.environ.get("PREVIEW_SLUG", "")
 # The bundle targets defined in databricks.yml. Kept here to validate TARGET and
-# to derive a deterministic fallback app name (prod -> bare, else -<target>) that
+# to derive a deterministic fallback app name (prod -> bare, dev/stg -> suffixed) that
 # matches the yaml, so a failed `bundle summary` never silently falls back to the
-# live prod app name for a dev/stg deploy.
-VALID_TARGETS = ("dev", "stg", "prod")
+# live prod app name for a dev/stg deploy. Preview requires bundle summary.
+VALID_TARGETS = ("dev", "stg", "prod", "preview")
 # Placeholder only — main() reassigns this via resolve_app_name(), which resolves
 # the name from the bundle target. An explicit APP_NAME env is IGNORED there (only
 # warned about), never honored, so it cannot redirect this run to another env.
@@ -168,6 +179,9 @@ def render_app_yml(values):
     text, missing = deploy_settings.render(ORIGINAL_APP_CONFIG, rendered)
     for name in missing:
         print(f"  (warning) could not set {name} in app.yaml — leaving the committed value")
+    if TARGET == "preview":
+        # A stateless app has no lakebase-db resource to resolve at startup.
+        text = text.replace("valueFrom: lakebase-db", 'value: ""')
     APP_CONFIG.write_text(text)
     print(f"  Rendered {APP_CONFIG} (restored to the committed text when this run ends)")
 
@@ -186,6 +200,8 @@ def _workspace_id_default():
 
 
 def _cli_cmd(*args):
+    if TARGET == "preview" and args[:2] in (("bundle", "summary"), ("bundle", "deploy"), ("bundle", "destroy")):
+        clear_local_preview_state(APP_DIR.parent)
     cmd = ["databricks", *args]
     if PROFILE:
         cmd += ["--profile", PROFILE]
@@ -499,6 +515,17 @@ def upgrade_app(values, live):
                f"then run this script again. Staged source: {remote}"])
 
 
+def _preview_var_args():
+    """Validate the preview identifier before any bundle call; other targets ignore it."""
+    if TARGET != "preview":
+        return []
+    try:
+        slug = validate_slug(PREVIEW_SLUG)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
+    return [f"--var=preview_slug={slug}"]
+
+
 def resolve_app_name():
     """Read the target's pinned app name back from the bundle.
 
@@ -511,6 +538,7 @@ def resolve_app_name():
     args = ["bundle", "summary", "-t", TARGET]
     if WAREHOUSE_ID:
         args += ["--var", f"warehouse_id={WAREHOUSE_ID}"]
+    args += _preview_var_args()
     summ = cli_json(*args)
     try:
         name = summ["resources"]["apps"]["ontology_readiness"]["name"]
@@ -530,7 +558,10 @@ def _fallback_app_name():
 
     Used only when `bundle summary` can't be read; it mirrors the yaml (prod ->
     bare, dev/stg -> suffixed) so a transient failure never resolves a dev/stg
-    deploy to the live prod app name."""
+    deploy to the live prod app name. Preview requires the summary because its
+    name depends on preview_slug, not just TARGET."""
+    if TARGET == "preview":
+        raise SystemExit("ERROR: preview app name must be resolved from bundle summary; check preview_slug.")
     return "genie-ontology-readiness" if TARGET == "prod" else f"genie-ontology-readiness-{TARGET}"
 
 
@@ -546,7 +577,7 @@ def main():
 
 def _main():
     global APP_NAME, WAREHOUSE_ID, USE_LAKEBASE, LAKEBASE_INSTANCE, LAKEBASE_DATABASE, LAKEBASE_SSL_MODE
-    if not PROFILE:
+    if not PROFILE and TARGET != "preview":
         print("ERROR: DATABRICKS_PROFILE not set.")
         sys.exit(1)
     if TARGET not in VALID_TARGETS:
@@ -596,7 +627,11 @@ def _main():
     # The grants must cover the catalogs this run deploys, which may come from the
     # deployed app rather than from this shell.
     env["ASSESS_CATALOGS"] = values["ASSESS_CATALOGS"].value
-    subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
+    if TARGET == "preview":
+        print("  Preview: skipping automatic catalog/system grants. Unavailable data is not assessed. "
+              "An admin can apply the app's /api/setup/grants SQL separately if needed.")
+    else:
+        subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
 
     if mode == "upgrade":
         print("\n[3/3] Upgrading the app in place (sync source, apps deploy)...")
@@ -609,13 +644,15 @@ def _main():
     # The app name is fixed by the target in databricks.yml — do NOT pass
     # --var app_name (the variable no longer exists; passing it would fail and,
     # historically, sharing one target's state across app names is the delete
-    # footgun this hardening removes). Only warehouse_id is a real per-deploy var,
-    # and it is always the resolved value, never an empty one.
-    var_args = [f"--var=warehouse_id={WAREHOUSE_ID}"]
+    # footgun this hardening removes). Preview passes the same validated slug
+    # used for name resolution; warehouse_id is always the resolved value.
+    var_args = [f"--var=warehouse_id={WAREHOUSE_ID}", *_preview_var_args()]
     if cli("bundle", "deploy", "-t", TARGET, *var_args, check=False) != 0:
         _stop(["bundle deploy failed. The app was not updated. Fix the error above, then run this script again."])
     rc = cli("bundle", "run", "ontology_readiness", "-t", TARGET, *var_args, check=False)
     if rc != 0:
+        if TARGET == "preview":
+            _stop(["Preview bundle run failed. Fix the error above and retry."])
         print(f"  (bundle run failed — ensure --var warehouse_id is set. If the app already "
               f"exists outside target '{TARGET}' state, redeploy code with `databricks apps deploy {APP_NAME}`.)")
 
