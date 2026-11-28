@@ -67,6 +67,17 @@ describe('GenieSpacesTable (per-agent curation, where visible)', () => {
     expect(html).toContain('where visible');
   });
 
+  it('labels "Standalone" as an absence-of-evidence default (not a positive marker)', () => {
+    const html = renderToStaticMarkup(
+      createElement(PillarDetail, { pillar: geniePillar([readable]), config }),
+    );
+    // The classification caption must make clear what standalone vs dashboard-embedded mean.
+    expect(html).toContain('best-effort audit heuristic');
+    expect(html).toContain('absence of evidence');
+    expect(html).toContain('no dashboard association was observed');
+    expect(html).toContain('Only standalone agents are scored');
+  });
+
   it('shows an unreadable agent as "not assessed", never as 0', () => {
     const html = renderToStaticMarkup(
       createElement(PillarDetail, { pillar: geniePillar([notReadable]), config }),

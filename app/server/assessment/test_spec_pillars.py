@@ -388,6 +388,28 @@ class GenieAgentsGoldenTest(unittest.TestCase):
         self.assertEqual(out["gaps"], [])
         self.assertEqual(out["unavailable_reason"], "insufficient_permission")
 
+    def test_score_is_invariant_to_curation(self):
+        # The non-scored-curation guarantee (#24): flipping readability and changing the
+        # per-agent curation counts must leave the numeric score (and gaps) unchanged.
+        counts = _genie_counts(4, 2, users=6, questions=30, recency_days=10)
+        rich = [{"title": "A", "readable": True, "type": "standalone", "instructions": 99,
+                 "sample_questions": 99, "example_sqls": 99, "functions": 99, "benchmarks": 99, "tables": 99}]
+        degraded = [{"title": "A", "readable": False, "type": "standalone", "instructions": None,
+                     "sample_questions": None, "example_sqls": None, "functions": None,
+                     "benchmarks": None, "tables": None}]
+
+        def run_with(curation):
+            with patch.object(probes, "_genie_curation", AsyncMock(return_value=curation)):
+                return _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes(counts))
+
+        out_rich, out_degraded = run_with(rich), run_with(degraded)
+        self.assertEqual(out_rich["score"], out_degraded["score"])
+        self.assertEqual(out_rich["score"], 71.0)  # the usage-only score, unaffected by curation
+        self.assertEqual(out_rich["gaps"], out_degraded["gaps"])
+        # Curation still rides along in metrics for the UI, just never in the score.
+        self.assertEqual(out_rich["metrics"]["spaces"], rich)
+        self.assertEqual(out_degraded["metrics"]["spaces"], degraded)
+
 
 class GenieUsageBandsTest(unittest.TestCase):
     """The graded score is a deterministic sum of existence + real-usage bands, capped 0..100."""
@@ -427,6 +449,9 @@ class GenieClassificationTest(unittest.TestCase):
         except ImportError:  # pragma: no cover - requirements-dev.txt installs it
             self.skipTest("duckdb not installed")
         con = duckdb.connect()
+        # The spec SQL uses Databricks' get_json_object(json, '$.path'); map it to DuckDB's
+        # json_extract_string (identical JSONPath) so the shared SQL runs unchanged here.
+        con.execute("CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p)")
         con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
                     "request_params STRUCT(space_id VARCHAR, display_name VARCHAR), "
                     "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
@@ -459,6 +484,37 @@ class GenieClassificationTest(unittest.TestCase):
         self.assertEqual(row["questions_30d"], 2)     # fresh's two conversation messages
         self.assertEqual(row["distinct_users_30d"], 2)  # alice@example.com + bob@example.com
         self.assertEqual(row["dashboard_embedded"], 1)  # 'dash', counted separately
+
+    def test_classification_is_exact_match_not_substring(self):
+        # Regression (#24 review): the classifier parses the space_id out of the dashboard
+        # response JSON and matches on EXACT equality, so an id that is a substring of
+        # another id, or that appears incidentally in unrelated result text, is NOT
+        # mis-marked dashboard-embedded (which would silently drop it from the score).
+        try:
+            import duckdb
+        except ImportError:  # pragma: no cover - requirements-dev.txt installs it
+            self.skipTest("duckdb not installed")
+        con = duckdb.connect()
+        con.execute("CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p)")
+        con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
+                    "request_params STRUCT(space_id VARCHAR, display_name VARCHAR), "
+                    "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
+        con.execute(
+            "INSERT INTO audit VALUES "
+            # two standalone agents whose ids overlap: 'abc' is a substring of 'abcd'
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'abc', 'display_name': 'ABC'}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'abcd', 'display_name': 'ABCD'}, {'email': 'bob@example.com'}, {'result': NULL}, 1), "
+            # a dashboard-genie row whose parsed space_id is EXACTLY 'abc'; its result text
+            # also mentions 'abcd' as a substring, which must NOT classify 'abcd'.
+            "(current_date() - 1, 'aibiGenie', 'getDashboardGenie', {'space_id': 'wrap', 'display_name': NULL}, {'email': 'alice@example.com'}, {'result': '{\"space_id\":\"abc\",\"note\":\"linked from abcd dashboard\"}'}, 1)")
+        sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
+        sql = sql.replace("system.access.audit", "audit").rstrip(";")
+        cols = [d[0] for d in con.execute(sql).description]
+        row = dict(zip(cols, con.execute(sql).fetchone()))
+        # Only 'abc' is dashboard-embedded; 'abcd' (and the standalone 'wrap') stay scored.
+        self.assertEqual(row["dashboard_embedded"], 1)
+        self.assertEqual(row["total"], 2)  # abcd + wrap remain standalone; abc is excluded
+        self.assertEqual(row["active_30d"], 1)  # only abcd had a conversation in 30d
 
 
 class GenieAgentsParityTest(unittest.TestCase):
@@ -515,6 +571,49 @@ class GenieCurationTest(unittest.IsolatedAsyncioTestCase):
             spaces = await probes._genie_curation([{"space_id": "s1", "agent": "Nameless"}])
         self.assertEqual(len(spaces), 1)
         self.assertFalse(spaces[0]["readable"])
+
+    async def test_transient_error_degrades_to_not_assessed(self):
+        with patch.object(probes, "get_workspace_host", lambda: "https://ws"), \
+             patch.object(probes, "get_auth_headers", lambda force_sp=False: {"Authorization": "Bearer x"}), \
+             patch.object(probes, "_inspect_space", AsyncMock(return_value=("error", None))):
+            spaces = await probes._genie_curation([{"space_id": "s1", "agent": "Flaky"}])
+        self.assertFalse(spaces[0]["readable"])
+        self.assertIsNone(spaces[0]["instructions"])
+
+
+class GenieSerializedParseTest(unittest.TestCase):
+    """The serialized-space parser degrades on a missing/malformed payload (the real
+    graceful-degradation path, not a mocked happy-path _inspect_space)."""
+
+    def test_missing_serialized_space_is_not_readable(self):
+        status, data = probes._serialized_counts({"title": "No payload"}, "s1", "No payload")
+        self.assertEqual((status, data), ("forbidden", None))
+
+    def test_malformed_serialized_json_is_not_readable(self):
+        status, data = probes._serialized_counts({"serialized_space": "{not valid json"}, "s1", "Bad")
+        self.assertEqual((status, data), ("forbidden", None))
+
+    def test_empty_body_is_not_readable(self):
+        self.assertEqual(probes._serialized_counts({}, "s1", "x"), ("forbidden", None))
+
+    def test_serialized_space_as_json_string_is_parsed(self):
+        body = {"title": "Sales",
+                "serialized_space": '{"instructions": {"text_instructions": ["a", "b"], '
+                                    '"example_question_sqls": ["q"]}, "data_sources": {"tables": ["t1", "t2", "t3"]}}'}
+        status, counts = probes._serialized_counts(body, "s1", "fallback")
+        self.assertEqual(status, "ok")
+        self.assertEqual(counts["title"], "Sales")
+        self.assertEqual(counts["instructions"], 2)
+        self.assertEqual(counts["example_sqls"], 1)
+        self.assertEqual(counts["tables"], 3)
+        self.assertEqual(counts["benchmarks"], 0)  # absent path counts 0, not an error
+
+    def test_serialized_space_as_dict_is_parsed(self):
+        body = {"serialized_space": {"config": {"sample_questions": ["q1", "q2"]}}}
+        status, counts = probes._serialized_counts(body, "s1", "fallback")
+        self.assertEqual(status, "ok")
+        self.assertEqual(counts["title"], "fallback")  # no title in body → fall back to the passed title
+        self.assertEqual(counts["sample_questions"], 2)
 
 
 def _adoption_routes(users, queries):

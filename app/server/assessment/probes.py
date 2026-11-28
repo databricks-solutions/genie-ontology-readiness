@@ -1299,6 +1299,36 @@ def _count(serialized: dict, *path: str) -> int:
         return 0
 
 
+def _serialized_counts(data: dict, sid: str, title: str) -> tuple[str, dict | None]:
+    """Parse a genie-spaces GET body into curation counts (pure; no I/O, so the
+    missing/malformed-payload degradation is unit-testable).
+
+    Returns (status, data):
+      ("ok", {...counts})   — a serialized_space payload was present and parsed
+      ("forbidden", None)   — no usable serialized_space (missing/malformed → the
+                              serialized read is gated behind CAN_EDIT, treat as not readable)
+    """
+    ss = (data or {}).get("serialized_space")
+    if isinstance(ss, str):
+        try:
+            ss = json.loads(ss)
+        except Exception:
+            ss = None
+    # No serialized payload returned (e.g. insufficient access) — treat as forbidden.
+    if not isinstance(ss, dict):
+        return "forbidden", None
+
+    return "ok", {
+        "title": (data.get("title") if isinstance(data, dict) else None) or title or sid,
+        "instructions": _count(ss, "instructions", "text_instructions"),
+        "sample_questions": _count(ss, "config", "sample_questions"),
+        "example_sqls": _count(ss, "instructions", "example_question_sqls"),
+        "functions": _count(ss, "instructions", "sql_functions"),
+        "benchmarks": _count(ss, "benchmarks", "questions"),
+        "tables": _count(ss, "data_sources", "tables"),
+    }
+
+
 async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tuple[str, dict | None]:
     """Fetch one serialized space and count each curation dimension.
 
@@ -1321,25 +1351,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
     except Exception:
         return "error", None
 
-    ss = data.get("serialized_space")
-    if isinstance(ss, str):
-        try:
-            ss = json.loads(ss)
-        except Exception:
-            ss = None
-    # No serialized payload returned (e.g. insufficient access) — treat as forbidden.
-    if not isinstance(ss, dict):
-        return "forbidden", None
-
-    return "ok", {
-        "title": data.get("title") or title or sid,
-        "instructions": _count(ss, "instructions", "text_instructions"),
-        "sample_questions": _count(ss, "config", "sample_questions"),
-        "example_sqls": _count(ss, "instructions", "example_question_sqls"),
-        "functions": _count(ss, "instructions", "sql_functions"),
-        "benchmarks": _count(ss, "benchmarks", "questions"),
-        "tables": _count(ss, "data_sources", "tables"),
-    }
+    return _serialized_counts(data, sid, title)
 
 
 # Reading a space's curation (serialized_space) requires CAN_EDIT; listing/asking
@@ -1423,15 +1435,21 @@ async def _genie_audit_rows() -> list[dict]:
             "  GROUP BY request_params.space_id "
             "), "
             "dashboard_refs AS ( "
-            "  SELECT response.result AS result FROM system.access.audit "
+            "  SELECT get_json_object(response.result, '$.space_id') AS sid1, "
+            "         get_json_object(response.result, '$.genie_space_id') AS sid2 "
+            "  FROM system.access.audit "
             f"  WHERE lower(action_name) IN ({_DASH_IN}) AND response.result IS NOT NULL "
             f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
             f"    {wsf}"
+            "), "
+            "dashboard_space_ids AS ( "
+            "  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL "
+            "  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL "
             ") "
             "SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, "
             "       a.events AS events, a.questions AS questions, a.users AS users, a.active_30d AS active_30d, "
-            "       CASE WHEN EXISTS (SELECT 1 FROM dashboard_refs d "
-            "            WHERE d.result LIKE '%' || a.space_id || '%') THEN 1 ELSE 0 END AS dashboard_embedded"
+            "       CASE WHEN a.space_id IN (SELECT space_id FROM dashboard_space_ids) "
+            "            THEN 1 ELSE 0 END AS dashboard_embedded"
             + ws_select + " "
             "FROM ( "
             "  SELECT request_params.space_id AS space_id, "
@@ -1598,9 +1616,12 @@ async def probe_genie_agents() -> dict:
         "gap_ids": gap_ids,
         "note": (f"Scored from standalone Genie Agents in the in-scope workspaces' system.access.audit "
                  f"events over the last {_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie), graded on real "
-                 "conversation usage. Agent type (standalone vs AI/BI dashboard-embedded) is a best-effort "
-                 "audit heuristic. Per-agent curation (instructions, example SQL, benchmarks) is read "
-                 "where visible — it needs CAN_EDIT and only works for agents in this workspace, so it is "
+                 "conversation usage. Agent type is a best-effort audit heuristic: 'dashboard-embedded' "
+                 "is positively detected (the agent's space id is the exact space_id in an AI/BI "
+                 "dashboard-genie response), while 'standalone' means no dashboard association was "
+                 "observed in the audit window — absence of evidence, not a positively-confirmed "
+                 "standalone. Per-agent curation (instructions, example SQL, benchmarks) is read where "
+                 "visible — it needs CAN_EDIT and only works for agents in this workspace, so it is "
                  "labeled 'where visible' and never affects the score."),
         "metrics": {"genie_agents": total, "active_30d": active,
                     "distinct_users_30d": audit.get("distinct_users_30d"),

@@ -276,9 +276,13 @@ system-table access) — *not* the Genie REST API, which is permission/scope-gat
 and only reflects what one principal can see. The score is **graded on real
 conversation usage** of the **standalone** Genie-agent population. A space is
 classified **dashboard-embedded** (an AI/BI Dashboard agent) when its `space_id`
-appears in the `response.result` of a `getDashboardGenie`/`updateDashboardGenie`
-row; otherwise it is a **standalone** agent (an absence-of-evidence default — label
-it so, don't overstate it). Dashboard-embedded agents are classified out of the
+**exactly equals** the `space_id`/`genie_space_id` value parsed from the
+`response.result` JSON of a `getDashboardGenie`/`updateDashboardGenie` row (an exact
+match on the parsed id, never a substring — a substring match would mis-mark
+overlapping ids); otherwise it is a **standalone** agent (an absence-of-evidence
+default — i.e. no dashboard association was observed in the audit window, not a
+positively-confirmed standalone; label it so, don't overstate it).
+Dashboard-embedded agents are classified out of the
 scored population and counted separately so they don't skew the pillar. "Real usage"
 is measured from **conversation actions only** (`genieStartConversationMessage`,
 `createConversationMessage`, `genieCreateConversationMessage`), never raw events —
@@ -290,7 +294,7 @@ overstate usage.
 **Signals**
 
 ```sql
--- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id appears in the response.result of a getDashboardGenie/updateDashboardGenie row; otherwise STANDALONE (absence-of-evidence default). Real usage is measured from CONVERSATION actions only (not raw events, which overstate via polling): questions_30d, distinct_users_30d and active_30d are over the last 30 days.
+-- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id EXACTLY equals the space_id/genie_space_id value parsed from the response.result JSON of a getDashboardGenie/updateDashboardGenie row (exact match, not a substring); otherwise STANDALONE (absence-of-evidence default). Real usage is measured from CONVERSATION actions only (not raw events, which overstate via polling): questions_30d, distinct_users_30d and active_30d are over the last 30 days.
 WITH genie_events AS (
   SELECT request_params.space_id AS space_id, action_name, event_date,
          user_identity.email AS user_email
@@ -301,11 +305,16 @@ WITH genie_events AS (
     AND event_date >= current_date() - INTERVAL 90 DAYS
 ),
 dashboard_refs AS (
-  SELECT response.result AS result
+  SELECT get_json_object(response.result, '$.space_id') AS sid1,
+         get_json_object(response.result, '$.genie_space_id') AS sid2
   FROM system.access.audit
   WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
     AND response.result IS NOT NULL
     AND event_date >= current_date() - INTERVAL 90 DAYS
+),
+dashboard_space_ids AS (
+  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL
+  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL
 ),
 per_space AS (
   SELECT space_id,
@@ -318,8 +327,7 @@ per_space AS (
 ),
 classified AS (
   SELECT space_id, trashed, questions_30d, last_active_date,
-         CASE WHEN EXISTS (SELECT 1 FROM dashboard_refs d
-                           WHERE d.result LIKE '%' || space_id || '%')
+         CASE WHEN space_id IN (SELECT space_id FROM dashboard_space_ids)
               THEN 1 ELSE 0 END AS dashboard_embedded
   FROM per_space
 ),
@@ -388,15 +396,21 @@ WITH names AS (
   GROUP BY request_params.space_id
 ),
 dashboard_refs AS (
-  SELECT response.result AS result FROM system.access.audit
+  SELECT get_json_object(response.result, '$.space_id') AS sid1,
+         get_json_object(response.result, '$.genie_space_id') AS sid2
+  FROM system.access.audit
   WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
     AND response.result IS NOT NULL
     AND event_date >= current_date() - INTERVAL 90 DAYS
+),
+dashboard_space_ids AS (
+  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL
+  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL
 )
 SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, a.events AS events,
        a.questions AS questions, a.users AS users,
        CASE WHEN a.active_30d = 1 THEN 'Yes' ELSE 'No' END AS active_30d,
-       CASE WHEN EXISTS (SELECT 1 FROM dashboard_refs d WHERE d.result LIKE '%' || a.space_id || '%')
+       CASE WHEN a.space_id IN (SELECT space_id FROM dashboard_space_ids)
             THEN 'Dashboard-embedded' ELSE 'Standalone' END AS type
 FROM (
   SELECT request_params.space_id AS space_id, COUNT(*) AS events,

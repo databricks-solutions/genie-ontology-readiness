@@ -286,6 +286,18 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
           <LegacyBreakdown rows={pillar.metrics.legacy_by_schema as UcSchemaCount[]} />
         )}
 
+      {pillar.key === 'genie_agents' && (
+        <p className="flex items-start gap-1.5 text-[11px] text-ink-400 leading-snug">
+          <Info size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Agent type is a best-effort audit heuristic. <span className="font-medium text-ink-500">Dashboard-embedded</span> is
+            positively detected (the agent’s space id is the exact space_id in an AI/BI dashboard-genie response);{' '}
+            <span className="font-medium text-ink-500">Standalone</span> means no dashboard association was observed in the audit
+            window — absence of evidence, not a confirmed standalone. Only standalone agents are scored.
+          </span>
+        </p>
+      )}
+
       {pillar.key === 'genie_agents' &&
         Array.isArray(pillar.metrics?.spaces) &&
         (pillar.metrics.spaces as GenieSpaceCuration[]).length > 0 && (
