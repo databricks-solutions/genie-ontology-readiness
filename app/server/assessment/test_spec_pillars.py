@@ -481,8 +481,11 @@ class GenieClassificationTest(unittest.TestCase):
             # standalone, polling only: a recent genieGetSpace with no conversation. It EXISTS
             # (counted in total) but must not be active and must not drive recency.
             "(current_date() - 1, 'aibiGenie', 'genieGetSpace', {'space_id': 'poll', 'display_name': 'Poll'}, {'email': 'svc@example.com'}, {'result': NULL}, 1), "
-            # dashboard-embedded: conversation activity AND space_id seen in a dashboard-genie response
+            # dashboard-embedded via response.result: 'dash' is a standalone-looking conversation
+            # agent, but a dashboard-genie row embeds it, so it leaves the scored population.
             "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'dash', 'display_name': 'Dash'}, {'email': 'carol@example.com'}, {'result': NULL}, 1), "
+            # the dashboard-genie row itself: its OWN wrapper space_id 'wrap' is a dashboard
+            # construct (not a standalone agent), and its response.result embeds 'dash'.
             "(current_date() - 1, 'aibiGenie', 'getDashboardGenie', {'space_id': 'wrap', 'display_name': NULL}, {'email': 'carol@example.com'}, {'result': '{\"genie_space_id\":\"dash\"}'}, 1)")
         return con
 
@@ -492,19 +495,19 @@ class GenieClassificationTest(unittest.TestCase):
         sql = sql.replace("system.access.audit", "audit").rstrip(";")
         cols = [d[0] for d in con.execute(sql).description]
         row = dict(zip(cols, con.execute(sql).fetchone()))
-        # 'dash' is dashboard-embedded (space_id in a dashboard-genie response.result) so it
-        # leaves the standalone population; 'wrap' and 'poll' are standalone non-conversation agents.
-        self.assertEqual(row["total"], 4)             # fresh + stale + wrap + poll
+        # Standalone population is fresh + stale + poll. Both 'dash' (embedded via response.result)
+        # and 'wrap' (the dashboard-genie row's own wrapper space_id) are dashboard-embedded.
+        self.assertEqual(row["total"], 3)             # fresh + stale + poll
         self.assertEqual(row["active_30d"], 1)        # only fresh had a conversation in 30d
         self.assertEqual(row["questions_30d"], 2)     # fresh's two conversation messages
         self.assertEqual(row["distinct_users_30d"], 2)  # alice@example.com + bob@example.com
-        self.assertEqual(row["dashboard_embedded"], 1)  # 'dash', counted separately
+        self.assertEqual(row["dashboard_embedded"], 2)  # 'dash' (embedded) + 'wrap' (own wrapper id)
 
     def test_recency_and_active_ignore_polling_only_agents(self):
         # Regression (#24 isac review): recency and active come from conversation actions only.
-        # 'poll' (genieGetSpace at -1) and 'wrap' (getDashboardGenie at -1) are the most recent
-        # events overall, but recency must track the latest CONVERSATION — fresh at -3 — so a
-        # polling-only agent earns zero recency and is never active.
+        # 'poll' (genieGetSpace at -1) is the most recent event among standalone agents, but
+        # recency must track the latest CONVERSATION — fresh at -3 — so a polling-only agent
+        # earns zero recency and is never active.
         import datetime
         con = self._audit_table()
         sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
@@ -513,7 +516,7 @@ class GenieClassificationTest(unittest.TestCase):
         row = dict(zip(cols, con.execute(sql).fetchone()))
         self.assertEqual(row["last_active_date"], datetime.date.today() - datetime.timedelta(days=3))
         # 'poll' exists in the population but contributes no activity.
-        self.assertEqual(row["total"], 4)
+        self.assertEqual(row["total"], 3)
         self.assertEqual(row["active_30d"], 1)
 
     def test_classification_is_exact_match_not_substring(self):
@@ -542,10 +545,12 @@ class GenieClassificationTest(unittest.TestCase):
         sql = sql.replace("system.access.audit", "audit").rstrip(";")
         cols = [d[0] for d in con.execute(sql).description]
         row = dict(zip(cols, con.execute(sql).fetchone()))
-        # Only 'abc' is dashboard-embedded; 'abcd' (and the standalone 'wrap') stay scored.
-        self.assertEqual(row["dashboard_embedded"], 1)
-        self.assertEqual(row["total"], 2)  # abcd + wrap remain standalone; abc is excluded
-        self.assertEqual(row["active_30d"], 1)  # only abcd had a conversation in 30d
+        # 'abc' is embedded (exact $.space_id match) and 'wrap' is the dashboard-genie wrapper's
+        # own id — both dashboard-embedded. 'abcd' stays standalone: it is NOT matched despite
+        # appearing as a substring of 'abc' in the dashboard result and 'abc' in its own id.
+        self.assertEqual(row["dashboard_embedded"], 2)  # 'abc' (embedded) + 'wrap' (own wrapper id)
+        self.assertEqual(row["total"], 1)  # only 'abcd' remains standalone
+        self.assertEqual(row["active_30d"], 1)  # abcd had a conversation in 30d
 
     def test_updateDashboardGenie_and_duplicate_id_in_both_json_paths(self):
         # Classification recognizes updateDashboardGenie (not just getDashboardGenie), and an
@@ -561,22 +566,24 @@ class GenieClassificationTest(unittest.TestCase):
                     "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
         con.execute(
             "INSERT INTO audit VALUES "
+            # a plain standalone conversation agent (the only one that should be scored)
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'solo', 'display_name': 'Solo'}, {'email': 'carol@example.com'}, {'result': NULL}, 1), "
             # two conversation agents that a dashboard embeds
             "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'd1', 'display_name': 'D1'}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
             "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'd2', 'display_name': 'D2'}, {'email': 'bob@example.com'}, {'result': NULL}, 1), "
-            # d1 embedded via updateDashboardGenie, $.space_id only
+            # d1 embedded via updateDashboardGenie, $.space_id only (wrapper space_id 'w1')
             "(current_date() - 1, 'aibiGenie', 'updateDashboardGenie', {'space_id': 'w1', 'display_name': NULL}, {'email': 'alice@example.com'}, {'result': '{\"space_id\":\"d1\"}'}, 1), "
-            # d2 embedded via updateDashboardGenie, id duplicated across BOTH json paths
+            # d2 embedded via updateDashboardGenie, id duplicated across BOTH json paths (wrapper 'w2')
             "(current_date() - 1, 'aibiGenie', 'updateDashboardGenie', {'space_id': 'w2', 'display_name': NULL}, {'email': 'bob@example.com'}, {'result': '{\"space_id\":\"d2\",\"genie_space_id\":\"d2\"}'}, 1)")
         sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
         sql = sql.replace("system.access.audit", "audit").rstrip(";")
         cols = [d[0] for d in con.execute(sql).description]
         row = dict(zip(cols, con.execute(sql).fetchone()))
-        # d1 + d2 are embedded (counted once each, despite d2 appearing in both paths);
-        # the two wrapper spaces (w1, w2) remain standalone.
-        self.assertEqual(row["dashboard_embedded"], 2)
-        self.assertEqual(row["total"], 2)
-        self.assertEqual(row["active_30d"], 0)
+        # Embedded set = {d1, d2 (counted once despite appearing in both json paths), w1, w2
+        # (the updateDashboardGenie wrappers' own ids)} = 4. Only 'solo' is standalone.
+        self.assertEqual(row["dashboard_embedded"], 4)
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["active_30d"], 1)
 
 
 class GenieAgentsParityTest(unittest.TestCase):

@@ -275,11 +275,13 @@ Scored from the **audit system table** (workspace-wide, via the viewer's own
 system-table access) — *not* the Genie REST API, which is permission/scope-gated
 and only reflects what one principal can see. The score is **graded on real
 conversation usage** of the **standalone** Genie-agent population. A space is
-classified **dashboard-embedded** (an AI/BI Dashboard agent) when its `space_id`
-**exactly equals** the `space_id`/`genie_space_id` value parsed from the
-`response.result` JSON of a `getDashboardGenie`/`updateDashboardGenie` row (an exact
-match on the parsed id, never a substring — a substring match would mis-mark
-overlapping ids); otherwise it is a **standalone** agent (an absence-of-evidence
+classified **dashboard-embedded** (an AI/BI Dashboard agent) when its `space_id` is
+either the **own** `request_params.space_id` of a
+`getDashboardGenie`/`updateDashboardGenie` row (the dashboard-genie wrapper construct
+itself) or **exactly equals** the `space_id`/`genie_space_id` value parsed from such a
+row's `response.result` JSON (an exact match on the parsed id, never a substring — a
+substring match would mis-mark overlapping ids); otherwise it is a **standalone**
+agent (an absence-of-evidence
 default — i.e. no dashboard association was observed in the audit window, not a
 positively-confirmed standalone; label it so, don't overstate it).
 Dashboard-embedded agents are classified out of the
@@ -299,7 +301,7 @@ earns **no** recency, rather than being dropped from the count.
 **Signals**
 
 ```sql
--- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id EXACTLY equals the space_id/genie_space_id value parsed from the response.result JSON of a getDashboardGenie/updateDashboardGenie row (exact match, not a substring); otherwise STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents that EXIST (any aibiGenie event is evidence of existence), but every USAGE signal — active_30d, active-share, distinct_users_30d, questions_30d and recency (last_active_date) — is derived from CONVERSATION actions only (never raw events, which overstate via genieGetSpace polling and service/eval accounts). So an existing-but-never-conversed agent lowers active-share and earns no recency rather than being dropped. questions_30d/distinct_users_30d/active_30d are over the last 30 days; last_active_date is the most recent conversation over the full lookback.
+-- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id is either the OWN request_params.space_id of a getDashboardGenie/updateDashboardGenie row (the dashboard-genie wrapper construct itself) or EXACTLY equals the space_id/genie_space_id value parsed from such a row's response.result JSON (exact match, not a substring); otherwise STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents that EXIST (any aibiGenie event is evidence of existence), but every USAGE signal — active_30d, active-share, distinct_users_30d, questions_30d and recency (last_active_date) — is derived from CONVERSATION actions only (never raw events, which overstate via genieGetSpace polling and service/eval accounts). So an existing-but-never-conversed agent lowers active-share and earns no recency rather than being dropped. questions_30d/distinct_users_30d/active_30d are over the last 30 days; last_active_date is the most recent conversation over the full lookback.
 WITH genie_events AS (
   SELECT request_params.space_id AS space_id, action_name, event_date,
          user_identity.email AS user_email
@@ -310,15 +312,19 @@ WITH genie_events AS (
     AND event_date >= current_date() - INTERVAL 90 DAYS
 ),
 dashboard_refs AS (
-  SELECT get_json_object(response.result, '$.space_id') AS sid1,
+  -- own_sid: the dashboard-genie row's OWN wrapper space_id (itself a dashboard
+  -- construct, not a standalone agent). sid1/sid2: the EMBEDDED genie space id
+  -- parsed from response.result. All are dashboard-embedded.
+  SELECT request_params.space_id AS own_sid,
+         get_json_object(response.result, '$.space_id') AS sid1,
          get_json_object(response.result, '$.genie_space_id') AS sid2
   FROM system.access.audit
   WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
-    AND response.result IS NOT NULL
     AND event_date >= current_date() - INTERVAL 90 DAYS
 ),
 dashboard_space_ids AS (
-  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL
+  SELECT own_sid AS space_id FROM dashboard_refs WHERE own_sid IS NOT NULL
+  UNION SELECT sid1 FROM dashboard_refs WHERE sid1 IS NOT NULL
   UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL
 ),
 per_space AS (
@@ -353,7 +359,7 @@ SELECT
   (SELECT COUNT(*) FROM classified WHERE trashed = 0 AND dashboard_embedded = 1) AS dashboard_embedded;
 ```
 
-`recency_days` = days since `last_active_date` (the most recent standalone-agent event);
+`recency_days` = days since `last_active_date` (the most recent standalone-agent conversation);
 `active_share` = `active_30d / total` when `total > 0`.
 
 **Score:**
@@ -403,15 +409,18 @@ WITH names AS (
   GROUP BY request_params.space_id
 ),
 dashboard_refs AS (
-  SELECT get_json_object(response.result, '$.space_id') AS sid1,
+  -- own_sid: the dashboard-genie row's own wrapper space_id; sid1/sid2: the embedded
+  -- genie space id parsed from response.result. All are dashboard-embedded.
+  SELECT request_params.space_id AS own_sid,
+         get_json_object(response.result, '$.space_id') AS sid1,
          get_json_object(response.result, '$.genie_space_id') AS sid2
   FROM system.access.audit
   WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
-    AND response.result IS NOT NULL
     AND event_date >= current_date() - INTERVAL 90 DAYS
 ),
 dashboard_space_ids AS (
-  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL
+  SELECT own_sid AS space_id FROM dashboard_refs WHERE own_sid IS NOT NULL
+  UNION SELECT sid1 FROM dashboard_refs WHERE sid1 IS NOT NULL
   UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL
 )
 SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, a.events AS events,

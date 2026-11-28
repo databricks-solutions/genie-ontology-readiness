@@ -528,10 +528,11 @@ GENIE_AGENTS = _index({
             "comment": (
                 "Graded usage for STANDALONE Genie Agents, from the audit log over the last "
                 f"{GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie), minus trashed spaces. A space is "
-                "DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id EXACTLY equals "
-                "the space_id/genie_space_id value parsed from the response.result JSON of a "
-                "getDashboardGenie/updateDashboardGenie row (exact match, not a substring); otherwise "
-                "STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents "
+                "DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id is either the "
+                "OWN request_params.space_id of a getDashboardGenie/updateDashboardGenie row (the "
+                "dashboard-genie wrapper construct itself) or EXACTLY equals the space_id/genie_space_id "
+                "value parsed from such a row's response.result JSON (exact match, not a substring); "
+                "otherwise STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents "
                 "that EXIST (any aibiGenie event is evidence of existence), but every USAGE signal — "
                 "active_30d, active-share, distinct_users_30d, questions_30d and recency "
                 "(last_active_date) — is derived from CONVERSATION actions only (never raw events, "
@@ -553,16 +554,20 @@ GENIE_AGENTS = _index({
                 "{workspace_filter}\n"
                 "),\n"
                 "dashboard_refs AS (\n"
-                "  SELECT get_json_object(response.result, '$.space_id') AS sid1,\n"
+                "  -- own_sid: the dashboard-genie row's OWN wrapper space_id (itself a dashboard\n"
+                "  -- construct, not a standalone agent). sid1/sid2: the EMBEDDED genie space id\n"
+                "  -- parsed from response.result. All are dashboard-embedded.\n"
+                "  SELECT request_params.space_id AS own_sid,\n"
+                "         get_json_object(response.result, '$.space_id') AS sid1,\n"
                 "         get_json_object(response.result, '$.genie_space_id') AS sid2\n"
                 "  FROM system.access.audit\n"
                 f"  WHERE lower(action_name) IN ({_GENIE_DASH_SQL})\n"
-                "    AND response.result IS NOT NULL\n"
                 f"    AND event_date >= current_date() - INTERVAL {GENIE_AUDIT_LOOKBACK_DAYS} DAYS"
                 "{workspace_filter}\n"
                 "),\n"
                 "dashboard_space_ids AS (\n"
-                "  SELECT sid1 AS space_id FROM dashboard_refs WHERE sid1 IS NOT NULL\n"
+                "  SELECT own_sid AS space_id FROM dashboard_refs WHERE own_sid IS NOT NULL\n"
+                "  UNION SELECT sid1 FROM dashboard_refs WHERE sid1 IS NOT NULL\n"
                 "  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL\n"
                 "),\n"
                 "per_space AS (\n"
@@ -603,7 +608,7 @@ GENIE_AGENTS = _index({
         },
     ],
     "derived": [
-        "`recency_days` = days since `last_active_date` (the most recent standalone-agent event);",
+        "`recency_days` = days since `last_active_date` (the most recent standalone-agent conversation);",
         "`active_share` = `active_30d / total` when `total > 0`.",
     ],
     "score": [
