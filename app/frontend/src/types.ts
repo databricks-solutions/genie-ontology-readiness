@@ -388,14 +388,21 @@ export interface ChatMessage {
   content: string;
 }
 
+// Best-effort per-agent curation (#24). Reading an agent's curation detail needs
+// CAN_EDIT and only works for agents co-located in this workspace, so each row is
+// labeled "where visible": `readable: false` means the serialized space couldn't be
+// fetched (other workspace / no CAN_EDIT / 403 / not-found) and the counts are null —
+// a "not assessed" state that must NEVER be shown as 0. Curation never affects the score.
 export interface GenieSpaceCuration {
   title: string;
-  instructions: number;
-  sample_questions: number;
-  example_sqls: number;
-  functions: number;
-  benchmarks: number;
-  tables: number;
+  readable: boolean;
+  type?: 'standalone' | 'dashboard';
+  instructions: number | null;
+  sample_questions: number | null;
+  example_sqls: number | null;
+  functions: number | null;
+  benchmarks: number | null;
+  tables: number | null;
 }
 
 export interface GenieSpace {

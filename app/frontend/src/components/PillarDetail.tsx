@@ -75,7 +75,8 @@ function LegacyBreakdown({ rows }: { rows: UcSchemaCount[] }) {
   );
 }
 
-const GENIE_COLS: { key: keyof Omit<GenieSpaceCuration, 'title'>; label: string }[] = [
+type GenieCountKey = 'instructions' | 'sample_questions' | 'example_sqls' | 'functions' | 'benchmarks' | 'tables';
+const GENIE_COLS: { key: GenieCountKey; label: string }[] = [
   { key: 'instructions', label: 'Instructions' },
   { key: 'sample_questions', label: 'Sample Q' },
   { key: 'example_sqls', label: 'Example SQL' },
@@ -84,10 +85,16 @@ const GENIE_COLS: { key: keyof Omit<GenieSpaceCuration, 'title'>; label: string 
   { key: 'tables', label: 'Tables' },
 ];
 
+// Per-agent curation, read "where visible": reading an agent's curation detail needs
+// CAN_EDIT and only works for agents in this workspace, so a row that couldn't be read
+// (`readable === false`) shows "not assessed", never 0 (#24). Curation never affects the score.
 function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
+  const anyNotReadable = spaces.some((sp) => !sp.readable);
   return (
     <div>
-      <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-400 mb-2">Per-space curation</h4>
+      <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-400 mb-2">
+        Per-agent curation <span className="font-normal normal-case tracking-normal text-ink-400">(where visible · not scored)</span>
+      </h4>
       <div className="overflow-x-auto rounded-md border border-gray-200">
         <table className="w-full text-sm">
           <thead>
@@ -102,19 +109,36 @@ function GenieSpacesTable({ spaces }: { spaces: GenieSpaceCuration[] }) {
             {spaces.map((sp, i) => (
               <tr key={i} className="border-t border-gray-100">
                 <td className="px-3 py-2 text-ink-800 max-w-[260px] truncate" title={sp.title}>{sp.title}</td>
-                {GENIE_COLS.map((c) => {
-                  const v = sp[c.key];
-                  return (
-                    <td key={c.key} className="px-3 py-2 text-center tabular-nums">
-                      {v > 0 ? <span className="text-emerald-700 font-medium">{v}</span> : <span className="text-ink-300">—</span>}
-                    </td>
-                  );
-                })}
+                {!sp.readable ? (
+                  <td colSpan={GENIE_COLS.length} className="px-3 py-2 text-center text-xs text-ink-400 italic">
+                    <span className="inline-flex items-center gap-1"><Lock size={12} /> not assessed (needs CAN_EDIT in this workspace)</span>
+                  </td>
+                ) : (
+                  GENIE_COLS.map((c) => {
+                    const v = sp[c.key];
+                    return (
+                      <td key={c.key} className="px-3 py-2 text-center tabular-nums">
+                        {typeof v === 'number' && v > 0 ? (
+                          <span className="text-emerald-700 font-medium">{v}</span>
+                        ) : (
+                          <span className="text-ink-300">—</span>
+                        )}
+                      </td>
+                    );
+                  })
+                )}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {anyNotReadable && (
+        <p className="mt-1.5 text-[11px] text-ink-400 leading-snug">
+          Agents marked “not assessed” couldn’t be read for curation — reading curation detail requires CAN_EDIT and
+          only works for agents in this workspace. This is a visibility limit, not a sign of poor curation, and it
+          never affects the score.
+        </p>
+      )}
     </div>
   );
 }
@@ -261,6 +285,19 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
         (pillar.metrics.legacy_by_schema as UcSchemaCount[]).length > 0 && (
           <LegacyBreakdown rows={pillar.metrics.legacy_by_schema as UcSchemaCount[]} />
         )}
+
+      {pillar.key === 'genie_agents' && (
+        <p className="flex items-start gap-1.5 text-[11px] text-ink-400 leading-snug">
+          <Info size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Agent type is a best-effort audit heuristic. <span className="font-medium text-ink-500">Dashboard-embedded</span> is
+            positively detected — the agent is an AI/BI dashboard-genie action’s own space, or its exact space id appears in that
+            action’s response;{' '}
+            <span className="font-medium text-ink-500">Standalone</span> means no dashboard association was observed in the audit
+            window — absence of evidence, not a confirmed standalone. Only standalone agents are scored.
+          </span>
+        </p>
+      )}
 
       {pillar.key === 'genie_agents' &&
         Array.isArray(pillar.metrics?.spaces) &&

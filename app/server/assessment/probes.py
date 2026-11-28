@@ -28,6 +28,7 @@ see ``prime_request_sources``.
 
 import asyncio
 import contextvars
+import datetime
 import functools
 import json
 import logging
@@ -46,10 +47,10 @@ from server.signal_spec import (
     GENIE_AGENTS as GENIE_SPEC,
     GENIE_AUDIT_LOOKBACK_DAYS,
     GENIE_ACTIVE_WINDOW_DAYS,
-    GENIE_TOTAL_POINTS,
-    GENIE_ACTIVE_POINTS,
-    GENIE_SHARE_POINTS,
-    GENIE_ACTIVE_SHARE,
+    GENIE_NAME_LOOKBACK_DAYS,
+    GENIE_CONVERSATION_ACTIONS,
+    GENIE_DASHBOARD_ACTIONS,
+    genie_usage_score,
     ADOPTION as ADOPTION_SPEC,
     ADOPTION_QUERY_POINTS,
     ADOPTION_WINDOW_DAYS,
@@ -143,7 +144,7 @@ def _reason_for(exc: Exception) -> str:
 
 
 # Column keys that the drill-down modal offers as slice-by filters.
-_DIMENSION_KEYS = ("workspace", "catalog", "schema", "agent")
+_DIMENSION_KEYS = ("workspace", "catalog", "schema", "agent", "type")
 
 
 def _drill(title: str, columns: list[dict], rows: list[dict], total_rows: int | None = None) -> dict | None:
@@ -1251,20 +1252,40 @@ async def probe_metrics() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5. Genie Agents (REST) — deep curation assessment
+# 5. Genie Agents (graded usage from the audit log + best-effort curation via REST)
 # ---------------------------------------------------------------------------
 _MAX_INSPECT = 30  # cap how many spaces we deep-inspect to bound latency
 _GENIE_AUDIT_LOOKBACK_DAYS = GENIE_AUDIT_LOOKBACK_DAYS  # the spec's window (its SQL and gap text use it too)
-# A space's display_name only appears on create/update audit events, not on the
-# query/conversation events that drive the 30-day activity count. Resolve names
-# over a wider window so an actively-queried but not-recently-edited space still
-# shows a readable name (falling back to its space id when none is in the window).
-_GENIE_NAME_LOOKBACK_DAYS = 90
 # Poll budget for the audit-log scans (system.access.audit over the lookback). On a
 # busy, large account the 90-day scan can run well past the 180 s default, more so
 # while other pillars load the same warehouse. Background runs (#128) aren't bound
 # by the Apps proxy's stream cut, so give these queries room; the run cap still applies.
 _GENIE_AUDIT_POLL_SECONDS = 600
+
+# Lowercased, quoted SQL IN-lists for the per-agent drill-down (the spec's
+# audit_counts query builds its own; these keep the drill-down in lockstep).
+_CONV_IN = ", ".join("'" + a.lower().replace("'", "''") + "'" for a in GENIE_CONVERSATION_ACTIONS)
+_DASH_IN = ", ".join("'" + a.lower().replace("'", "''") + "'" for a in GENIE_DASHBOARD_ACTIONS)
+
+
+def _parse_date(value):
+    """A ``datetime.date`` from a date/datetime or an ISO ``YYYY-MM-DD`` string; None if unparseable."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    try:
+        return datetime.date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def _recency_days(value):
+    """Whole days since ``value`` (clamped at 0), or None when there's no date."""
+    d = _parse_date(value)
+    return max(0, (datetime.date.today() - d).days) if d else None
 
 
 def _count(serialized: dict, *path: str) -> int:
@@ -1276,6 +1297,36 @@ def _count(serialized: dict, *path: str) -> int:
         return len(node) if isinstance(node, list) else 0
     except (KeyError, TypeError):
         return 0
+
+
+def _serialized_counts(data: dict, sid: str, title: str) -> tuple[str, dict | None]:
+    """Parse a genie-spaces GET body into curation counts (pure; no I/O, so the
+    missing/malformed-payload degradation is unit-testable).
+
+    Returns (status, data):
+      ("ok", {...counts})   — a serialized_space payload was present and parsed
+      ("forbidden", None)   — no usable serialized_space (missing/malformed → the
+                              serialized read is gated behind CAN_EDIT, treat as not readable)
+    """
+    ss = (data or {}).get("serialized_space")
+    if isinstance(ss, str):
+        try:
+            ss = json.loads(ss)
+        except Exception:
+            ss = None
+    # No serialized payload returned (e.g. insufficient access) — treat as forbidden.
+    if not isinstance(ss, dict):
+        return "forbidden", None
+
+    return "ok", {
+        "title": (data.get("title") if isinstance(data, dict) else None) or title or sid,
+        "instructions": _count(ss, "instructions", "text_instructions"),
+        "sample_questions": _count(ss, "config", "sample_questions"),
+        "example_sqls": _count(ss, "instructions", "example_question_sqls"),
+        "functions": _count(ss, "instructions", "sql_functions"),
+        "benchmarks": _count(ss, "benchmarks", "questions"),
+        "tables": _count(ss, "data_sources", "tables"),
+    }
 
 
 async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tuple[str, dict | None]:
@@ -1300,25 +1351,7 @@ async def _inspect_space(host: str, headers: dict, sid: str, title: str) -> tupl
     except Exception:
         return "error", None
 
-    ss = data.get("serialized_space")
-    if isinstance(ss, str):
-        try:
-            ss = json.loads(ss)
-        except Exception:
-            ss = None
-    # No serialized payload returned (e.g. insufficient access) — treat as forbidden.
-    if not isinstance(ss, dict):
-        return "forbidden", None
-
-    return "ok", {
-        "title": data.get("title") or title or sid,
-        "instructions": _count(ss, "instructions", "text_instructions"),
-        "sample_questions": _count(ss, "config", "sample_questions"),
-        "example_sqls": _count(ss, "instructions", "example_question_sqls"),
-        "functions": _count(ss, "instructions", "sql_functions"),
-        "benchmarks": _count(ss, "benchmarks", "questions"),
-        "tables": _count(ss, "data_sources", "tables"),
-    }
+    return _serialized_counts(data, sid, title)
 
 
 # Reading a space's curation (serialized_space) requires CAN_EDIT; listing/asking
@@ -1330,20 +1363,23 @@ _EDIT_HINT = ("Reading an agent's curation detail requires CAN_EDIT on that agen
 
 
 async def _genie_audit_counts() -> dict:
-    """Best-effort Genie usage from the audit system table.
+    """Graded Genie usage for STANDALONE agents from the audit system table.
 
     system.access.audit records Genie activity under service_name='aibiGenie'
-    with the space id in request_params.space_id. The count of Genie Agents is
-    the number of distinct space_ids, excluding any space that has ever been
-    trashed (a `trashSpace` action; there is no deleteSpace — see the docs at
-    https://docs.databricks.com/aws/en/ai-bi/admin/audit).
+    with the space id in request_params.space_id. A space is counted when it has
+    an aibiGenie event in the lookback window and was never trashed (a `trashSpace`
+    action; there is no deleteSpace — https://docs.databricks.com/aws/en/ai-bi/admin/audit),
+    and is classified DASHBOARD-EMBEDDED (counted separately, not scored) when its
+    space_id appears in the response.result of a getDashboardGenie/updateDashboardGenie
+    row; otherwise STANDALONE.
 
-    Single bounded scan: prune the account-level audit table to the workspaces in
-    scope (the runtime filter) and the full lookback window, then group by space_id and
-    derive per-space "trashed" and "active in last 30 days" flags in one pass. The
-    scan has its own poll budget (_GENIE_AUDIT_POLL_SECONDS); a background run isn't
-    bound by the Apps proxy's stream cut (#128).
-    Returns total / active_30d (each None if the audit table isn't readable).
+    Real usage is measured from CONVERSATION actions only (raw events overstate via
+    polling, #24): questions_30d, distinct_users_30d and active_30d over 30 days.
+    The single bounded scan has its own poll budget (_GENIE_AUDIT_POLL_SECONDS); a
+    background run isn't bound by the Apps proxy's stream cut (#128).
+
+    Returns the aggregate usage fields (each count None if the audit table isn't
+    readable), plus last_active_date and the derived recency_days.
     """
     try:
         workspace_filter, parameters = workspace_predicate()
@@ -1354,9 +1390,15 @@ async def _genie_audit_counts() -> dict:
             poll_seconds=_GENIE_AUDIT_POLL_SECONDS,
         )
         row = rows[0] if rows else {}
+        last_active = row.get("last_active_date")
         return {
             "total": int(row.get("total") or 0),
             "active_30d": int(row.get("active_30d") or 0),
+            "questions_30d": int(row.get("questions_30d") or 0),
+            "distinct_users_30d": int(row.get("distinct_users_30d") or 0),
+            "dashboard_embedded": int(row.get("dashboard_embedded") or 0),
+            "last_active_date": _parse_date(last_active).isoformat() if _parse_date(last_active) else None,
+            "recency_days": _recency_days(last_active),
         }
     except StatementTimeout:
         logger.warning("Genie audit scan timed out after %ss", _GENIE_AUDIT_POLL_SECONDS)
@@ -1367,35 +1409,60 @@ async def _genie_audit_counts() -> dict:
 
 async def _genie_audit_rows() -> list[dict]:
     """Best-effort per-agent drill-down: the top Genie Agents (by audit events) in
-    scope, with event volume, activity, and (when >1 workspace is selected) which
-    workspace they live in. Bounded so it can't blow the streaming timeout."""
+    scope, each with its type (standalone vs dashboard-embedded), 30-day conversation
+    questions / distinct users / active flag, and (when >1 workspace is selected)
+    which workspace they live in. Bounded so it can't blow the streaming timeout."""
     try:
         wsf, wparams = workspace_predicate()  # applied inside the inner audit scans (unqualified column)
         multi = is_multi_workspace()
         ws_select = ", w.workspace_name AS workspace, a.workspace_id AS workspace_id" if multi else ""
         ws_join = (" LEFT JOIN system.access.workspaces_latest w "
                    "ON CAST(a.workspace_id AS STRING) = CAST(w.workspace_id AS STRING)") if multi else ""
+        conv_30d = (f"lower(action_name) IN ({_CONV_IN}) "
+                    f"AND event_date >= current_date() - INTERVAL {GENIE_ACTIVE_WINDOW_DAYS} DAYS")
         rows = await execute_sql(
             # names: latest display_name per space over the wider name window; the
-            # activity subquery (a) drives event volume / recency over the 30d window.
+            # activity subquery (a) drives event volume / usage over the windows;
+            # dashboard_refs drives the standalone-vs-dashboard classification.
             "WITH names AS ( "
             "  SELECT request_params.space_id AS space_id, "
             "         max_by(request_params.display_name, event_time) AS space_name "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
             "    AND request_params.display_name IS NOT NULL "
-            f"    AND event_date >= current_date() - INTERVAL {_GENIE_NAME_LOOKBACK_DAYS} DAYS "
+            f"    AND event_date >= current_date() - INTERVAL {GENIE_NAME_LOOKBACK_DAYS} DAYS "
             f"    {wsf}"
             "  GROUP BY request_params.space_id "
+            "), "
+            "dashboard_refs AS ( "
+            # own_sid: the dashboard-genie row's own wrapper space_id; sid1/sid2: the embedded
+            # genie space id parsed from response.result. All are dashboard-embedded.
+            "  SELECT request_params.space_id AS own_sid, "
+            "         get_json_object(response.result, '$.space_id') AS sid1, "
+            "         get_json_object(response.result, '$.genie_space_id') AS sid2 "
+            "  FROM system.access.audit "
+            f"  WHERE lower(action_name) IN ({_DASH_IN}) "
+            f"    AND event_date >= current_date() - INTERVAL {_GENIE_AUDIT_LOOKBACK_DAYS} DAYS "
+            f"    {wsf}"
+            "), "
+            "dashboard_space_ids AS ( "
+            "  SELECT own_sid AS space_id FROM dashboard_refs WHERE own_sid IS NOT NULL "
+            "  UNION SELECT sid1 FROM dashboard_refs WHERE sid1 IS NOT NULL "
+            "  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL "
             ") "
             "SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, "
-            "       a.events AS events, a.active_30d AS active_30d" + ws_select + " "
+            "       a.events AS events, a.questions AS questions, a.users AS users, a.active_30d AS active_30d, "
+            "       CASE WHEN a.space_id IN (SELECT space_id FROM dashboard_space_ids) "
+            "            THEN 1 ELSE 0 END AS dashboard_embedded"
+            + ws_select + " "
             "FROM ( "
             "  SELECT request_params.space_id AS space_id, "
             + ("any_value(workspace_id) AS workspace_id, " if multi else "") +
             "         COUNT(*) AS events, "
+            f"         SUM(CASE WHEN {conv_30d} THEN 1 ELSE 0 END) AS questions, "
+            f"         COUNT(DISTINCT CASE WHEN {conv_30d} THEN user_identity.email END) AS users, "
             "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed, "
-            f"         MAX(CASE WHEN event_date >= current_date() - INTERVAL {GENIE_ACTIVE_WINDOW_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d "
+            f"         MAX(CASE WHEN {conv_30d} THEN 1 ELSE 0 END) AS active_30d "
             "  FROM system.access.audit "
             "  WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL "
             "    AND request_params.space_id <> 'new' "
@@ -1409,7 +1476,11 @@ async def _genie_audit_rows() -> list[dict]:
         )
         out = []
         for r in rows:
+            dash = int(r.get("dashboard_embedded") or 0)
             row = {"agent": r.get("agent"), "space_id": r.get("space_id"),
+                   "type": "Dashboard-embedded" if dash else "Standalone",
+                   "questions": int(r.get("questions") or 0),
+                   "users": int(r.get("users") or 0),
                    "events": int(r.get("events") or 0),
                    "active_30d": "Yes" if int(r.get("active_30d") or 0) else "No"}
             if multi:
@@ -1421,26 +1492,91 @@ async def _genie_audit_rows() -> list[dict]:
         return []
 
 
+def _curation_not_readable(title: str) -> dict:
+    """A clear 'not readable / not assessed' curation row — null counts, NEVER 0 —
+    for a standalone agent whose serialized space the app can't fetch (#24)."""
+    return {"title": title, "readable": False, "type": "standalone",
+            "instructions": None, "sample_questions": None, "example_sqls": None,
+            "functions": None, "benchmarks": None, "tables": None}
+
+
+async def _genie_curation(standalone_rows: list[dict]) -> list[dict]:
+    """Best-effort per-agent curation counts for STANDALONE agents, read from each
+    agent's serialized space (Databricks gates that read behind CAN_EDIT, and it only
+    works for agents co-located in this workspace). This is curation QUALITY context
+    only — it NEVER affects the numeric score. Where the serialized space can't be
+    fetched (other workspace / no CAN_EDIT / 403 / not-found) the agent degrades to a
+    clear 'not readable' row with null counts, never 0/absent, so a partial read
+    ('where visible') isn't mistaken for poor curation. Bounded by _MAX_INSPECT."""
+    if not standalone_rows:
+        return []
+    try:
+        host = get_workspace_host()
+        headers = get_auth_headers(force_sp=True)  # Genie REST isn't covered by the OBO sql scope
+    except Exception:
+        host, headers = "", None
+    out: list[dict] = []
+    for r in standalone_rows[:_MAX_INSPECT]:
+        sid = r.get("space_id")
+        title = r.get("agent") or sid or "(unknown agent)"
+        if not host or not headers or not sid:
+            out.append(_curation_not_readable(title))
+            continue
+        try:
+            status, data = await _inspect_space(host, headers, sid, title)
+        except Exception:
+            status, data = "error", None
+        if status == "ok" and data:
+            out.append({
+                "title": data["title"], "readable": True, "type": "standalone",
+                "instructions": data["instructions"],
+                "sample_questions": data["sample_questions"],
+                "example_sqls": data["example_sqls"],
+                "functions": data["functions"],
+                "benchmarks": data["benchmarks"],
+                "tables": data["tables"],
+            })
+        else:
+            out.append(_curation_not_readable(title))
+    return out
+
+
 def _genie_audit_signals(audit: dict) -> list:
     sig = []
     label = GENIE_SPEC["signal_labels"]
     if audit.get("total") is not None:
         sig.append({"label": label["total"], "value": audit["total"],
-                    "detail": f"Distinct agents observed in this workspace's audit log ({_GENIE_AUDIT_LOOKBACK_DAYS}d)"})
+                    "detail": f"Standalone Genie Agents in the audit log ({_GENIE_AUDIT_LOOKBACK_DAYS}d); "
+                              "dashboard-embedded agents are excluded"})
     if audit.get("active_30d") is not None:
         sig.append({"label": label["active_30d"], "value": audit["active_30d"],
-                    "detail": f"Distinct agents with activity in the last {GENIE_ACTIVE_WINDOW_DAYS} days — audit log"})
+                    "detail": f"Standalone agents with a conversation in the last {GENIE_ACTIVE_WINDOW_DAYS} days"})
+    if audit.get("distinct_users_30d") is not None:
+        sig.append({"label": label["distinct_users_30d"], "value": audit["distinct_users_30d"],
+                    "detail": f"Distinct users who asked a question across standalone agents "
+                              f"({GENIE_ACTIVE_WINDOW_DAYS}d)"})
+    if audit.get("questions_30d") is not None:
+        sig.append({"label": label["questions_30d"], "value": audit["questions_30d"],
+                    "detail": f"Conversation questions across standalone agents ({GENIE_ACTIVE_WINDOW_DAYS}d)"})
+    if audit.get("dashboard_embedded"):
+        sig.append({"label": label["dashboard_embedded"], "value": audit["dashboard_embedded"],
+                    "detail": "AI/BI Dashboard agents (space_id seen in a dashboard-genie response) — "
+                              "counted separately, not scored"})
     return sig
 
 
 @_with_gap_ids
 async def probe_genie_agents() -> dict:
-    """Count Genie Agents from the audit log ONLY (system.access.audit / aibiGenie).
+    """Score STANDALONE Genie Agents from the audit log (system.access.audit / aibiGenie),
+    graded on real conversation usage (#24).
 
-    We deliberately do not use the Genie REST API "spaces visible to the app": it is
-    permission- and scope-gated (on-behalf-of-user tokens lack the genie scope), and
-    it reflects only what one principal can see. The audit log gives a workspace-wide,
-    existing-spaces count via the viewer's own system-table access.
+    We deliberately do not use the Genie REST API "spaces visible to the app" for the
+    count: it is permission- and scope-gated (on-behalf-of-user tokens lack the genie
+    scope) and reflects only what one principal can see. The audit log gives a workspace-
+    wide view via the viewer's own system-table access. Agent type (standalone vs AI/BI
+    dashboard-embedded) is a best-effort audit heuristic, and per-agent curation is a
+    best-effort REST read layered on top — neither the type split's dashboard population
+    nor the curation counts change the numeric score.
     """
     audit = await _genie_audit_counts()
     total, active = audit.get("total"), audit.get("active_30d")
@@ -1453,22 +1589,19 @@ async def probe_genie_agents() -> dict:
         return _empty("Genie usage can't be read — the assessing identity needs SELECT on system.access.audit.",
                       reason="insufficient_permission")
     total, active = total or 0, active or 0
-    drill_rows = await _genie_audit_rows()
-    drill_cols = [{"key": "agent", "label": "Genie Space"},
+    raw = await _genie_audit_rows()
+    standalone_rows = [r for r in raw if r.get("type") == "Standalone"]
+    drill_cols = [{"key": "agent", "label": "Genie Agent"},
                   {"key": "space_id", "label": "Space id"},
-                  {"key": "events", "label": "Audit events"},
+                  {"key": "type", "label": "Type"},
+                  {"key": "questions", "label": "Questions 30d"},
+                  {"key": "users", "label": "Users 30d"},
                   {"key": "active_30d", "label": "Active 30d"}]
     if is_multi_workspace():
-        drill_cols.insert(2, {"key": "workspace", "label": "Workspace"})
+        drill_cols.insert(3, {"key": "workspace", "label": "Workspace"})
 
-    score = 0.0
-    if total > 0:
-        score += GENIE_TOTAL_POINTS
-    if active > 0:
-        score += GENIE_ACTIVE_POINTS
-    if total > 0 and active / total >= GENIE_ACTIVE_SHARE:
-        score += GENIE_SHARE_POINTS
-    score = min(score, 100.0)
+    score = genie_usage_score(total, active, audit.get("distinct_users_30d"),
+                              audit.get("questions_30d"), audit.get("recency_days"))
 
     gaps: list[str] = []
     gap_ids: list[str] = []
@@ -1477,18 +1610,29 @@ async def probe_genie_agents() -> dict:
     elif active == 0:
         _spec_gap(GENIE_SPEC, "no_active_genie_agents", gaps, gap_ids, total=total)
 
+    spaces = await _genie_curation(standalone_rows)
+
     return {
         "available": True,
         "score": round(score, 1),
         "signals": _genie_audit_signals(audit),
         "gaps": gaps,
         "gap_ids": gap_ids,
-        "note": f"Counted from the in-scope workspaces' system.access.audit events over the last "
-                f"{_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie). Curation quality — instructions, "
-                "example/verified SQL, benchmarks — isn't visible in the audit log; use the "
-                "Genie Agent Quality Workshop accelerator to assess and lift it.",
-        "metrics": {"genie_agents": total, "active_30d": active, "genie_audit": audit},
-        "drill_down": _drill("Genie Agents by audit activity", drill_cols, drill_rows),
+        "note": (f"Scored from standalone Genie Agents in the in-scope workspaces' system.access.audit "
+                 f"events over the last {_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie), graded on real "
+                 "conversation usage. Agent type is a best-effort audit heuristic: 'dashboard-embedded' "
+                 "is positively detected — the agent is an AI/BI dashboard-genie action's own space, or "
+                 "its exact space id appears in that action's response — while 'standalone' means no "
+                 "dashboard association was observed in the audit window, absence of evidence, not a "
+                 "positively-confirmed standalone. Per-agent curation (instructions, example SQL, benchmarks) is read where "
+                 "visible — it needs CAN_EDIT and only works for agents in this workspace, so it is "
+                 "labeled 'where visible' and never affects the score."),
+        "metrics": {"genie_agents": total, "active_30d": active,
+                    "distinct_users_30d": audit.get("distinct_users_30d"),
+                    "questions_30d": audit.get("questions_30d"),
+                    "dashboard_embedded": audit.get("dashboard_embedded"),
+                    "genie_audit": audit, "spaces": spaces},
+        "drill_down": _drill("Genie Agents by audit activity", drill_cols, raw),
     }
 
 

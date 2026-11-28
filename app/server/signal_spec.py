@@ -429,17 +429,96 @@ METRICS = _index({
 })
 
 # ---------------------------------------------------------------------------
-# 5. Genie Agents (counted from the audit log)
+# 5. Genie Agents (graded real-usage score from the audit log)
 # ---------------------------------------------------------------------------
-# Total agents: every space with audit events over this full lookback (not trashed).
+# Existence: every space with aibiGenie audit events over this full lookback (not
+# trashed). active_30d / questions_30d / distinct_users_30d are measured over the
+# shorter 30-day window; a stale agent is counted but is not active (#120).
 GENIE_AUDIT_LOOKBACK_DAYS = 90
-# Active agents: those with an event in this shorter window. A stale agent is counted in
-# the total but is not active (#120).
 GENIE_ACTIVE_WINDOW_DAYS = 30
-GENIE_TOTAL_POINTS = 40
-GENIE_ACTIVE_POINTS = 40
-GENIE_SHARE_POINTS = 20
-GENIE_ACTIVE_SHARE = 0.3
+# Resolve each space's display_name over a wider window (names only appear on
+# create/update events, not on query/conversation events that drive 30-day usage).
+GENIE_NAME_LOOKBACK_DAYS = 90
+
+# Real usage is measured from CONVERSATION-bearing actions only, NOT raw audit
+# events. Raw events are dominated by genieGetSpace polling and service/eval
+# accounts, which overstate usage (#24). An agent is "active" when it has at
+# least one of these actions in the 30-day window; questions_30d counts them and
+# distinct_users_30d counts the distinct user emails behind them.
+GENIE_CONVERSATION_ACTIONS = (
+    "genieStartConversationMessage",
+    "createConversationMessage",
+    "genieCreateConversationMessage",
+)
+# Best-effort agent-type classification: a space is DASHBOARD-EMBEDDED (an AI/BI
+# Dashboard agent) when its space_id appears in the response.result of one of
+# these dashboard actions. Absence of that evidence is the DEFAULT — a space with
+# no such row is classified STANDALONE (an absence-of-evidence default, labeled as
+# such, not a positive marker). Dashboard-embedded agents are classified out of
+# the scored population and counted separately so they don't skew the pillar.
+GENIE_DASHBOARD_ACTIONS = ("getDashboardGenie", "updateDashboardGenie")
+
+# Graded usage bands (replace the old binary +40/+40/+20 count thresholds). Each
+# band is a fixed tier so day-to-day drift rarely moves the score; the probe adds
+# the highest tier reached in each band and caps the total at 100.
+GENIE_EXISTENCE_POINTS = 15.0
+# active_30d / total (share of standalone agents active in the window).
+GENIE_SHARE_BANDS = ((0.1, 8.0), (0.3, 16.0), (0.6, 25.0))
+# distinct users who asked a question across standalone agents (30d).
+GENIE_USER_BANDS = ((1, 8.0), (5, 16.0), (20, 25.0))
+# conversation questions across standalone agents (30d).
+GENIE_QUESTION_BANDS = ((1, 7.0), (25, 14.0), (100, 20.0))
+# recency: days since the most recent standalone-agent activity (<= each tier).
+GENIE_RECENCY_BANDS = ((7, 15.0), (14, 10.0), (30, 5.0))
+
+
+def _genie_band(value, bands) -> float:
+    """Points for ``value`` from an ascending ``(at_least, points)`` band table
+    (the highest tier whose threshold ``value`` meets)."""
+    points = 0.0
+    for at_least, pts in bands:
+        if (value or 0) >= at_least:
+            points = pts
+    return points
+
+
+def genie_recency_points(days) -> float:
+    """Points for recency from ``GENIE_RECENCY_BANDS`` (days-since-last-activity;
+    fresher earns more). ``None`` (no activity / unknown) earns 0."""
+    if days is None:
+        return 0.0
+    points = 0.0
+    for within, pts in GENIE_RECENCY_BANDS:
+        if days <= within:
+            points = max(points, pts)
+    return points
+
+
+def genie_usage_score(total, active_30d, distinct_users_30d, questions_30d, recency_days) -> float:
+    """Deterministic graded usage score (0..100) for the standalone Genie-agent
+    population. ``total == 0`` (no standalone agents) scores 0."""
+    if not total:
+        return 0.0
+    score = GENIE_EXISTENCE_POINTS
+    share = (active_30d or 0) / total
+    score += _genie_band(share, GENIE_SHARE_BANDS)
+    score += _genie_band(distinct_users_30d, GENIE_USER_BANDS)
+    score += _genie_band(questions_30d, GENIE_QUESTION_BANDS)
+    score += genie_recency_points(recency_days)
+    return round(min(score, 100.0), 1)
+
+
+def _sql_action_list(actions) -> str:
+    """Lowercased, quoted SQL IN-list for ``lower(action_name) IN (...)``."""
+    return ", ".join("'" + a.lower().replace("'", "''") + "'" for a in actions)
+
+
+def _band_doc(bands, unit: str = "") -> str:
+    return ", ".join(f"`+{pts:g}` at `>= {at:g}{unit}`" for at, pts in bands)
+
+
+_GENIE_CONV_SQL = _sql_action_list(GENIE_CONVERSATION_ACTIONS)
+_GENIE_DASH_SQL = _sql_action_list(GENIE_DASHBOARD_ACTIONS)
 
 GENIE_AGENTS = _index({
     "key": "genie_agents",
@@ -447,55 +526,126 @@ GENIE_AGENTS = _index({
         {
             "id": "audit_counts",
             "comment": (
-                f"Genie Agents = spaces seen in the audit log over the last {GENIE_AUDIT_LOOKBACK_DAYS} days, "
-                "minus any that were trashed. "
-                f"active_30d = spaces with activity in the last {GENIE_ACTIVE_WINDOW_DAYS} days."
+                "Graded usage for STANDALONE Genie Agents, from the audit log over the last "
+                f"{GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie), minus trashed spaces. A space is "
+                "DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id is either the "
+                "OWN request_params.space_id of a getDashboardGenie/updateDashboardGenie row (the "
+                "dashboard-genie wrapper construct itself) or EXACTLY equals the space_id/genie_space_id "
+                "value parsed from such a row's response.result JSON (exact match, not a substring); "
+                "otherwise STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents "
+                "that EXIST (any aibiGenie event is evidence of existence), but every USAGE signal — "
+                "active_30d, active-share, distinct_users_30d, questions_30d and recency "
+                "(last_active_date) — is derived from CONVERSATION actions only (never raw events, "
+                "which overstate via genieGetSpace polling and service/eval accounts). So an "
+                "existing-but-never-conversed agent lowers active-share and earns no recency rather "
+                "than being dropped. questions_30d/distinct_users_30d/active_30d are over the last "
+                f"{GENIE_ACTIVE_WINDOW_DAYS} days; last_active_date is the most recent conversation "
+                "over the full lookback."
             ),
             "sql": (
-                "SELECT COUNT(*) AS total,\n"
-                "       SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d\n"
-                "FROM (\n"
-                "  SELECT request_params.space_id AS space_id,\n"
-                "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,\n"
-                "         MAX(CASE WHEN event_date >= current_date() - INTERVAL "
-                f"{GENIE_ACTIVE_WINDOW_DAYS} DAYS THEN 1 ELSE 0 END) AS active_30d\n"
+                "WITH genie_events AS (\n"
+                "  SELECT request_params.space_id AS space_id, action_name, event_date,\n"
+                "         user_identity.email AS user_email\n"
                 "  FROM system.access.audit\n"
                 "  WHERE service_name = 'aibiGenie'\n"
                 "    AND request_params.space_id IS NOT NULL\n"
                 "    AND request_params.space_id <> 'new'\n"
                 f"    AND event_date >= current_date() - INTERVAL {GENIE_AUDIT_LOOKBACK_DAYS} DAYS"
                 "{workspace_filter}\n"
-                "  GROUP BY request_params.space_id\n"
-                ") WHERE trashed = 0;"
+                "),\n"
+                "dashboard_refs AS (\n"
+                "  -- own_sid: the dashboard-genie row's OWN wrapper space_id (itself a dashboard\n"
+                "  -- construct, not a standalone agent). sid1/sid2: the EMBEDDED genie space id\n"
+                "  -- parsed from response.result. All are dashboard-embedded.\n"
+                "  SELECT request_params.space_id AS own_sid,\n"
+                "         get_json_object(response.result, '$.space_id') AS sid1,\n"
+                "         get_json_object(response.result, '$.genie_space_id') AS sid2\n"
+                "  FROM system.access.audit\n"
+                f"  WHERE lower(action_name) IN ({_GENIE_DASH_SQL})\n"
+                f"    AND event_date >= current_date() - INTERVAL {GENIE_AUDIT_LOOKBACK_DAYS} DAYS"
+                "{workspace_filter}\n"
+                "),\n"
+                "dashboard_space_ids AS (\n"
+                "  SELECT own_sid AS space_id FROM dashboard_refs WHERE own_sid IS NOT NULL\n"
+                "  UNION SELECT sid1 FROM dashboard_refs WHERE sid1 IS NOT NULL\n"
+                "  UNION SELECT sid2 FROM dashboard_refs WHERE sid2 IS NOT NULL\n"
+                "),\n"
+                "per_space AS (\n"
+                "  SELECT space_id,\n"
+                "         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,\n"
+                f"         SUM(CASE WHEN lower(action_name) IN ({_GENIE_CONV_SQL})\n"
+                f"                   AND event_date >= current_date() - INTERVAL {GENIE_ACTIVE_WINDOW_DAYS} DAYS\n"
+                "                  THEN 1 ELSE 0 END) AS questions_30d,\n"
+                "         -- recency is conversation-only: polling (genieGetSpace) must not earn it\n"
+                f"         MAX(CASE WHEN lower(action_name) IN ({_GENIE_CONV_SQL})\n"
+                "                  THEN event_date END) AS last_active_date\n"
+                "  FROM genie_events GROUP BY space_id\n"
+                "),\n"
+                "classified AS (\n"
+                "  SELECT space_id, trashed, questions_30d, last_active_date,\n"
+                "         CASE WHEN space_id IN (SELECT space_id FROM dashboard_space_ids)\n"
+                "              THEN 1 ELSE 0 END AS dashboard_embedded\n"
+                "  FROM per_space\n"
+                "),\n"
+                "standalone AS (\n"
+                "  SELECT * FROM classified WHERE trashed = 0 AND dashboard_embedded = 0\n"
+                ")\n"
+                "SELECT\n"
+                "  (SELECT COUNT(*) FROM standalone) AS total,\n"
+                "  (SELECT COUNT(*) FROM standalone WHERE questions_30d > 0) AS active_30d,\n"
+                "  (SELECT COALESCE(SUM(questions_30d), 0) FROM standalone) AS questions_30d,\n"
+                "  (SELECT COUNT(DISTINCT e.user_email) FROM genie_events e\n"
+                f"     WHERE lower(e.action_name) IN ({_GENIE_CONV_SQL})\n"
+                f"       AND e.event_date >= current_date() - INTERVAL {GENIE_ACTIVE_WINDOW_DAYS} DAYS\n"
+                "       AND e.space_id IN (SELECT space_id FROM standalone)) AS distinct_users_30d,\n"
+                "  (SELECT MAX(last_active_date) FROM standalone) AS last_active_date,\n"
+                "  (SELECT COUNT(*) FROM classified WHERE trashed = 0 AND dashboard_embedded = 1)"
+                " AS dashboard_embedded;"
             ),
             "shared": True,
-            "app_impl": "adds the viewer's workspace filter as bound parameters",
+            "app_impl": "adds the viewer's workspace filter as bound parameters; derives recency_days "
+                        "from last_active_date",
         },
     ],
-    "derived": [],
+    "derived": [
+        "`recency_days` = days since `last_active_date` (the most recent standalone-agent conversation);",
+        "`active_share` = `active_30d / total` when `total > 0`.",
+    ],
     "score": [
-        "Start at 0, then:",
-        f"- `+{GENIE_TOTAL_POINTS}` if `total > 0`;",
-        f"- `+{GENIE_ACTIVE_POINTS}` if `active_30d > 0`;",
-        f"- `+{GENIE_SHARE_POINTS}` if `total > 0` and `active_30d / total >= {GENIE_ACTIVE_SHARE}`.",
+        "If no standalone Genie Agent exists (`total == 0`), the score is **0** and only the "
+        "`no_genie_agents` gap applies.",
         "",
-        "Cap the result at 100.",
+        f"Otherwise start at `+{GENIE_EXISTENCE_POINTS:g}` for having a standalone agent, then add the "
+        "highest tier reached in each graded real-usage band (capped at 100):",
+        "",
+        f"- **Active share** (`active_30d / total`): {_band_doc(GENIE_SHARE_BANDS)};",
+        f"- **Distinct users (30d)**: {_band_doc(GENIE_USER_BANDS)};",
+        f"- **Questions (30d)**: {_band_doc(GENIE_QUESTION_BANDS)};",
+        "- **Recency** (days since last activity): "
+        + ", ".join(f"`+{pts:g}` within {within}d" for within, pts in GENIE_RECENCY_BANDS) + ".",
+        "",
+        "Dashboard-embedded agents (AI/BI Dashboard agents) are classified out of this population "
+        "and counted separately; they never affect the score.",
     ],
     "signals": [
-        {"id": "total", "label": "Genie Agents", "value": "`total`"},
+        {"id": "total", "label": "Genie Agents (standalone)", "value": "`total`"},
         {"id": "active_30d", "label": "Active agents (30d)", "value": "`active_30d`"},
+        {"id": "distinct_users_30d", "label": "Users (30d)", "value": "`distinct_users_30d`"},
+        {"id": "questions_30d", "label": "Questions (30d)", "value": "`questions_30d`"},
+        {"id": "dashboard_embedded", "label": "Dashboard-embedded", "value": "`dashboard_embedded`",
+         "when": "counted separately; not scored in this pillar"},
     ],
     "gaps": [
         {
             "id": "no_genie_agents",
             "when": "total == 0",
-            "text": ("No Genie Agents found in the audit log — create a curated Genie Agent as the entry "
-                     "point to natural-language analytics."),
+            "text": ("No standalone Genie Agents found in the audit log — create a curated Genie Agent "
+                     "as the entry point to natural-language analytics."),
         },
         {
             "id": "no_active_genie_agents",
             "when": "total > 0 and active_30d == 0",
-            "text": ("{total} Genie Agent(s) exist but none were active in the last "
+            "text": ("{total} standalone Genie Agent(s) exist but none had a conversation in the last "
                      f"{GENIE_ACTIVE_WINDOW_DAYS} days — drive adoption or retire stale agents."),
         },
     ],
