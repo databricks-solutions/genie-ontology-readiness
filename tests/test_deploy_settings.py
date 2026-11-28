@@ -163,18 +163,117 @@ def test_git_detection_does_not_need_an_empty_source_path():
     assert live["git"] and live["yml_readable"]
 
 
-def test_an_empty_postgres_object_still_counts_as_autoscaling():
+def test_an_empty_postgres_object_counts_as_autoscaling_but_stops_as_unknown():
     live = ds.read_live(_git_app(lakebase={"name": "lakebase-db", "postgres": {}}), lambda p: None)
-    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    # Attached to Autoscaling, but the resource names no branch/database — the destination is
+    # unknown, so the run must NOT assume a first install and create a new project.
+    assert live["autoscaling"]
+    assert ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_UNKNOWN_STOP]
 
 
-def test_autoscaling_lakebase_always_stops_before_any_change():
-    lakebase = {"name": "lakebase-db", "postgres": {"branch": "projects/p/branches/production",
-                                                    "database": "projects/p/branches/production/databases/d"}}
-    live = ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
+LIVE_BRANCH = "projects/p/branches/production"
+LIVE_DB_RESOURCE = "projects/p/branches/production/databases/d"
+
+
+def _autoscaling_live():
+    lakebase = {"name": "lakebase-db", "postgres": {"branch": LIVE_BRANCH, "database": LIVE_DB_RESOURCE}}
+    return ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
+
+
+def test_autoscaling_records_the_deployed_branch_and_database_resource():
+    live = _autoscaling_live()
     assert live["autoscaling"] and "LAKEBASE_INSTANCE_NAME" not in live["resources"]
+    assert live["resources"]["LAKEBASE_BRANCH"] == LIVE_BRANCH
+    assert live["resources"]["LAKEBASE_DATABASE_RESOURCE"] == LIVE_DB_RESOURCE
+
+
+def test_autoscaling_detach_and_provisioned_switch_stop():
+    """Turning history off, or switching to a Provisioned instance, stops regardless of target."""
+    live = _autoscaling_live()
+    assert ds.find_problems(_values(explicit={"USE_LAKEBASE": "false"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    assert ds.find_problems(_values(explicit={"LAKEBASE_INSTANCE_NAME": "inst"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_target_matching_the_deployed_resource_is_legitimate_reuse():
+    """Same branch + same database resource = the legitimate reuse case: it proceeds."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, LIVE_DB_RESOURCE)
     for reset in (False, True):
-        assert ds.find_problems(_values(live=live)[0], live, reset=reset) == [ds.AUTOSCALING_STOP]
+        values = _values(live=live, reset=reset)[0]
+        assert ds.find_problems(values, live, reset=reset, autoscaling_target=target) == []
+
+
+def test_autoscaling_target_on_a_different_project_stops():
+    """A derived (or explicit) destination on another project would silently repoint — stop."""
+    live = _autoscaling_live()
+    target = ("projects/other/branches/production",
+              "projects/other/branches/production/databases/databricks-postgres")
+    assert ds.find_problems(_values(live=live)[0], live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_target_on_the_same_branch_but_a_different_database_stops():
+    """Same branch, different database RESOURCE (e.g. the hardcoded databricks-postgres vs the
+    deployed /databases/d) would switch the history database — stop. This is the fixture the
+    review flagged as wrongly treated as safe."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, f"{LIVE_BRANCH}/databases/databricks-postgres")
+    assert ds.find_problems(_values(live=live)[0], live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_without_a_target_falls_back_to_the_explicit_endpoint_branch_check():
+    """A direct find_problems call with no computed target still catches an explicit endpoint on
+    another branch (defense when the destination was not threaded through)."""
+    live = _autoscaling_live()
+    other = {"LAKEBASE_ENDPOINT_NAME": "projects/other/branches/production/endpoints/primary"}
+    assert ds.find_problems(_values(explicit=other, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    same = {"LAKEBASE_ENDPOINT_NAME": "projects/p/branches/production/endpoints/primary"}
+    assert ds.find_problems(_values(explicit=same, live=live)[0], live) == []
+
+
+def test_reset_does_not_bypass_the_autoscaling_detach_or_repoint_stops():
+    """RESET_SETTINGS re-renders other settings but must NOT silently detach or repoint an attached
+    Autoscaling history. The pre-PR code always stopped on Autoscaling; keep detach/repoint stops
+    under reset (unlike the Provisioned path, where reset skips the comparison stops)."""
+    live = _autoscaling_live()
+    # detach under reset
+    detach = _values(explicit={"USE_LAKEBASE": "false"}, live=live, reset=True)[0]
+    assert ds.find_problems(detach, live, reset=True) == [ds.AUTOSCALING_STOP]
+    # repoint (target on another project) under reset
+    values = _values(live=live, reset=True)[0]
+    other_target = ("projects/other/branches/production",
+                    "projects/other/branches/production/databases/databricks-postgres")
+    assert ds.find_problems(values, live, reset=True, autoscaling_target=other_target) == [ds.AUTOSCALING_STOP]
+    # legitimate reuse under reset still proceeds
+    assert ds.find_problems(values, live, reset=True,
+                            autoscaling_target=(LIVE_BRANCH, LIVE_DB_RESOURCE)) == []
+
+
+def test_detach_stop_only_on_an_explicit_user_use_lakebase_false():
+    """An INHERITED USE_LAKEBASE=false (render artifact when the host was momentarily empty) must
+    NOT block an attached Autoscaling app on every upgrade; only a user-set false detaches."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, LIVE_DB_RESOURCE)
+    base = dict(_values(live=live)[0])
+    # inherited false (deployed) -> history treated as on -> no stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_DEPLOYED)
+    assert ds.find_problems(base, live, autoscaling_target=target) == []
+    # default false -> also no stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_DEFAULT)
+    assert ds.find_problems(base, live, autoscaling_target=target) == []
+    # explicit user false -> detach stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_YOU)
+    assert ds.find_problems(base, live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_history_on_treats_inherited_false_as_on_for_autoscaling():
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_DEPLOYED), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_DEFAULT), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_YOU), "", autoscaling=True) is False
+    # non-autoscaling falls back to effective_lakebase
+    assert ds.history_on(ds.Setting("true", ds.SOURCE_YOU), "", autoscaling=False) is True
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "", autoscaling=False) is False
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "inst", autoscaling=False) is True
 
 
 # --- precedence ----------------------------------------------------------------

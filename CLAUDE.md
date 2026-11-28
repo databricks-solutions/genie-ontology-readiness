@@ -41,10 +41,34 @@ scripts (`scripts/post_deploy.py`, with `bundle deploy` for a first install and 
 reuses the deployed app's settings, in this order: the value you set, the deployed value, the
 release default (an app deployed from Git with no custom `env_vars` has the release defaults). It
 prints a table of settings and sources. It stops before any change if the deployed config cannot be
-read, if the run would turn Lakebase history off or point it at another instance or database, or if
-`lakebase-db` is an Autoscaling database (the CLI manages Provisioned only). `RESET_SETTINGS=true`
-starts fresh. The logic is in `scripts/deploy_settings.py`. The notebook installer was removed: it
-could not upgrade apps deployed from Git or use Autoscaling Lakebase.
+read, or if the run would detach/repoint existing Lakebase history (turn it off, switch an
+Autoscaling app to a Provisioned instance, or point it at another database/branch). These
+detach/repoint stops hold even under `RESET_SETTINGS=true`, which re-renders the other settings
+from the release defaults but never silently detaches or moves an attached Autoscaling history
+database. An already-attached Autoscaling app is upgraded by REUSING its deployed branch + database
+resource (so a non-default database, e.g. one created in the Apps UI, still upgrades); only a
+genuine explicit override to a different branch stops. The logic is in
+`scripts/deploy_settings.py`. The notebook installer was removed: it could not upgrade apps deployed
+from Git or use Autoscaling Lakebase.
+
+**Lakebase: Autoscaling (default) vs Provisioned (legacy).** With `USE_LAKEBASE=true` and no
+`LAKEBASE_INSTANCE_NAME`, `post_deploy.py` takes the **Autoscaling** branch — now the default and
+fully automated. It idempotently creates-or-reuses the project / branch / endpoint / database and
+the app SP's Postgres role (`role_id` = `gor_<sp>`, starts with a letter; `postgres_role` = the SP
+client-id UUID), resolves the database's real underscore Postgres name, renders `LAKEBASE_ENDPOINT_NAME`
++ `LAKEBASE_DATABASE` + `LAKEBASE_USER` into the published `app.yaml`, attaches the `lakebase-db`
+resource itself via `apps update --json` with the `postgres` shape (`{branch, database,
+permission: CAN_CONNECT_AND_CREATE}`) — so **no manual `apps update`** is needed — grants the SP, and
+restarts via `apps deploy`. Ordering is fixed: edit app.yaml → `bundle deploy` → `bundle run` →
+`apps update` (attach) → grant → `apps deploy`; the attach runs after `bundle deploy` because
+`bundle deploy` reconciles resources from `databricks.yml` (which omits `lakebase-db`) and would
+otherwise strip it. **Provisioned** is legacy and runs only when `LAKEBASE_INSTANCE_NAME` is set.
+**The `databricks-postgres` trap:** an Autoscaling database's hyphenated *resource id* (e.g.
+`databricks-postgres`) is NOT its Postgres name; the actual name is the underscore form
+(`databricks_postgres`, from `databricks postgres get-database <resource> -o json` →
+`.status.postgres_database`). Rendering the hyphenated id fails pool init with
+`database "databricks-postgres" does not exist`, so the script always renders the resolved
+underscore name into `LAKEBASE_DATABASE`.
 
 The history tables live in `public` for existing installs, and in schema `genie_ontology_readiness` for a new database (chosen at startup in `app/server/history_schema.py`). A Lakebase error at startup turns history off; the app still runs.
 Lakebase history is per user (keyed by the `X-Forwarded-Email` identity Databricks Apps inject) and
@@ -241,10 +265,16 @@ cd app/frontend && npm install && npm run dev   # http://localhost:3000
 
 ## Optional: snapshot history (Lakebase)
 
-To trend readiness over time, add a Lakebase instance in `databricks.yml`
-(`database_instances` + a `lakebase-db` app resource, see the commented block),
-set `USE_LAKEBASE=true` before `post_deploy.py`, and uncomment `PGHOST`/`PGDATABASE`
-in `app/app.yaml`. The app creates its snapshot table on startup.
+To trend readiness over time, set `USE_LAKEBASE=true` before `post_deploy.py`. With no
+`LAKEBASE_INSTANCE_NAME`, the script takes the **Autoscaling** path (the default): it creates-or-reuses
+the Autoscaling project / branch / endpoint / database and the app SP's Postgres role, attaches the
+`lakebase-db` resource, and renders the endpoint + resolved underscore database name into the
+published `app.yaml` (see the **Deployment** section's Autoscaling-vs-Provisioned note). The
+**Provisioned** (legacy) path runs only when `LAKEBASE_INSTANCE_NAME` names an existing instance. In
+the Apps UI, add a `lakebase-db` resource (Autoscaling or Provisioned) and the runtime resolves the
+rest. The app creates its snapshot table on startup. The first CLI install needs a second `post_deploy.py`
+run to finish the SP Postgres role, because the app's service principal id is known only after the app
+is created.
 
 ## Branding for a customer
 
