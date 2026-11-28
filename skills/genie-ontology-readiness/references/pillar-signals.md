@@ -271,55 +271,111 @@ GROUP BY table_catalog, table_schema ORDER BY metric_views DESC LIMIT 500;
 
 ## 5. Genie Agents — weight 16
 
-Counted from the **audit system table** (workspace-wide, via the viewer's own
+Scored from the **audit system table** (workspace-wide, via the viewer's own
 system-table access) — *not* the Genie REST API, which is permission/scope-gated
-and only reflects what one principal can see.
+and only reflects what one principal can see. The score is **graded on real
+conversation usage** of the **standalone** Genie-agent population. A space is
+classified **dashboard-embedded** (an AI/BI Dashboard agent) when its `space_id`
+appears in the `response.result` of a `getDashboardGenie`/`updateDashboardGenie`
+row; otherwise it is a **standalone** agent (an absence-of-evidence default — label
+it so, don't overstate it). Dashboard-embedded agents are classified out of the
+scored population and counted separately so they don't skew the pillar. "Real usage"
+is measured from **conversation actions only** (`genieStartConversationMessage`,
+`createConversationMessage`, `genieCreateConversationMessage`), never raw events —
+raw events are dominated by `genieGetSpace` polling and service/eval accounts and
+overstate usage.
 
 <!-- BEGIN GENERATED: pillar-genie_agents -->
 <!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
--- Genie Agents = spaces seen in the audit log over the last 90 days, minus any that were trashed. active_30d = spaces with activity in the last 30 days.
-SELECT COUNT(*) AS total,
-       SUM(CASE WHEN active_30d = 1 THEN 1 ELSE 0 END) AS active_30d
-FROM (
-  SELECT request_params.space_id AS space_id,
-         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,
-         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d
+-- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id appears in the response.result of a getDashboardGenie/updateDashboardGenie row; otherwise STANDALONE (absence-of-evidence default). Real usage is measured from CONVERSATION actions only (not raw events, which overstate via polling): questions_30d, distinct_users_30d and active_30d are over the last 30 days.
+WITH genie_events AS (
+  SELECT request_params.space_id AS space_id, action_name, event_date,
+         user_identity.email AS user_email
   FROM system.access.audit
   WHERE service_name = 'aibiGenie'
     AND request_params.space_id IS NOT NULL
     AND request_params.space_id <> 'new'
     AND event_date >= current_date() - INTERVAL 90 DAYS
-  GROUP BY request_params.space_id
-) WHERE trashed = 0;
+),
+dashboard_refs AS (
+  SELECT response.result AS result
+  FROM system.access.audit
+  WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
+    AND response.result IS NOT NULL
+    AND event_date >= current_date() - INTERVAL 90 DAYS
+),
+per_space AS (
+  SELECT space_id,
+         MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,
+         SUM(CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+                   AND event_date >= current_date() - INTERVAL 30 DAYS
+                  THEN 1 ELSE 0 END) AS questions_30d,
+         MAX(event_date) AS last_active_date
+  FROM genie_events GROUP BY space_id
+),
+classified AS (
+  SELECT space_id, trashed, questions_30d, last_active_date,
+         CASE WHEN EXISTS (SELECT 1 FROM dashboard_refs d
+                           WHERE d.result LIKE '%' || space_id || '%')
+              THEN 1 ELSE 0 END AS dashboard_embedded
+  FROM per_space
+),
+standalone AS (
+  SELECT * FROM classified WHERE trashed = 0 AND dashboard_embedded = 0
+)
+SELECT
+  (SELECT COUNT(*) FROM standalone) AS total,
+  (SELECT COUNT(*) FROM standalone WHERE questions_30d > 0) AS active_30d,
+  (SELECT COALESCE(SUM(questions_30d), 0) FROM standalone) AS questions_30d,
+  (SELECT COUNT(DISTINCT e.user_email) FROM genie_events e
+     WHERE lower(e.action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+       AND e.event_date >= current_date() - INTERVAL 30 DAYS
+       AND e.space_id IN (SELECT space_id FROM standalone)) AS distinct_users_30d,
+  (SELECT MAX(last_active_date) FROM standalone) AS last_active_date,
+  (SELECT COUNT(*) FROM classified WHERE trashed = 0 AND dashboard_embedded = 1) AS dashboard_embedded;
 ```
+
+`recency_days` = days since `last_active_date` (the most recent standalone-agent event);
+`active_share` = `active_30d / total` when `total > 0`.
 
 **Score:**
 
-Start at 0, then:
-- `+40` if `total > 0`;
-- `+40` if `active_30d > 0`;
-- `+20` if `total > 0` and `active_30d / total >= 0.3`.
+If no standalone Genie Agent exists (`total == 0`), the score is **0** and only the `no_genie_agents` gap applies.
 
-Cap the result at 100.
+Otherwise start at `+15` for having a standalone agent, then add the highest tier reached in each graded real-usage band (capped at 100):
 
-**Signals to display:** Genie Agents (`total`) and Active agents (30d) (`active_30d`).
+- **Active share** (`active_30d / total`): `+8` at `>= 0.1`, `+16` at `>= 0.3`, `+25` at `>= 0.6`;
+- **Distinct users (30d)**: `+8` at `>= 1`, `+16` at `>= 5`, `+25` at `>= 20`;
+- **Questions (30d)**: `+7` at `>= 1`, `+14` at `>= 25`, `+20` at `>= 100`;
+- **Recency** (days since last activity): `+15` within 7d, `+10` within 14d, `+5` within 30d.
+
+Dashboard-embedded agents (AI/BI Dashboard agents) are classified out of this population and counted separately; they never affect the score.
+
+**Signals to display:** Genie Agents (standalone) (`total`), Active agents (30d) (`active_30d`), Users (30d) (`distinct_users_30d`), Questions (30d) (`questions_30d`), and Dashboard-embedded (`dashboard_embedded`) counted separately; not scored in this pillar.
 
 **Gaps:**
-- `total == 0` → "No Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics."
-- `total > 0 and active_30d == 0` → "`{total}` Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents."
+- `total == 0` → "No standalone Genie Agents found in the audit log — create a curated Genie Agent as the entry point to natural-language analytics."
+- `total > 0 and active_30d == 0` → "`{total}` standalone Genie Agent(s) exist but none had a conversation in the last 30 days — drive adoption or retire stale agents."
 <!-- END GENERATED: pillar-genie_agents -->
 
 If `system.access.audit` is unreadable, mark the pillar **unavailable** (reason:
 insufficient permission — the identity needs `SELECT` on `system.access.audit`).
 
-**Note to include:** curation quality (instructions, example/verified SQL,
-benchmarks) isn't visible in the audit log; recommend the Genie Agent Quality
-Workshop to assess and lift it.
+**Best-effort per-agent curation (where visible, NOT scored).** Reading an agent's
+curation detail (instructions, example/verified SQL, functions, benchmarks, sample
+questions, data-source tables) comes from the agent's **serialized space**, which
+Databricks gates behind **CAN_EDIT** and which only reads for agents co-located in
+the scorer's own workspace. So assess whatever agents you can read and label the
+rest **"not readable / not assessed"** — *never* 0/absent, so a visibility limit
+isn't mistaken for poor curation. Label the whole breakdown **"where visible"**.
+This is quality context only and **must not affect the numeric score**. (Serialized
+read: `GET {host}/api/2.0/genie/spaces/{space_id}?include_serialized_space=true`; a
+401/403/404 or a missing `serialized_space` payload → "not readable".)
 
-**Drill-down — Genie Agents by audit activity** (top agents by event volume, bounded to 200). The `names` CTE resolves each space's latest display name over a wider 90-day window (names only appear on create/update events, not query events). On a very large or shared metastore this scan can be slow — keep the `LIMIT` and the 90-day bound. Add a `workspace` column (join `system.access.workspaces_latest` on `workspace_id`) when more than one workspace is in scope:
+**Drill-down — Genie Agents by audit activity** (top agents by event volume, bounded to 200), each with its **type** (standalone vs dashboard-embedded) and 30-day conversation usage (`questions`, distinct `users`, `active_30d`). The `names` CTE resolves each space's latest display name over a wider 90-day window (names only appear on create/update events, not conversation events); the `dashboard_refs` CTE drives the type classification. On a very large or shared metastore this scan can be slow — keep the `LIMIT` and the 90-day bound. Add a `workspace` column (join `system.access.workspaces_latest` on `workspace_id`) when more than one workspace is in scope:
 
 ```sql
 WITH names AS (
@@ -330,17 +386,31 @@ WITH names AS (
     AND request_params.display_name IS NOT NULL
     AND event_date >= current_date() - INTERVAL 90 DAYS
   GROUP BY request_params.space_id
+),
+dashboard_refs AS (
+  SELECT response.result AS result FROM system.access.audit
+  WHERE lower(action_name) IN ('getdashboardgenie', 'updatedashboardgenie')
+    AND response.result IS NOT NULL
+    AND event_date >= current_date() - INTERVAL 90 DAYS
 )
 SELECT COALESCE(nm.space_name, a.space_id) AS agent, a.space_id AS space_id, a.events AS events,
-       CASE WHEN a.active_30d = 1 THEN 'Yes' ELSE 'No' END AS active_30d
+       a.questions AS questions, a.users AS users,
+       CASE WHEN a.active_30d = 1 THEN 'Yes' ELSE 'No' END AS active_30d,
+       CASE WHEN EXISTS (SELECT 1 FROM dashboard_refs d WHERE d.result LIKE '%' || a.space_id || '%')
+            THEN 'Dashboard-embedded' ELSE 'Standalone' END AS type
 FROM (
   SELECT request_params.space_id AS space_id, COUNT(*) AS events,
+         SUM(CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+                   AND event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS questions,
+         COUNT(DISTINCT CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+                              AND event_date >= current_date() - INTERVAL 30 DAYS THEN user_identity.email END) AS users,
          MAX(CASE WHEN lower(action_name) = 'trashspace' THEN 1 ELSE 0 END) AS trashed,
-         MAX(CASE WHEN event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d
+         MAX(CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+                   AND event_date >= current_date() - INTERVAL 30 DAYS THEN 1 ELSE 0 END) AS active_30d
   FROM system.access.audit
   WHERE service_name = 'aibiGenie' AND request_params.space_id IS NOT NULL
     AND request_params.space_id <> 'new'
-    AND event_date >= current_date() - INTERVAL 30 DAYS
+    AND event_date >= current_date() - INTERVAL 90 DAYS
   GROUP BY request_params.space_id
 ) a LEFT JOIN names nm ON a.space_id = nm.space_id
 WHERE a.trashed = 0 ORDER BY a.events DESC LIMIT 200;

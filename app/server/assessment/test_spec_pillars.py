@@ -11,6 +11,7 @@ The fake warehouse answers each probe query by a substring of its SQL, so the sa
 answers drive the pre-move and post-move SQL.
 """
 import asyncio
+import datetime
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -318,44 +319,66 @@ class MetricsParityTest(unittest.TestCase):
                          ["no_metric_views", "few_metric_views", "metric_views_uncommented"])
 
 
+def _genie_counts(total, active, users=0, questions=0, recency_days=None, dashboard=0):
+    """One audit_counts row. ``recency_days`` is turned into a ``last_active_date``
+    relative to today so the probe's derived recency is deterministic."""
+    last = (None if recency_days is None
+            else (datetime.date.today() - datetime.timedelta(days=recency_days)).isoformat())
+    return {"total": str(total), "active_30d": str(active), "distinct_users_30d": str(users),
+            "questions_30d": str(questions), "last_active_date": last,
+            "dashboard_embedded": str(dashboard)}
+
+
 def _genie_routes(counts):
-    """``counts`` is (total, active_30d), or an exception when the audit read is refused."""
-    if isinstance(counts, Exception):
-        answer = counts
-    else:
-        total, active = counts
-        answer = [{"total": str(total), "active_30d": str(active)}]
-    return ((lambda q: "AS total" in q, answer),)
+    """``counts`` is an audit_counts row dict (see ``_genie_counts``), or an exception
+    when the audit read is refused. The per-agent drill-down and curation reads return
+    nothing in these unit runs (no row matches, no standalone agents to inspect)."""
+    answer = counts if isinstance(counts, Exception) else [counts]
+    return ((lambda q: "AS total" in q and "FROM standalone" in q, answer),)
 
 
 class GenieAgentsGoldenTest(unittest.TestCase):
-    """probe_genie_agents output, pinned to the pre-move App text."""
+    """probe_genie_agents output, pinned for the graded real-usage score (#24)."""
 
-    _NONE = ("No Genie Agents found in the audit log — create a curated Genie Agent as the entry point "
-             "to natural-language analytics.")
+    _NONE = ("No standalone Genie Agents found in the audit log — create a curated Genie Agent "
+             "as the entry point to natural-language analytics.")
 
-    def test_curated_and_active(self):
-        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((10, 4)))
+    def test_curated_and_heavily_used(self):
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(10, 8, users=30, questions=400, recency_days=2, dashboard=2)))
         self.assertEqual(out["score"], 100.0)
         self.assertEqual(out["gaps"], [])
         self.assertEqual([(s["label"], s["value"]) for s in out["signals"]],
-                         [("Genie Agents", 10), ("Active agents (30d)", 4)])
+                         [("Genie Agents (standalone)", 10), ("Active agents (30d)", 8),
+                          ("Users (30d)", 30), ("Questions (30d)", 400), ("Dashboard-embedded", 2)])
 
-    def test_no_agents(self):
-        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((0, 0)))
+    def test_no_standalone_agents(self):
+        # Every agent is dashboard-embedded: no standalone population to score.
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(0, 0, dashboard=3)))
         self.assertEqual(out["score"], 0.0)
         self.assertEqual(out["gaps"], [self._NONE])
+        self.assertEqual(out["metrics"]["dashboard_embedded"], 3)
 
-    def test_agents_but_none_active(self):
-        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((5, 0)))
-        self.assertEqual(out["score"], 40.0)
+    def test_agents_exist_but_none_active(self):
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(5, 0, recency_days=45)))
+        self.assertEqual(out["score"], 15.0)  # existence only; no real-usage bands reached
         self.assertEqual(out["gaps"], [
-            "5 Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.",
+            "5 standalone Genie Agent(s) exist but none had a conversation in the last 30 days "
+            "— drive adoption or retire stale agents.",
         ])
 
-    def test_low_activity_share_earns_no_share_points(self):
-        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((10, 2)))
-        self.assertEqual(out["score"], 80.0)
+    def test_moderate_usage(self):
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(4, 2, users=6, questions=30, recency_days=10)))
+        self.assertEqual(out["score"], 71.0)
+        self.assertEqual(out["gaps"], [])
+
+    def test_low_activity_share(self):
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(10, 2, users=3, questions=15, recency_days=5)))
+        self.assertEqual(out["score"], 53.0)
         self.assertEqual(out["gaps"], [])
 
     def test_audit_read_refused(self):
@@ -366,19 +389,37 @@ class GenieAgentsGoldenTest(unittest.TestCase):
         self.assertEqual(out["unavailable_reason"], "insufficient_permission")
 
 
-    def test_only_stale_agents(self):
-        # Every agent is older than 30 days: they exist but none is active. Counts the
-        # agents, scores 40 (total only), and raises the "none were active" gap.
-        out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((2, 0)))
-        self.assertEqual(out["score"], 40.0)
-        self.assertEqual(out["gaps"], [
-            "2 Genie Agent(s) exist but none were active in the last 30 days — drive adoption or retire stale agents.",
-        ])
+class GenieUsageBandsTest(unittest.TestCase):
+    """The graded score is a deterministic sum of existence + real-usage bands, capped 0..100."""
+
+    def test_existence_floor_and_cap(self):
+        # A standalone agent with no measurable usage scores exactly the existence floor.
+        self.assertEqual(S.genie_usage_score(1, 0, 0, 0, None), S.GENIE_EXISTENCE_POINTS)
+        # Nothing exceeds 100 even with every band maxed.
+        self.assertEqual(S.genie_usage_score(10, 10, 999, 9999, 0), 100.0)
+        # No standalone agents → 0, regardless of other inputs.
+        self.assertEqual(S.genie_usage_score(0, 0, 50, 50, 0), 0.0)
+
+    def test_each_band_adds_its_highest_reached_tier(self):
+        base = S.GENIE_EXISTENCE_POINTS
+        # active share: 1/10 = 0.1 reaches only the first share tier.
+        self.assertEqual(S.genie_usage_score(10, 1, 0, 0, None), base + S.GENIE_SHARE_BANDS[0][1])
+        # distinct users: 5 reaches the second user tier.
+        self.assertEqual(S.genie_usage_score(1, 0, 5, 0, None), base + S.GENIE_USER_BANDS[1][1])
+        # questions: 100 reaches the top question tier.
+        self.assertEqual(S.genie_usage_score(1, 0, 0, 100, None), base + S.GENIE_QUESTION_BANDS[2][1])
+
+    def test_recency_fresher_scores_higher_and_unknown_scores_zero(self):
+        self.assertEqual(S.genie_recency_points(1), 15.0)   # within 7d
+        self.assertEqual(S.genie_recency_points(10), 10.0)  # within 14d
+        self.assertEqual(S.genie_recency_points(25), 5.0)   # within 30d
+        self.assertEqual(S.genie_recency_points(45), 0.0)   # stale
+        self.assertEqual(S.genie_recency_points(None), 0.0)
 
 
-class GenieAuditSqlTest(unittest.TestCase):
-    """The spec's audit query, run on an in-memory audit table (DuckDB), counts a stale agent
-    as an agent but not as active (#120). Skipped when duckdb is not installed."""
+class GenieClassificationTest(unittest.TestCase):
+    """The audit query classifies dashboard-embedded agents out of the scored standalone
+    population and counts them separately (#24). Skipped when duckdb is not installed."""
 
     def _audit_table(self):
         try:
@@ -387,21 +428,37 @@ class GenieAuditSqlTest(unittest.TestCase):
             self.skipTest("duckdb not installed")
         con = duckdb.connect()
         con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
-                    "request_params STRUCT(space_id VARCHAR), workspace_id BIGINT)")
-        con.execute("INSERT INTO audit VALUES "
-                    "(current_date() - 3, 'aibiGenie', 'queryAgent', {'space_id': 'fresh'}, 1), "
-                    "(current_date() - 60, 'aibiGenie', 'queryAgent', {'space_id': 'stale'}, 1), "
-                    "(current_date() - 5, 'aibiGenie', 'trashSpace', {'space_id': 'gone'}, 1), "
-                    "(current_date() - 2, 'aibiGenie', 'queryAgent', {'space_id': 'new'}, 1)")
+                    "request_params STRUCT(space_id VARCHAR, display_name VARCHAR), "
+                    "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
+        con.execute(
+            "INSERT INTO audit VALUES "
+            # standalone, active: two distinct users ask questions in the last 30 days
+            "(current_date() - 3, 'aibiGenie', 'createConversationMessage', {'space_id': 'fresh', 'display_name': 'Fresh'}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
+            "(current_date() - 3, 'aibiGenie', 'genieStartConversationMessage', {'space_id': 'fresh', 'display_name': 'Fresh'}, {'email': 'bob@example.com'}, {'result': NULL}, 1), "
+            # standalone, stale: a conversation 60 days ago (counted, not active)
+            "(current_date() - 60, 'aibiGenie', 'createConversationMessage', {'space_id': 'stale', 'display_name': 'Stale'}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
+            # trashed: excluded entirely
+            "(current_date() - 5, 'aibiGenie', 'trashSpace', {'space_id': 'gone', 'display_name': NULL}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
+            # polling noise with the 'new' placeholder id: not an agent
+            "(current_date() - 2, 'aibiGenie', 'genieGetSpace', {'space_id': 'new', 'display_name': NULL}, {'email': 'svc@example.com'}, {'result': NULL}, 1), "
+            # dashboard-embedded: conversation activity AND space_id seen in a dashboard-genie response
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'dash', 'display_name': 'Dash'}, {'email': 'carol@example.com'}, {'result': NULL}, 1), "
+            "(current_date() - 1, 'aibiGenie', 'getDashboardGenie', {'space_id': 'wrap', 'display_name': NULL}, {'email': 'carol@example.com'}, {'result': '{\"genie_space_id\":\"dash\"}'}, 1)")
         return con
 
-    def test_stale_agent_is_counted_but_not_active(self):
+    def test_dashboard_embedded_excluded_from_scored_population(self):
         con = self._audit_table()
         sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
         sql = sql.replace("system.access.audit", "audit").rstrip(";")
-        total, active = con.execute(sql).fetchone()
-        self.assertEqual(total, 2)    # fresh + stale; trashed and 'new' are not agents
-        self.assertEqual(active, 1)   # only fresh has events in the last 30 days
+        cols = [d[0] for d in con.execute(sql).description]
+        row = dict(zip(cols, con.execute(sql).fetchone()))
+        # 'dash' is dashboard-embedded (space_id in a dashboard-genie response.result) so it
+        # leaves the standalone population; 'wrap' is a standalone (non-conversation) agent.
+        self.assertEqual(row["total"], 3)             # fresh + stale + wrap
+        self.assertEqual(row["active_30d"], 1)        # only fresh had a conversation in 30d
+        self.assertEqual(row["questions_30d"], 2)     # fresh's two conversation messages
+        self.assertEqual(row["distinct_users_30d"], 2)  # alice@example.com + bob@example.com
+        self.assertEqual(row["dashboard_embedded"], 1)  # 'dash', counted separately
 
 
 class GenieAgentsParityTest(unittest.TestCase):
@@ -415,10 +472,49 @@ class GenieAgentsParityTest(unittest.TestCase):
         for total in (0, 1, 5, 10):
             for active in sorted({0, total // 2, total}):
                 with self.subTest(total=total, active=active):
-                    out = _run(probes.probe_genie_agents, _sources(["main"]), *_genie_routes((total, active)))
+                    out = _run(probes.probe_genie_agents, _sources(["main"]),
+                               *_genie_routes(_genie_counts(total, active)))
                     expected = _spec_gaps(S.GENIE_AGENTS, {"total": total, "active_30d": active})
                     self.assertEqual(out["gap_ids"], [gid for gid, _ in expected])
                     self.assertEqual(out["gaps"], [text for _, text in expected])
+
+
+class GenieCurationTest(unittest.IsolatedAsyncioTestCase):
+    """Best-effort per-agent curation (#24): populated where the serialized space is
+    readable, and degraded to a clear 'not readable' row — NEVER 0 — otherwise. Curation
+    never affects the numeric score."""
+
+    async def test_readable_agent_gets_counts(self):
+        with patch.object(probes, "get_workspace_host", lambda: "https://ws"), \
+             patch.object(probes, "get_auth_headers", lambda force_sp=False: {"Authorization": "Bearer x"}), \
+             patch.object(probes, "_inspect_space",
+                          AsyncMock(return_value=("ok", {"title": "Sales", "instructions": 3,
+                                                         "sample_questions": 4, "example_sqls": 2,
+                                                         "functions": 0, "benchmarks": 1, "tables": 5}))):
+            spaces = await probes._genie_curation([{"space_id": "s1", "agent": "Sales"}])
+        self.assertEqual(spaces, [{"title": "Sales", "readable": True, "type": "standalone",
+                                   "instructions": 3, "sample_questions": 4, "example_sqls": 2,
+                                   "functions": 0, "benchmarks": 1, "tables": 5}])
+
+    async def test_unreadable_agent_degrades_to_not_assessed_not_zero(self):
+        with patch.object(probes, "get_workspace_host", lambda: "https://ws"), \
+             patch.object(probes, "get_auth_headers", lambda force_sp=False: {"Authorization": "Bearer x"}), \
+             patch.object(probes, "_inspect_space", AsyncMock(return_value=("forbidden", None))):
+            spaces = await probes._genie_curation([{"space_id": "s1", "agent": "Gated"}])
+        row = spaces[0]
+        self.assertFalse(row["readable"])
+        self.assertEqual(row["title"], "Gated")
+        # The curation counts are None ("not assessed"), never 0 — a visibility limit must
+        # not read as poor curation.
+        for key in ("instructions", "sample_questions", "example_sqls", "functions", "benchmarks", "tables"):
+            self.assertIsNone(row[key])
+
+    async def test_no_host_degrades_without_network(self):
+        with patch.object(probes, "get_workspace_host", lambda: ""), \
+             patch.object(probes, "_inspect_space", AsyncMock(side_effect=AssertionError("must not fetch"))):
+            spaces = await probes._genie_curation([{"space_id": "s1", "agent": "Nameless"}])
+        self.assertEqual(len(spaces), 1)
+        self.assertFalse(spaces[0]["readable"])
 
 
 def _adoption_routes(users, queries):
