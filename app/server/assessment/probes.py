@@ -72,6 +72,9 @@ from server.signal_spec import (
     UC_SCHEMA_POINTS,
     UC_FOOTPRINT_TABLES,
     UC_SCHEMA_MIN,
+    UC_NON_TABLE_TYPES,
+    UC_MANAGED_TABLE_TYPES,
+    sql_type_list,
     gap_text,
     render_sql,
 )
@@ -509,8 +512,14 @@ async def probe_uc_foundation() -> dict:
         sch = _src("schemata", s)
         n_schemas = await _scalar(render_sql(q["schemas"]["sql"], {"<SCHEMATA>": sch},
                                              schema_filter=_schema_sql(s, "schema_name")).rstrip(";"))
+        # Scope the headline total the same way as the per-schema drill-down: in
+        # system mode the metastore-wide view also returns internal catalogs
+        # (system / samples / __databricks_internal / __-prefixed), so exclude
+        # them here too, otherwise the headline total over-counts relative to the
+        # drill-down (#87). In per-catalog union mode the filter is a no-op.
         rows = await execute_sql(
-            render_sql(q["tables"]["sql"], {"<TABLES>": tbl}, schema_filter=_schema_sql(s)).rstrip(";")
+            render_sql(q["tables"]["sql"], {"<TABLES>": tbl},
+                       schema_filter=f"{_schema_sql(s)} {_internal_catalog_filter(s)}".rstrip()).rstrip(";")
         )
         total = int(rows[0].get("total") or 0)
         managed = int(rows[0].get("managed") or 0)
@@ -576,7 +585,8 @@ async def probe_uc_foundation() -> dict:
                 lrows = await execute_sql(
                     "SELECT table_schema AS sch, COUNT(*) AS n "
                     "FROM hive_metastore.information_schema.tables "
-                    "WHERE table_schema <> 'information_schema' GROUP BY table_schema ORDER BY n DESC LIMIT 50"
+                    f"WHERE table_schema <> 'information_schema' AND table_type NOT IN ({sql_type_list(UC_NON_TABLE_TYPES)}) "
+                    "GROUP BY table_schema ORDER BY n DESC LIMIT 50"
                 )
                 legacy_by_schema = [{"schema": r.get("sch"), "tables": int(r.get("n") or 0)} for r in lrows]
             except Exception as e:
@@ -588,8 +598,8 @@ async def probe_uc_foundation() -> dict:
         try:
             crows = await execute_sql(
                 f"SELECT table_catalog AS catalog, table_schema AS schema, COUNT(*) AS tables, "
-                f"       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE') THEN 1 ELSE 0 END) AS managed "
-                f"FROM {tbl} WHERE {_schema_sql(s)} {_internal_catalog_filter(s)}"
+                f"       SUM(CASE WHEN table_type IN ({sql_type_list(UC_MANAGED_TABLE_TYPES)}) THEN 1 ELSE 0 END) AS managed "
+                f"FROM {tbl} WHERE {_schema_sql(s)} AND table_type NOT IN ({sql_type_list(UC_NON_TABLE_TYPES)}) {_internal_catalog_filter(s)}"
                 f"GROUP BY table_catalog, table_schema ORDER BY tables DESC LIMIT 500"
             )
             drill_rows = [

@@ -148,6 +148,104 @@ class UcFoundationParityTest(unittest.TestCase):
                             self.assertEqual(out["gaps"], [text for _, text in expected])
 
 
+class UcFoundationTableTypeTest(unittest.TestCase):
+    """#87: the 'tables' total excludes VIEW/METRIC_VIEW (both metric-view spellings)
+    and counts STREAMING_TABLE / MATERIALIZED_VIEW as managed, with managed % over
+    the corrected denominator.
+
+    The fake warehouse applies the probe's *actual* SQL to a mixed table_type
+    fixture — it parses the exclusion list and the managed CASE set straight out
+    of the rendered SQL — so a regression in either predicate changes the numbers
+    the probe reports and fails this test."""
+
+    # The exact exclusion/managed sets the spec declares, so the test tracks the
+    # shared constants rather than a hand-maintained copy.
+    _EXCLUDED = set(S.UC_NON_TABLE_TYPES)       # ('VIEW', 'METRIC_VIEW', 'METRIC VIEW')
+    _MANAGED = set(S.UC_MANAGED_TABLE_TYPES)
+
+    # A DLT/dlt-meta-shaped schema: physical tables plus many views & streaming
+    # objects. Includes BOTH metric-view spellings ('METRIC_VIEW' and 'METRIC VIEW').
+    _MIXED = {
+        "MANAGED": 10,
+        "MANAGED_SHALLOW_CLONE": 2,
+        "EXTERNAL": 5,
+        "FOREIGN": 1,
+        "STREAMING_TABLE": 4,
+        "MATERIALIZED_VIEW": 3,
+        "VIEW": 20,
+        "METRIC_VIEW": 6,
+        "METRIC VIEW": 2,
+    }
+    # Corrected denominator excludes VIEW (20) + METRIC_VIEW (6) + METRIC VIEW (2):
+    # 10+2+5+1+4+3 = 25.
+    _EXPECTED_TOTAL = 25
+    # Managed numerator: MANAGED + MANAGED_SHALLOW_CLONE + STREAMING_TABLE + MATERIALIZED_VIEW.
+    _EXPECTED_MANAGED = 19
+    _EXPECTED_MANAGED_PCT = 76.0  # pct(19, 25)
+
+    @staticmethod
+    def _type_set(sql: str, after: str) -> set:
+        """The quoted table_type literals in the first ``(...)`` after ``after``."""
+        import re
+        m = re.search(re.escape(after) + r"\s*\(([^)]*)\)", sql)
+        return set(re.findall(r"'([^']+)'", m.group(1))) if m else set()
+
+    def test_mixed_table_types(self):
+        seen: list[str] = []
+
+        async def warehouse(query, parameters=None, force_sp=False, record=True, **_opts):
+            seen.append(query)
+            if "AS total" in query:
+                # Apply the probe's real SQL to the fixture: parse the exclusion
+                # list and the managed CASE set straight out of the rendered SQL.
+                excluded = self._type_set(query, "table_type NOT IN")
+                managed_set = self._type_set(query, "CASE WHEN table_type IN")
+                total = sum(n for t, n in self._MIXED.items() if t not in excluded)
+                managed = sum(n for t, n in self._MIXED.items()
+                              if t in managed_set and t not in excluded)
+                return [{"total": str(total), "managed": str(managed)}]
+            if "schemata" in query:
+                return [{"n_schemas": "3"}]
+            return []
+
+        # Scoped run (schemas set) so the hive_metastore coverage read is skipped.
+        with patch.object(probes, "_resolve_sources",
+                          AsyncMock(return_value=_sources(["a"], schemas=["dlt_schema"]))), \
+             patch.object(probes, "execute_sql", warehouse):
+            out = asyncio.run(probes.probe_uc_foundation())
+
+        headline_sql = next(q for q in seen if "AS total" in q)
+        # Denominator excludes exactly VIEW + both metric-view spellings — so the
+        # space-spelled 'METRIC VIEW' is excluded too (the review's finding 1).
+        self.assertEqual(self._type_set(headline_sql, "table_type NOT IN"),
+                         {"VIEW", "METRIC_VIEW", "METRIC VIEW"})
+        self.assertEqual(self._type_set(headline_sql, "table_type NOT IN"), self._EXCLUDED)
+        # Managed numerator counts streaming tables and materialized views.
+        managed_set = self._type_set(headline_sql, "CASE WHEN table_type IN")
+        self.assertEqual(
+            managed_set,
+            {"MANAGED", "MANAGED_SHALLOW_CLONE", "STREAMING_TABLE", "MATERIALIZED_VIEW"})
+        self.assertEqual(managed_set, self._MANAGED)
+
+        # VIEW + metric views (both spellings) are out of the total (28 excluded →
+        # 25, not the naive 53).
+        self.assertEqual(out["metrics"]["tables"], self._EXPECTED_TOTAL)
+        # STREAMING_TABLE + MATERIALIZED_VIEW are counted in the total too.
+        self.assertEqual(
+            out["metrics"]["tables"],
+            sum(n for t, n in self._MIXED.items() if t not in self._EXCLUDED))
+        # Managed % is over the corrected denominator.
+        self.assertEqual(out["metrics"]["managed_pct"], self._EXPECTED_MANAGED_PCT)
+        managed_signal = next(s for s in out["signals"] if s["label"] == "Managed")
+        self.assertEqual(managed_signal["value"], self._EXPECTED_MANAGED_PCT)
+
+    def test_hive_coverage_excludes_views(self):
+        """#87 finding 2: the hive_metastore count used in uc_coverage_pct applies the
+        SAME view exclusion, so both sides of the ratio count only physical tables."""
+        hive_sql = S.UC_FOUNDATION["queries_by_id"]["hive_tables"]["sql"]
+        self.assertEqual(self._type_set(hive_sql, "table_type NOT IN"), self._EXCLUDED)
+
+
 def _rel_routes(gold, constraints):
     """``constraints`` is a (pk, fk) pair, or an exception when table_constraints is refused."""
     if isinstance(constraints, Exception):
