@@ -228,6 +228,24 @@ def test_autoscaling_without_a_target_falls_back_to_the_explicit_endpoint_branch
     assert ds.find_problems(_values(explicit=same, live=live)[0], live) == []
 
 
+def test_reset_does_not_bypass_the_autoscaling_detach_or_repoint_stops():
+    """RESET_SETTINGS re-renders other settings but must NOT silently detach or repoint an attached
+    Autoscaling history. The pre-PR code always stopped on Autoscaling; keep detach/repoint stops
+    under reset (unlike the Provisioned path, where reset skips the comparison stops)."""
+    live = _autoscaling_live()
+    # detach under reset
+    detach = _values(explicit={"USE_LAKEBASE": "false"}, live=live, reset=True)[0]
+    assert ds.find_problems(detach, live, reset=True) == [ds.AUTOSCALING_STOP]
+    # repoint (target on another project) under reset
+    values = _values(live=live, reset=True)[0]
+    other_target = ("projects/other/branches/production",
+                    "projects/other/branches/production/databases/databricks-postgres")
+    assert ds.find_problems(values, live, reset=True, autoscaling_target=other_target) == [ds.AUTOSCALING_STOP]
+    # legitimate reuse under reset still proceeds
+    assert ds.find_problems(values, live, reset=True,
+                            autoscaling_target=(LIVE_BRANCH, LIVE_DB_RESOURCE)) == []
+
+
 # --- precedence ----------------------------------------------------------------
 
 def test_precedence_you_set_beats_deployed_beats_default():

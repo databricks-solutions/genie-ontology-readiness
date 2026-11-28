@@ -221,7 +221,9 @@ DATABRICKS_PROFILE=<p> TARGET=prod python3 scripts/post_deploy.py
 ```
 
 - **Change one setting:** set only that variable. An empty value clears it, for example `ASSESS_CATALOGS=`.
-- **Start fresh:** `RESET_SETTINGS=true`. Each setting you do not set uses the release default.
+- **Start fresh:** `RESET_SETTINGS=true`. Each setting you do not set uses the release default. It
+  does **not** detach or repoint an attached Autoscaling history database — that stays put; to move
+  history on purpose, detach the `lakebase-db` resource in the Apps UI first.
 - **Infrastructure change** (the release notes say `databricks.yml` changed): `INFRA=true`. This runs
   `bundle deploy`. It needs the bundle state of the first install. If you are not the user who ran
   it, bind the app first with `databricks bundle deployment bind ontology_readiness <app-name> -t prod`.

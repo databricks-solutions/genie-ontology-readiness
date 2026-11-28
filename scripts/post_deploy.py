@@ -279,17 +279,16 @@ def _read_workspace_text(path):
         return dest.read_text()
 
 
-def _intended_autoscaling_target(endpoint_value):
-    """This run's intended Autoscaling ``(branch, database_resource)`` destination for the given
-    resolved LAKEBASE_ENDPOINT_NAME.
+def _intended_autoscaling_target(endpoint_value, live):
+    """This run's intended Autoscaling ``(branch, database_resource)`` destination.
 
-    Derived from an explicit endpoint (reuse it) or, when none is set, from the app name — exactly
-    what setup_lakebase_autoscaling will create/attach. deploy_settings compares it against the
-    DEPLOYED lakebase-db resource so a mismatch stops before any change (it would silently repoint
-    the branch or switch the database)."""
-    project_id, branch_id, _ = _autoscaling_ids(endpoint_value)
-    branch = f"projects/{project_id}/branches/{branch_id}"
-    return branch, f"{branch}/databases/{AUTOSCALING_DATABASE_ID}"
+    Uses the same precedence as setup_lakebase_autoscaling (explicit endpoint > the DEPLOYED
+    resource > app-name derivation), so the guard compares what will actually be created/attached
+    against the deployed resource. For an already-attached app with no explicit override this
+    equals the deployed resource (legitimate reuse — including a non-default database); it differs
+    only on a genuine override to another branch/database, which must stop."""
+    dest = _autoscaling_destination(endpoint_value, live.get("resources", {}))
+    return dest["branch"], dest["database_resource"]
 
 
 def resolve_settings(live):
@@ -300,11 +299,12 @@ def resolve_settings(live):
     extra = {"WORKSPACE_ID": _workspace_id_default()}
     values, problems = deploy_settings.plan(
         explicit_from_env(), live, template_text, forced=forced, extra_defaults=extra, reset=reset)
-    # Autoscaling repoint/detach guard: compare this run's intended destination — derived from the
-    # RESOLVED endpoint (so it matches what setup_lakebase_autoscaling will create/attach) — against
-    # the DEPLOYED lakebase-db resource. Stops before any change if it would repoint or switch DBs.
-    if live.get("autoscaling") and not reset:
-        target = _intended_autoscaling_target(values["LAKEBASE_ENDPOINT_NAME"].value)
+    # Autoscaling repoint/detach guard: compare this run's intended destination — derived with the
+    # same precedence setup uses (RESOLVED endpoint > deployed resource > app name) — against the
+    # DEPLOYED lakebase-db resource. Stops before any change if it would repoint or switch DBs. This
+    # runs even under RESET_SETTINGS: reset re-renders other settings but must not detach/repoint.
+    if live.get("autoscaling"):
+        target = _intended_autoscaling_target(values["LAKEBASE_ENDPOINT_NAME"].value, live)
         for p in deploy_settings.find_problems(values, live, reset=reset, autoscaling_target=target):
             if p not in problems:
                 problems.append(p)
@@ -346,15 +346,38 @@ def _credential_autoscaling(endpoint):
     return cred.get("token") if isinstance(cred, dict) else None
 
 
-def _pg_exists(got):
-    """True when a `postgres get-*` read returned a real resource (has a `name`)."""
-    return isinstance(got, dict) and bool(got.get("name"))
+_PG_NOT_FOUND = ("does not exist", "not found", "resource_does_not_exist", "no such")
+
+
+def _pg_get(get_verb, name):
+    """Tri-state read of a postgres resource by full resource name.
+
+    Returns the resource dict when it exists; None ONLY when the workspace explicitly reports it
+    does not exist (NOT_FOUND); and STOPS (hard error) on any other read failure — auth,
+    permission, transient, or malformed output. This matters because the ensure-* helpers create
+    a resource when the read says "missing": a failed read mistaken for "missing" would recreate
+    or replace a LIVE history resource (data loss). Mirrors _get_app's tri-state contract."""
+    r = subprocess.run(_cli_cmd("postgres", get_verb, name, "--output", "json"),
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError:
+            _stop([f"Could not read {name}: the CLI returned unexpected output."])
+    text = (r.stdout + r.stderr).lower()
+    if any(s in text for s in _PG_NOT_FOUND):
+        return None
+    _stop([f"Could not read {name} from the workspace: {r.stderr.strip()[:200]}",
+           "This read failed for a reason other than 'not found', so this run will not assume the "
+           "resource is missing (creating it could replace a live history resource). Fix the CLI "
+           "profile or your access, then run again."])
 
 
 def _ensure_project(project_id):
-    """Idempotently ensure an Autoscaling project. Returns its resource name."""
+    """Ensure an Autoscaling project (reuse if present, create only on a confirmed not-found).
+    Returns its resource name."""
     name = f"projects/{project_id}"
-    if _pg_exists(cli_json("postgres", "get-project", name)):
+    if _pg_get("get-project", name) is not None:
         print(f"  reuse project {name}")
     else:
         print(f"  create project {name}")
@@ -363,9 +386,9 @@ def _ensure_project(project_id):
 
 
 def _ensure_branch(project_name, branch_id):
-    """Idempotently ensure a branch of the project. Returns its resource name."""
+    """Ensure a branch of the project (reuse if present, create only on a confirmed not-found)."""
     name = f"{project_name}/branches/{branch_id}"
-    if _pg_exists(cli_json("postgres", "get-branch", name)):
+    if _pg_get("get-branch", name) is not None:
         print(f"  reuse branch {name}")
     else:
         print(f"  create branch {name}")
@@ -374,35 +397,43 @@ def _ensure_branch(project_name, branch_id):
 
 
 def _ensure_endpoint(branch_name, endpoint_id):
-    """Idempotently ensure a read-write compute endpoint of the branch. Returns its resource name."""
+    """Ensure a read-write compute endpoint of the branch.
+
+    Reuse it when present; create ONLY on a confirmed not-found. No --replace-existing: on a reuse
+    run a failed read must never recreate/disrupt the LIVE endpoint that serves history (so
+    _pg_get stops on a non-NOT_FOUND error rather than treating it as missing)."""
     name = f"{branch_name}/endpoints/{endpoint_id}"
-    if _pg_exists(cli_json("postgres", "get-endpoint", name)):
+    if _pg_get("get-endpoint", name) is not None:
         print(f"  reuse endpoint {name}")
     else:
         print(f"  create endpoint {name}")
-        cli("postgres", "create-endpoint", branch_name, endpoint_id, "--replace-existing", check=False)
+        cli("postgres", "create-endpoint", branch_name, endpoint_id, check=False)
     return name
 
 
 def _ensure_database(branch_name, database_id):
-    """Idempotently ensure a database of the branch. Returns its resource name."""
+    """Ensure a database of the branch.
+
+    Reuse it when present; create ONLY on a confirmed not-found. NEVER --replace-existing: the
+    history database must never be replaced on a reuse run (data loss). _pg_get stops on any
+    non-NOT_FOUND read error so a transient/permission failure is not mistaken for "missing"."""
     name = f"{branch_name}/databases/{database_id}"
-    if _pg_exists(cli_json("postgres", "get-database", name)):
+    if _pg_get("get-database", name) is not None:
         print(f"  reuse database {name}")
     else:
         print(f"  create database {name}")
-        cli("postgres", "create-database", branch_name, "--database-id", database_id,
-            "--replace-existing", check=False)
+        cli("postgres", "create-database", branch_name, "--database-id", database_id, check=False)
     return name
 
 
 def _ensure_role(branch_name, role_id, sp_client_id):
-    """Idempotently ensure the app SP's Postgres role on the branch. Returns its resource name.
+    """Ensure the app SP's Postgres role on the branch (reuse if present, create only on a
+    confirmed not-found). Returns its resource name.
 
     role_id starts with a letter (`gor_<sp>`); postgres_role is the raw SP client-id UUID. The
     role is created with default privileges only — schema grants follow via _grant_history."""
     name = f"{branch_name}/roles/{role_id}"
-    if _pg_exists(cli_json("postgres", "get-role", name)):
+    if _pg_get("get-role", name) is not None:
         print(f"  reuse SP Postgres role {name}")
     else:
         print(f"  create SP Postgres role {name}")
@@ -434,17 +465,48 @@ def _postgres_database_name(database_resource):
     return ""
 
 
-def _autoscaling_ids(endpoint_setting):
-    """(project_id, branch_id, endpoint_id) for the Autoscaling branch.
+def _parse_branch(branch):
+    """(project_id, branch_id) from a branch resource name projects/<p>/branches/<b>, else ("","")."""
+    parts = (branch or "").strip("/").split("/")
+    if len(parts) >= 4 and parts[0] == "projects" and parts[2] == "branches":
+        return parts[1], parts[3]
+    return "", ""
 
-    An explicit LAKEBASE_ENDPOINT_NAME (projects/<p>/branches/<b>/endpoints/<e>) names an
-    existing project/branch/endpoint to reuse; otherwise ids are derived from the app name."""
+
+def _autoscaling_destination(endpoint_setting, live_resources):
+    """Where this Autoscaling run points: {branch, endpoint_id, database_resource, database_id}.
+
+    Precedence, so an upgrade NEVER silently moves history and a non-default database (e.g. one
+    created in the Apps UI) still upgrades:
+
+    1. An explicit LAKEBASE_ENDPOINT_NAME (projects/<p>/branches/<b>/endpoints/<e>) names the
+       branch + endpoint. The database is the DEPLOYED one when it is on that same branch, else
+       the default id on that branch.
+    2. No explicit endpoint, but the app is ALREADY attached (deployed Autoscaling resource):
+       reuse the DEPLOYED branch and the DEPLOYED database resource verbatim.
+    3. First install (nothing attached, no explicit endpoint): derive from the app name with the
+       default branch/endpoint/database ids.
+    """
+    deployed_branch = (live_resources.get("LAKEBASE_BRANCH") or "").strip("/")
+    deployed_db = (live_resources.get("LAKEBASE_DATABASE_RESOURCE") or "").strip("/")
     ep = (endpoint_setting or "").strip()
     if ep.startswith("projects/") and "/endpoints/" in ep:
         parts = ep.split("/")
-        if len(parts) >= 6:
-            return parts[1], parts[3], parts[5]
-    return _pg_id(APP_NAME), AUTOSCALING_BRANCH_ID, AUTOSCALING_ENDPOINT_ID
+        branch = f"projects/{parts[1]}/branches/{parts[3]}"
+        endpoint_id = parts[5]
+        database_resource = (deployed_db if (deployed_db and deployed_branch == branch)
+                             else f"{branch}/databases/{AUTOSCALING_DATABASE_ID}")
+    elif deployed_branch:
+        branch = deployed_branch
+        endpoint_id = AUTOSCALING_ENDPOINT_ID
+        database_resource = deployed_db or f"{branch}/databases/{AUTOSCALING_DATABASE_ID}"
+    else:
+        branch = f"projects/{_pg_id(APP_NAME)}/branches/{AUTOSCALING_BRANCH_ID}"
+        endpoint_id = AUTOSCALING_ENDPOINT_ID
+        database_resource = f"{branch}/databases/{AUTOSCALING_DATABASE_ID}"
+    database_id = database_resource.split("/databases/")[-1]
+    return {"branch": branch, "endpoint_id": endpoint_id,
+            "database_resource": database_resource, "database_id": database_id}
 
 
 def setup_lakebase():
@@ -501,27 +563,30 @@ def setup_lakebase():
     _LAKEBASE["user_email"] = user_email
 
 
-def setup_lakebase_autoscaling():
+def setup_lakebase_autoscaling(live):
     """Default Lakebase path: idempotently ensure the Autoscaling project / branch / endpoint /
     database / SP Postgres role, then record the host, credential endpoint, database resource,
     and resolved underscore database name for the attach + app.yaml rendering.
 
-    Idempotent create-or-reuse: a get-then-create for each resource works whether it already
-    exists (reuse) or is missing (create); none fails on "already exists". The app may not exist
-    yet on a first install, so the SP role is created on the follow-up upgrade run (as the README
-    notes for Lakebase)."""
+    Idempotent create-or-reuse: a get-then-create for each resource reuses it when present and
+    creates it ONLY on a confirmed not-found (see _pg_get), so a reuse run never recreates or
+    replaces a live history resource. When the app is already attached, the destination reuses the
+    DEPLOYED branch + database resource (so a non-default database still upgrades), exactly what the
+    resolve_settings guard validated. The app may not exist yet on a first install, so the SP role
+    is created on the follow-up upgrade run (as the README notes for Lakebase)."""
     me = cli_json("current-user", "me")
     user_email = me.get("userName", "") if isinstance(me, dict) else ""
     app = cli_json("apps", "get", APP_NAME)
     sp = app.get("service_principal_client_id", "") if isinstance(app, dict) else ""
 
-    project_id, branch_id, endpoint_id = _autoscaling_ids(LAKEBASE_ENDPOINT_NAME)
+    dest = _autoscaling_destination(LAKEBASE_ENDPOINT_NAME, live.get("resources", {}))
+    project_id, branch_id = _parse_branch(dest["branch"])
     print(f"\n[Lakebase] Autoscaling (default path): project '{project_id}', branch '{branch_id}', "
-          f"endpoint '{endpoint_id}'")
+          f"endpoint '{dest['endpoint_id']}', database '{dest['database_id']}'")
     project = _ensure_project(project_id)
     branch = _ensure_branch(project, branch_id)
-    endpoint = _ensure_endpoint(branch, endpoint_id)
-    database_resource = _ensure_database(branch, AUTOSCALING_DATABASE_ID)
+    endpoint = _ensure_endpoint(branch, dest["endpoint_id"])
+    database_resource = _ensure_database(branch, dest["database_id"])
     if sp:
         _ensure_role(branch, _pg_role_id(sp), sp)
     else:
@@ -842,7 +907,7 @@ def _main():
         if LAKEBASE_INSTANCE:
             setup_lakebase()
         else:
-            setup_lakebase_autoscaling()
+            setup_lakebase_autoscaling(live)
     if (USE_LAKEBASE and not _LAKEBASE["host"]
             and deploy_settings.uses_lakebase(live["env"], live["resources"], live.get("autoscaling"))):
         _stop(["Lakebase is not available. This run would turn history off. Nothing was deployed. "

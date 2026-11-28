@@ -245,7 +245,8 @@ AUTOSCALING_STOP = (
     "turning history off, switching to a Provisioned instance, or pointing at a different "
     "Autoscaling branch/endpoint/database would orphan that history. Keep USE_LAKEBASE on, leave "
     "LAKEBASE_INSTANCE_NAME unset, and set LAKEBASE_ENDPOINT_NAME to the DEPLOYED branch's endpoint "
-    "(see the deployed lakebase-db resource). To start fresh on purpose, set RESET_SETTINGS=true."
+    "(see the deployed lakebase-db resource). RESET_SETTINGS=true does NOT override this — to move "
+    "history to a different database on purpose, detach the lakebase-db resource in the Apps UI first."
 )
 
 
@@ -292,29 +293,33 @@ def _autoscaling_problems(values, live, target=None):
 def find_problems(values, live, *, reset=False, autoscaling_target=None):
     """Return the plain-text reasons to stop before changing anything. Empty = go ahead.
 
-    With reset=True the deployed settings were ignored on purpose, so the checks that
-    compare against them are skipped (idempotent reuse never detaches history).
-
     ``autoscaling_target`` is this run's intended ``(branch, database_resource)`` destination (the
-    caller derives it from the app name / an explicit endpoint). It is compared against the
-    deployed Autoscaling resource so a derived-vs-deployed mismatch stops before any change."""
+    caller derives it from the deployed resource / an explicit endpoint / the app name). It is
+    compared against the deployed Autoscaling resource so a mismatch stops before any change.
+
+    RESET_SETTINGS (``reset``) re-renders the other settings from the release defaults, but it does
+    NOT bypass the Autoscaling detach/repoint stops: resetting must never silently drop or move an
+    attached history resource. With reset, only the unknown-settings stops (which reset is the
+    documented escape for) are skipped."""
+    if not reset:
+        if live.get("git") and not live.get("yml_readable"):
+            return [
+                "The app is deployed from Git with custom settings (env_vars), and the API does not "
+                "return their values, so its settings are unknown. Upgrade it the way it was deployed: "
+                "in the Apps UI (Deploy from Git), or with the pipeline that set those env_vars."
+            ]
+        if live.get("has_deployment") and not live.get("yml_readable"):
+            # The deployed settings are unknown, so no comparison against them is meaningful.
+            return [
+                f"The app is deployed from '{live.get('source_path', '')}'. Its app.yaml cannot be "
+                "read, so its settings are unknown. Check that you can read that folder, then run again. "
+                "To ignore the deployed settings, set RESET_SETTINGS=true."
+            ]
+    if live.get("autoscaling"):
+        # These stops hold even under reset — never silently detach or repoint an attached history.
+        return _autoscaling_problems(values, live, autoscaling_target)
     if reset:
         return []
-    if live.get("git") and not live.get("yml_readable"):
-        return [
-            "The app is deployed from Git with custom settings (env_vars), and the API does not "
-            "return their values, so its settings are unknown. Upgrade it the way it was deployed: "
-            "in the Apps UI (Deploy from Git), or with the pipeline that set those env_vars."
-        ]
-    if live.get("has_deployment") and not live.get("yml_readable"):
-        # The deployed settings are unknown, so no comparison against them is meaningful.
-        return [
-            f"The app is deployed from '{live.get('source_path', '')}'. Its app.yaml cannot be "
-            "read, so its settings are unknown. Check that you can read that folder, then run again. "
-            "To ignore the deployed settings, set RESET_SETTINGS=true."
-        ]
-    if live.get("autoscaling"):
-        return _autoscaling_problems(values, live, autoscaling_target)
     return _lakebase_problems(values, live.get("env", {}), live.get("resources", {}))
 
 

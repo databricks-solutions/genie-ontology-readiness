@@ -42,9 +42,14 @@ reuses the deployed app's settings, in this order: the value you set, the deploy
 release default (an app deployed from Git with no custom `env_vars` has the release defaults). It
 prints a table of settings and sources. It stops before any change if the deployed config cannot be
 read, or if the run would detach/repoint existing Lakebase history (turn it off, switch an
-Autoscaling app to a Provisioned instance, or point it at another database/branch).
-`RESET_SETTINGS=true` starts fresh. The logic is in `scripts/deploy_settings.py`. The notebook
-installer was removed: it could not upgrade apps deployed from Git or use Autoscaling Lakebase.
+Autoscaling app to a Provisioned instance, or point it at another database/branch). These
+detach/repoint stops hold even under `RESET_SETTINGS=true`, which re-renders the other settings
+from the release defaults but never silently detaches or moves an attached Autoscaling history
+database. An already-attached Autoscaling app is upgraded by REUSING its deployed branch + database
+resource (so a non-default database, e.g. one created in the Apps UI, still upgrades); only a
+genuine explicit override to a different branch stops. The logic is in
+`scripts/deploy_settings.py`. The notebook installer was removed: it could not upgrade apps deployed
+from Git or use Autoscaling Lakebase.
 
 **Lakebase: Autoscaling (default) vs Provisioned (legacy).** With `USE_LAKEBASE=true` and no
 `LAKEBASE_INSTANCE_NAME`, `post_deploy.py` takes the **Autoscaling** branch — now the default and
