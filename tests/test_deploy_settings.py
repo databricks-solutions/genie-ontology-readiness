@@ -165,16 +165,32 @@ def test_git_detection_does_not_need_an_empty_source_path():
 
 def test_an_empty_postgres_object_still_counts_as_autoscaling():
     live = ds.read_live(_git_app(lakebase={"name": "lakebase-db", "postgres": {}}), lambda p: None)
-    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    # Autoscaling is now the default path: a correctly-triggered reuse run proceeds (no stop).
+    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == []
 
 
-def test_autoscaling_lakebase_always_stops_before_any_change():
+def test_autoscaling_reuse_run_proceeds_but_detach_or_repoint_still_stops():
+    """Autoscaling is the default path, so a reuse run proceeds. The safety intent is preserved:
+    turning history off, switching to a Provisioned instance, or pointing at a different branch
+    still stops before any change."""
     lakebase = {"name": "lakebase-db", "postgres": {"branch": "projects/p/branches/production",
                                                     "database": "projects/p/branches/production/databases/d"}}
     live = ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
     assert live["autoscaling"] and "LAKEBASE_INSTANCE_NAME" not in live["resources"]
+    assert live["resources"]["LAKEBASE_BRANCH"] == "projects/p/branches/production"
+    # A plain reuse run (USE_LAKEBASE auto/default, no instance, no endpoint) proceeds, even on reset.
     for reset in (False, True):
-        assert ds.find_problems(_values(live=live)[0], live, reset=reset) == [ds.AUTOSCALING_STOP]
+        assert ds.find_problems(_values(live=live, reset=reset)[0], live, reset=reset) == []
+    # Detach: turning history off.
+    assert ds.find_problems(_values(explicit={"USE_LAKEBASE": "false"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    # Repoint: switching to a Provisioned instance.
+    assert ds.find_problems(_values(explicit={"LAKEBASE_INSTANCE_NAME": "inst"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    # Repoint: an endpoint on a different branch.
+    other = {"LAKEBASE_ENDPOINT_NAME": "projects/other/branches/production/endpoints/primary"}
+    assert ds.find_problems(_values(explicit=other, live=live)[0], live) == [ds.AUTOSCALING_STOP]
+    # Reuse: an endpoint on the SAME branch is fine.
+    same = {"LAKEBASE_ENDPOINT_NAME": "projects/p/branches/production/endpoints/primary"}
+    assert ds.find_problems(_values(explicit=same, live=live)[0], live) == []
 
 
 # --- precedence ----------------------------------------------------------------
