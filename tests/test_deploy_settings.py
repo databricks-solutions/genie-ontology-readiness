@@ -169,26 +169,61 @@ def test_an_empty_postgres_object_still_counts_as_autoscaling():
     assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == []
 
 
-def test_autoscaling_reuse_run_proceeds_but_detach_or_repoint_still_stops():
-    """Autoscaling is the default path, so a reuse run proceeds. The safety intent is preserved:
-    turning history off, switching to a Provisioned instance, or pointing at a different branch
-    still stops before any change."""
-    lakebase = {"name": "lakebase-db", "postgres": {"branch": "projects/p/branches/production",
-                                                    "database": "projects/p/branches/production/databases/d"}}
-    live = ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
+LIVE_BRANCH = "projects/p/branches/production"
+LIVE_DB_RESOURCE = "projects/p/branches/production/databases/d"
+
+
+def _autoscaling_live():
+    lakebase = {"name": "lakebase-db", "postgres": {"branch": LIVE_BRANCH, "database": LIVE_DB_RESOURCE}}
+    return ds.read_live(_git_app(lakebase=lakebase), lambda p: None)
+
+
+def test_autoscaling_records_the_deployed_branch_and_database_resource():
+    live = _autoscaling_live()
     assert live["autoscaling"] and "LAKEBASE_INSTANCE_NAME" not in live["resources"]
-    assert live["resources"]["LAKEBASE_BRANCH"] == "projects/p/branches/production"
-    # A plain reuse run (USE_LAKEBASE auto/default, no instance, no endpoint) proceeds, even on reset.
-    for reset in (False, True):
-        assert ds.find_problems(_values(live=live, reset=reset)[0], live, reset=reset) == []
-    # Detach: turning history off.
+    assert live["resources"]["LAKEBASE_BRANCH"] == LIVE_BRANCH
+    assert live["resources"]["LAKEBASE_DATABASE_RESOURCE"] == LIVE_DB_RESOURCE
+
+
+def test_autoscaling_detach_and_provisioned_switch_stop():
+    """Turning history off, or switching to a Provisioned instance, stops regardless of target."""
+    live = _autoscaling_live()
     assert ds.find_problems(_values(explicit={"USE_LAKEBASE": "false"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
-    # Repoint: switching to a Provisioned instance.
     assert ds.find_problems(_values(explicit={"LAKEBASE_INSTANCE_NAME": "inst"}, live=live)[0], live) == [ds.AUTOSCALING_STOP]
-    # Repoint: an endpoint on a different branch.
+
+
+def test_autoscaling_target_matching_the_deployed_resource_is_legitimate_reuse():
+    """Same branch + same database resource = the legitimate reuse case: it proceeds."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, LIVE_DB_RESOURCE)
+    for reset in (False, True):
+        values = _values(live=live, reset=reset)[0]
+        assert ds.find_problems(values, live, reset=reset, autoscaling_target=target) == []
+
+
+def test_autoscaling_target_on_a_different_project_stops():
+    """A derived (or explicit) destination on another project would silently repoint — stop."""
+    live = _autoscaling_live()
+    target = ("projects/other/branches/production",
+              "projects/other/branches/production/databases/databricks-postgres")
+    assert ds.find_problems(_values(live=live)[0], live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_target_on_the_same_branch_but_a_different_database_stops():
+    """Same branch, different database RESOURCE (e.g. the hardcoded databricks-postgres vs the
+    deployed /databases/d) would switch the history database — stop. This is the fixture the
+    review flagged as wrongly treated as safe."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, f"{LIVE_BRANCH}/databases/databricks-postgres")
+    assert ds.find_problems(_values(live=live)[0], live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_autoscaling_without_a_target_falls_back_to_the_explicit_endpoint_branch_check():
+    """A direct find_problems call with no computed target still catches an explicit endpoint on
+    another branch (defense when the destination was not threaded through)."""
+    live = _autoscaling_live()
     other = {"LAKEBASE_ENDPOINT_NAME": "projects/other/branches/production/endpoints/primary"}
     assert ds.find_problems(_values(explicit=other, live=live)[0], live) == [ds.AUTOSCALING_STOP]
-    # Reuse: an endpoint on the SAME branch is fine.
     same = {"LAKEBASE_ENDPOINT_NAME": "projects/p/branches/production/endpoints/primary"}
     assert ds.find_problems(_values(explicit=same, live=live)[0], live) == []
 

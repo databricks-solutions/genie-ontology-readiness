@@ -243,13 +243,13 @@ AUTOSCALING_STOP = (
     "This run would detach or repoint the app's Lakebase Autoscaling history. The deployed app "
     "keeps its assessment history in a Lakebase Autoscaling database (now the default path); "
     "turning history off, switching to a Provisioned instance, or pointing at a different "
-    "Autoscaling branch/endpoint would orphan that history. Keep USE_LAKEBASE on, leave "
-    "LAKEBASE_INSTANCE_NAME unset, and keep LAKEBASE_ENDPOINT_NAME on the deployed branch. "
-    "To start fresh on purpose, set RESET_SETTINGS=true."
+    "Autoscaling branch/endpoint/database would orphan that history. Keep USE_LAKEBASE on, leave "
+    "LAKEBASE_INSTANCE_NAME unset, and set LAKEBASE_ENDPOINT_NAME to the DEPLOYED branch's endpoint "
+    "(see the deployed lakebase-db resource). To start fresh on purpose, set RESET_SETTINGS=true."
 )
 
 
-def _autoscaling_problems(values, live):
+def _autoscaling_problems(values, live, target=None):
     """Safety stops for an app whose history is a Lakebase Autoscaling database.
 
     Autoscaling is the default path, so a correctly-triggered reuse run proceeds: it re-ensures
@@ -258,24 +258,46 @@ def _autoscaling_problems(values, live):
 
     - explicit USE_LAKEBASE=false would turn history off (detach);
     - LAKEBASE_INSTANCE_NAME set would switch to a Provisioned instance (repoint);
-    - an explicit LAKEBASE_ENDPOINT_NAME on a different branch would repoint the compute.
+    - this run's intended destination (``target``: the branch + database RESOURCE names the caller
+      will create/attach) differs from the DEPLOYED lakebase-db resource — it would repoint the
+      compute branch or switch the database.
+
+    ``target`` is ``(branch, database_resource)``. When it is not supplied (a direct
+    ``find_problems`` call with no computed destination), fall back to comparing an explicit
+    LAKEBASE_ENDPOINT_NAME against the deployed branch, so the branch-repoint stop still holds.
     """
     if (values["USE_LAKEBASE"].value or "").strip().lower() == "false":
         return [AUTOSCALING_STOP]
     if (values["LAKEBASE_INSTANCE_NAME"].value or "").strip():
         return [AUTOSCALING_STOP]
     deployed_branch = (live.get("resources", {}).get("LAKEBASE_BRANCH") or "").rstrip("/")
+    deployed_db = (live.get("resources", {}).get("LAKEBASE_DATABASE_RESOURCE") or "").rstrip("/")
+    if target is not None:
+        want_branch = (target[0] or "").rstrip("/")
+        want_db = (target[1] or "").rstrip("/")
+        # Compare against the DEPLOYED resource. A derived destination (from the app name) that
+        # differs from where the app is actually attached would silently repoint it; so would an
+        # explicit endpoint on another branch, or a different database on the same branch.
+        if deployed_branch and want_branch and want_branch != deployed_branch:
+            return [AUTOSCALING_STOP]
+        if deployed_db and want_db and want_db != deployed_db:
+            return [AUTOSCALING_STOP]
+        return []
     want_endpoint = (values["LAKEBASE_ENDPOINT_NAME"].value or "").strip()
     if want_endpoint and deployed_branch and not want_endpoint.startswith(deployed_branch + "/"):
         return [AUTOSCALING_STOP]
     return []
 
 
-def find_problems(values, live, *, reset=False):
+def find_problems(values, live, *, reset=False, autoscaling_target=None):
     """Return the plain-text reasons to stop before changing anything. Empty = go ahead.
 
     With reset=True the deployed settings were ignored on purpose, so the checks that
-    compare against them are skipped (idempotent reuse never detaches history)."""
+    compare against them are skipped (idempotent reuse never detaches history).
+
+    ``autoscaling_target`` is this run's intended ``(branch, database_resource)`` destination (the
+    caller derives it from the app name / an explicit endpoint). It is compared against the
+    deployed Autoscaling resource so a derived-vs-deployed mismatch stops before any change."""
     if reset:
         return []
     if live.get("git") and not live.get("yml_readable"):
@@ -292,11 +314,12 @@ def find_problems(values, live, *, reset=False):
             "To ignore the deployed settings, set RESET_SETTINGS=true."
         ]
     if live.get("autoscaling"):
-        return _autoscaling_problems(values, live)
+        return _autoscaling_problems(values, live, autoscaling_target)
     return _lakebase_problems(values, live.get("env", {}), live.get("resources", {}))
 
 
-def plan(explicit, live, template_text, *, forced=None, extra_defaults=None, reset=False):
+def plan(explicit, live, template_text, *, forced=None, extra_defaults=None, reset=False,
+         autoscaling_target=None):
     """Resolve every setting for this run. Returns (values, problems).
 
     With reset=True the deployed values are ignored: each setting is either explicit
@@ -305,7 +328,7 @@ def plan(explicit, live, template_text, *, forced=None, extra_defaults=None, res
     env = {} if reset else live.get("env", {})
     resources = {} if reset else live.get("resources", {})
     values = resolve(explicit, env, resources, defaults, forced)
-    return values, find_problems(values, live, reset=reset)
+    return values, find_problems(values, live, reset=reset, autoscaling_target=autoscaling_target)
 
 
 def format_table(values):

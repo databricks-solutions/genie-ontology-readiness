@@ -10,6 +10,7 @@ helpers). They assert:
   - idempotent project/branch/endpoint/database/role — create-if-missing AND reuse-if-exists;
   - the rendered LAKEBASE_DATABASE is the RESOLVED underscore name, never the hyphenated id.
 """
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -57,8 +58,9 @@ class _PgFake:
     as a real create would. Records every `cli` (write) call so a test can assert create-vs-reuse
     and ordering."""
 
-    def __init__(self, existing=()):
+    def __init__(self, existing=(), resolve_db=True):
         self.existing = set(existing)
+        self.resolve_db = resolve_db  # False: get-database returns a status WITHOUT postgres_database
         self.cli_calls = []
         self.updates = []  # apps update payloads (the attach)
 
@@ -82,7 +84,8 @@ class _PgFake:
                 return {"name": name, "status": {"hosts": {"host": "ep-x.database.cloud.databricks.com"}}}
             if a[1] == "get-database":
                 # The resource id is hyphenated; the Postgres name is the underscore form.
-                return {"name": name, "status": {"postgres_database": "databricks_postgres"}}
+                status = {"postgres_database": "databricks_postgres"} if self.resolve_db else {}
+                return {"name": name, "status": status}
             return {"name": name}
         return None
 
@@ -241,30 +244,54 @@ def test_render_writes_the_resolved_underscore_database_and_endpoint(monkeypatch
 
 # --- ordering: bundle deploy before the attach -------------------------------
 
-def test_bundle_mode_runs_bundle_deploy_before_the_attach(monkeypatch):
-    """A first-install (bundle) run must publish (`bundle deploy`/`run`) before attaching the
-    lakebase-db resource, or `bundle deploy` would strip the freshly-attached resource."""
-    order = []
+def _as_app(branch, db):
+    """A Git-deployed app with an Autoscaling lakebase-db resource (live branch + db resource)."""
+    return {"name": APP, "service_principal_client_id": SP,
+            "active_deployment": {"git_source": {"commit": "abc"}, "source_code_path": None},
+            "resources": [{"name": "sql-warehouse", "sql_warehouse": {"id": "wh"}},
+                          {"name": "lakebase-db", "postgres": {"branch": branch, "database": db}}]}
+
+
+def _drive_main(monkeypatch, *, get_app, env, order):
+    """Drive post_deploy._main() with the workspace I/O stubbed, recording the step order.
+
+    resolve_settings runs for real (so the repoint/detach guard fires); only its I/O is stubbed.
+    `get_app` is the apps-get dict (None = first install). Lakebase setup/attach/grant/restart and
+    the CLI are recorded. Returns the list of apps-update payloads (the attach)."""
+    updates = []
+    for k in ("WAREHOUSE_ID", "USE_LAKEBASE", "LAKEBASE_INSTANCE_NAME", "LAKEBASE_ENDPOINT_NAME",
+              "LAKEBASE_DATABASE", "RESET_SETTINGS", "INFRA", "ASSESS_CATALOGS"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
 
     monkeypatch.setattr(post_deploy, "PROFILE", "p")
     monkeypatch.setattr(post_deploy, "TARGET", "dev")
+    monkeypatch.setattr(post_deploy, "APP_NAME", APP)
+    monkeypatch.setattr(post_deploy, "ORIGINAL_APP_CONFIG", TEMPLATE)
     monkeypatch.setattr(post_deploy, "resolve_app_name", lambda: APP)
-    monkeypatch.setattr(post_deploy, "_get_app", lambda name: None)  # first install
+    monkeypatch.setattr(post_deploy, "git_version", lambda: "1.0")
+    monkeypatch.setattr(post_deploy, "_workspace_id_default", lambda: "9")
+    monkeypatch.setattr(post_deploy, "_get_app", lambda name: get_app)
     monkeypatch.setattr(post_deploy, "render_app_yml", lambda values: order.append("render"))
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: order.append("grant-perms"))
 
-    live = ds.read_live(None, lambda p: None)
-    values, _ = ds.plan({"WAREHOUSE_ID": "wh", "USE_LAKEBASE": "true"}, live, TEMPLATE,
-                        forced={"GOR_VERSION": "1", "LAKEBASE_USER": "", "LAKEBASE_HOST": ""},
-                        extra_defaults={"WORKSPACE_ID": "9"})
-    monkeypatch.setattr(post_deploy, "resolve_settings", lambda live: values)
-
-    def _fake_setup():
+    def _setup_as():
         order.append("setup-autoscaling")
         post_deploy._LAKEBASE.update(host="ep.host", sp_client_id=SP, endpoint=_ids()["endpoint"],
                                      branch=_ids()["branch"], database_resource=_ids()["database"],
                                      database="databricks_postgres")
-    monkeypatch.setattr(post_deploy, "setup_lakebase_autoscaling", _fake_setup)
+
+    def _setup_prov():
+        order.append("setup-provisioned")
+        post_deploy._LAKEBASE.update(host="prov.host", sp_client_id=SP)
+
+    monkeypatch.setattr(post_deploy, "setup_lakebase_autoscaling", _setup_as)
+    monkeypatch.setattr(post_deploy, "setup_lakebase", _setup_prov)
+    monkeypatch.setattr(post_deploy, "attach_lakebase_autoscaling",
+                        lambda: order.append("attach-autoscaling"))
+    monkeypatch.setattr(post_deploy, "attach_lakebase", lambda: order.append("attach-provisioned"))
+    monkeypatch.setattr(post_deploy, "upgrade_app", lambda values, live: order.append("upgrade"))
 
     def _fake_cli(*args, check=True):
         if args[:2] == ("bundle", "deploy"):
@@ -277,29 +304,119 @@ def test_bundle_mode_runs_bundle_deploy_before_the_attach(monkeypatch):
     monkeypatch.setattr(post_deploy, "cli", _fake_cli)
     monkeypatch.setattr(post_deploy, "cli_json",
                         lambda *a: {"active_deployment": {"source_code_path": "/W/app"}})
-    monkeypatch.setattr(post_deploy, "_update_resources", lambda **kw: order.append(("attach", kw)))
+    post_deploy._main()
+    return updates
+
+
+def test_bundle_mode_sequence_render_publish_attach(monkeypatch):
+    """First-install (bundle) ordering must be: render -> bundle deploy -> bundle run -> attach,
+    so `bundle deploy` (which reconciles resources from databricks.yml) can't strip the freshly-
+    attached lakebase-db. The attach is the Autoscaling path (no instance set)."""
+    order = []
+    _drive_main(monkeypatch, get_app=None, env={"WAREHOUSE_ID": "wh", "USE_LAKEBASE": "true"},
+                order=order)
+    seq = [s for s in order if s in ("render", "bundle-deploy", "bundle-run", "attach-autoscaling")]
+    assert seq == ["render", "bundle-deploy", "bundle-run", "attach-autoscaling"]
+    assert "attach-provisioned" not in order  # Autoscaling is the default path
+
+
+def test_attach_sequence_update_then_grant_then_restart(monkeypatch):
+    """attach_lakebase_autoscaling must update (attach) -> grant -> restart (apps deploy). Removing
+    _restart_app or reordering grant/restart fails here."""
+    order = []
+    fake = _PgFake(existing=list(_ids().values()))
+    monkeypatch.setattr(post_deploy, "APP_NAME", APP)
+    monkeypatch.setattr(post_deploy, "LAKEBASE_INSTANCE", "")
+    monkeypatch.setattr(post_deploy, "USE_LAKEBASE", True)
+    monkeypatch.setattr(post_deploy, "cli_json", fake.cli_json)
+
+    def _fake_cli(*args, check=True):
+        if args[:2] == ("apps", "deploy"):
+            order.append("restart")
+        return 0
+    monkeypatch.setattr(post_deploy, "cli", _fake_cli)
+    monkeypatch.setattr(post_deploy, "_update_resources",
+                        lambda **kw: order.append(("attach", kw)) or True)
     monkeypatch.setattr(post_deploy, "_grant_history", lambda: order.append("grant"))
 
-    post_deploy._main()
+    post_deploy.setup_lakebase_autoscaling()
+    post_deploy.attach_lakebase_autoscaling()
 
-    attach = next(i for i, step in enumerate(order) if isinstance(step, tuple) and step[0] == "attach")
-    assert order.index("bundle-deploy") < attach
-    assert order.index("bundle-run") < attach
-    # the attach carries the Autoscaling `postgres` payload (not a Provisioned instance)
-    _, kw = order[attach]
+    steps = [s if isinstance(s, str) else s[0] for s in order]
+    assert steps == ["attach", "grant", "restart"]
+    _, kw = next(s for s in order if isinstance(s, tuple))
     assert kw["postgres"]["database"] == _ids()["database"]
-    assert "lakebase" not in kw or kw["lakebase"] is None
-    assert order.index("grant") > attach  # grant after the attach, per the contract ordering
+    assert kw.get("lakebase") is None  # not the Provisioned shape
 
 
-def test_provisioned_still_runs_when_instance_name_is_set(monkeypatch):
-    """Provisioned (legacy) must still trigger when LAKEBASE_INSTANCE_NAME is set, not Autoscaling."""
-    calls = []
-    monkeypatch.setattr(post_deploy, "setup_lakebase", lambda: calls.append("provisioned"))
-    monkeypatch.setattr(post_deploy, "setup_lakebase_autoscaling", lambda: calls.append("autoscaling"))
-    # effective_lakebase true + an instance set -> provisioned branch
-    assert ds.effective_lakebase("true", "inst") is True
-    # Mirror the _main dispatch (USE_LAKEBASE on):
-    instance = "inst"
-    (post_deploy.setup_lakebase if instance else post_deploy.setup_lakebase_autoscaling)()
-    assert calls == ["provisioned"]
+def test_provisioned_path_is_taken_when_instance_name_is_set(monkeypatch):
+    """Drive _main with resolved Provisioned settings (LAKEBASE_INSTANCE_NAME set): the Provisioned
+    setup + attach run, Autoscaling does not."""
+    order = []
+    _drive_main(monkeypatch, get_app=None,
+                env={"WAREHOUSE_ID": "wh", "USE_LAKEBASE": "true",
+                     "LAKEBASE_INSTANCE_NAME": "shared-inst", "LAKEBASE_DATABASE": "ontology_readiness"},
+                order=order)
+    assert "setup-provisioned" in order and "setup-autoscaling" not in order
+    assert "attach-provisioned" in order and "attach-autoscaling" not in order
+
+
+# --- would-repoint / would-detach guards (blocking 1 & 2) --------------------
+
+DERIVED_BRANCH = f"projects/{APP}/branches/production"
+DERIVED_DB = f"{DERIVED_BRANCH}/databases/databricks-postgres"
+
+
+def test_main_stops_before_any_change_when_live_is_another_project(monkeypatch):
+    """BLOCKING 1: an upgrade with no explicit endpoint must NOT silently repoint a live app that is
+    attached to another project to the app-name-derived one — it stops before any change."""
+    order = []
+    app = _as_app("projects/elsewhere/branches/production",
+                  "projects/elsewhere/branches/production/databases/databricks-postgres")
+    with pytest.raises(SystemExit):
+        _drive_main(monkeypatch, get_app=app, env={"USE_LAKEBASE": "true"}, order=order)
+    # stopped in resolve_settings, before setup / publish / attach
+    assert not any(s in order for s in ("setup-autoscaling", "bundle-deploy", "attach-autoscaling",
+                                        "apps-deploy"))
+
+
+def test_main_stops_when_live_database_resource_differs_on_the_same_branch(monkeypatch):
+    """BLOCKING 2: same branch but a different live database RESOURCE (the app uses /databases/d,
+    the script would otherwise attach /databases/databricks-postgres) must stop, not switch DBs."""
+    order = []
+    app = _as_app(DERIVED_BRANCH, f"{DERIVED_BRANCH}/databases/d")
+    with pytest.raises(SystemExit):
+        _drive_main(monkeypatch, get_app=app, env={"USE_LAKEBASE": "true"}, order=order)
+    assert not any(s in order for s in ("setup-autoscaling", "bundle-deploy", "attach-autoscaling"))
+
+
+def test_main_proceeds_on_legitimate_reuse_same_project_branch_and_database(monkeypatch):
+    """The legitimate reuse case (live branch + db == the derived destination) proceeds through
+    setup and the in-place upgrade (no bundle deploy for an existing app)."""
+    order = []
+    app = _as_app(DERIVED_BRANCH, DERIVED_DB)
+    _drive_main(monkeypatch, get_app=app, env={"USE_LAKEBASE": "true"}, order=order)
+    assert "setup-autoscaling" in order  # not stopped
+
+
+# --- blocking 3: unresolved postgres_database hard-fails before publish ------
+
+def test_setup_hard_fails_when_postgres_database_cannot_be_resolved(monkeypatch):
+    """BLOCKING 3: if get-database has no .status.postgres_database, setup must hard-error rather
+    than fall open to the previous/hyphenated LAKEBASE_DATABASE."""
+    fake = _PgFake(existing=list(_ids().values()), resolve_db=False)
+    _wire(monkeypatch, fake)
+    with pytest.raises(SystemExit):
+        post_deploy.setup_lakebase_autoscaling()
+    # host may resolve, but the DB name did not, so nothing is recorded for publish
+    assert post_deploy._LAKEBASE["database"] == ""
+
+
+def test_postgres_database_name_ignores_spec_and_uses_status_only(monkeypatch):
+    """The resolved name must come from .status.postgres_database ONLY (no spec fallback)."""
+    monkeypatch.setattr(post_deploy, "cli_json",
+                        lambda *a: {"name": a[2], "status": {}, "spec": {"postgres_database": "from_spec"}})
+    assert post_deploy._postgres_database_name("projects/p/branches/b/databases/x") == ""
+    monkeypatch.setattr(post_deploy, "cli_json",
+                        lambda *a: {"name": a[2], "status": {"postgres_database": "from_status"}})
+    assert post_deploy._postgres_database_name("projects/p/branches/b/databases/x") == "from_status"

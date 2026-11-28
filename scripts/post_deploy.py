@@ -279,6 +279,19 @@ def _read_workspace_text(path):
         return dest.read_text()
 
 
+def _intended_autoscaling_target(endpoint_value):
+    """This run's intended Autoscaling ``(branch, database_resource)`` destination for the given
+    resolved LAKEBASE_ENDPOINT_NAME.
+
+    Derived from an explicit endpoint (reuse it) or, when none is set, from the app name — exactly
+    what setup_lakebase_autoscaling will create/attach. deploy_settings compares it against the
+    DEPLOYED lakebase-db resource so a mismatch stops before any change (it would silently repoint
+    the branch or switch the database)."""
+    project_id, branch_id, _ = _autoscaling_ids(endpoint_value)
+    branch = f"projects/{project_id}/branches/{branch_id}"
+    return branch, f"{branch}/databases/{AUTOSCALING_DATABASE_ID}"
+
+
 def resolve_settings(live):
     """Resolve every setting for this run. Prints the table; stops on a safety problem."""
     reset = reset_requested()
@@ -287,6 +300,14 @@ def resolve_settings(live):
     extra = {"WORKSPACE_ID": _workspace_id_default()}
     values, problems = deploy_settings.plan(
         explicit_from_env(), live, template_text, forced=forced, extra_defaults=extra, reset=reset)
+    # Autoscaling repoint/detach guard: compare this run's intended destination — derived from the
+    # RESOLVED endpoint (so it matches what setup_lakebase_autoscaling will create/attach) — against
+    # the DEPLOYED lakebase-db resource. Stops before any change if it would repoint or switch DBs.
+    if live.get("autoscaling") and not reset:
+        target = _intended_autoscaling_target(values["LAKEBASE_ENDPOINT_NAME"].value)
+        for p in deploy_settings.find_problems(values, live, reset=reset, autoscaling_target=target):
+            if p not in problems:
+                problems.append(p)
     if not values["WAREHOUSE_ID"].value:
         problems.insert(0, "No SQL warehouse id. Set WAREHOUSE_ID to a SQL warehouse you can use. "
                            "List warehouses with: databricks warehouses list.")
@@ -403,14 +424,13 @@ def _endpoint_host(endpoint):
 def _postgres_database_name(database_resource):
     """The resolved Postgres database name (underscore) of an Autoscaling database resource.
 
-    Read from `postgres get-database <resource> .status.postgres_database` — NEVER the
-    hyphenated resource id. "" if it cannot be read."""
+    Read from `postgres get-database <resource> .status.postgres_database` ONLY — the
+    status-reported name is the live, authoritative Postgres name (underscore). The hyphenated
+    resource id and any `spec` value are NOT used: rendering the hyphenated id fails pool init
+    with `database "databricks-postgres" does not exist`. "" if it cannot be read."""
     db = cli_json("postgres", "get-database", database_resource)
     if isinstance(db, dict):
-        for part in (db.get("status") or {}, db.get("spec") or {}):
-            name = part.get("postgres_database")
-            if name:
-                return name
+        return (db.get("status") or {}).get("postgres_database") or ""
     return ""
 
 
@@ -510,14 +530,20 @@ def setup_lakebase_autoscaling():
 
     host = _endpoint_host(endpoint)
     database = _postgres_database_name(database_resource)
+    # Hard requirement: the RESOLVED underscore Postgres name must be known before we publish or
+    # attach. Without it, rendering would keep the previous/default LAKEBASE_DATABASE (risking the
+    # forbidden hyphenated id or a wrong database), so refuse rather than fail open. Nothing has
+    # been published or attached yet; the created/reused resources are idempotent to re-run.
+    if not database:
+        _stop([f"Could not resolve the Postgres database name of '{database_resource}' "
+               f"(postgres get-database ... .status.postgres_database was empty). Refusing to "
+               f"publish with an unresolved database name (the hyphenated resource id fails pool "
+               f"init). Make sure the database is ready, then run this script again."])
     _LAKEBASE.update(host=host, sp_client_id=sp, user_email=user_email, endpoint=endpoint,
                      branch=branch, database_resource=database_resource, database=database)
     if not host:
         print("  WARNING: could not resolve the endpoint host — history will stay off this run.")
-    if database:
-        print(f"  database: resource '{database_resource}' -> Postgres name '{database}'")
-    else:
-        print(f"  WARNING: could not resolve the Postgres name of '{database_resource}'.")
+    print(f"  database: resource '{database_resource}' -> Postgres name '{database}'")
 
 
 def _grant_history():
