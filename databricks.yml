@@ -120,4 +120,4 @@ targets:
     resources:
       apps:
         ontology_readiness:
-          name: genie-ontology-readiness-pr-${var.preview_slug}
+          name: gor-pr-${var.preview_slug}
