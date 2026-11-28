@@ -57,7 +57,10 @@ async def _active_deployment(app_name: str) -> dict:
     """The app's own active deployment, or {} (no access, not on Apps, timeout)."""
     try:
         # Client/auth initialization and the SDK request can both block.
-        app = await run_sync(lambda: _get_workspace_client().apps.get(app_name))
+        # Bound caller latency even if SDK retries continue in the worker thread.
+        app = await asyncio.wait_for(
+            run_sync(lambda: _get_workspace_client().apps.get(app_name)), timeout=5,
+        )
         return app.active_deployment.as_dict() if app and app.active_deployment else {}
     except Exception as e:  # never block the UI on this
         logger.info("build info: could not read the active deployment: %s", type(e).__name__)

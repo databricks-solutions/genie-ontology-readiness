@@ -78,6 +78,33 @@ class BuildInfoTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await build_info._active_deployment("gor-dev"), {})
         client.return_value.apps.get.assert_called_once_with("gor-dev")
 
+    async def test_slow_sdk_lookup_returns_empty_within_caller_deadline(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow_get(name):
+            started.set()
+            try:
+                release.wait(timeout=15)
+                return App(name=name)
+            finally:
+                finished.set()
+
+        with patch.object(build_info, "_get_workspace_client") as client:
+            client.return_value.apps.get.side_effect = slow_get
+            try:
+                with self.assertLogs(build_info.logger, "INFO") as logs:
+                    result = await asyncio.wait_for(build_info._active_deployment("gor-dev"), timeout=6)
+                self.assertEqual(result, {})
+                self.assertTrue(started.is_set())
+                self.assertFalse(finished.is_set())  # caller returned while the SDK was still blocked
+                self.assertIn("TimeoutError", logs.output[0])
+                client.return_value.apps.get.assert_called_once_with("gor-dev")
+            finally:
+                release.set()
+                self.assertTrue(await run_sync(finished.wait, 1))
+
     async def test_sdk_active_deployment_preserves_fields_and_request_context(self):
         expected = {
             "deployment_id": "01f1",
