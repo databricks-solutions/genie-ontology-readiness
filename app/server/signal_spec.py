@@ -34,6 +34,31 @@ import re
 # The default schema predicate when no schema allowlist is in force.
 DEFAULT_SCHEMA_FILTER = "{column} <> 'information_schema'"
 
+# ---------------------------------------------------------------------------
+# Shared table_type taxonomy
+# ---------------------------------------------------------------------------
+# One source of truth for the ``table_type`` sets, so the headline spec SQL, the
+# probes.py drill-down, and the hive-coverage query can't drift (#87). ``table_type``
+# for metric views is spelled either way on different runtimes ('METRIC_VIEW' or
+# 'METRIC VIEW'), so both spellings appear wherever metric views are matched/excluded.
+METRIC_VIEW_TYPES = ("METRIC_VIEW", "METRIC VIEW")
+
+# The "tables" denominator counts physical tables only — exclude views (plain +
+# metric, both spellings). This is an exclusion (NOT IN), not a positive allowlist,
+# so unknown/future physical table types still count.
+UC_NON_TABLE_TYPES = ("VIEW",) + METRIC_VIEW_TYPES
+
+# Streaming tables and materialized views are UC-managed objects (DLT/dlt-meta
+# create many of these), so they count toward the managed numerator alongside the
+# classic managed types.
+UC_MANAGED_TABLE_TYPES = ("MANAGED", "MANAGED_SHALLOW_CLONE", "STREAMING_TABLE", "MATERIALIZED_VIEW")
+
+
+def sql_type_list(types) -> str:
+    """Render a tuple of ``table_type`` literals as a SQL IN-list body, e.g.
+    ``'VIEW','METRIC_VIEW','METRIC VIEW'``."""
+    return ",".join("'" + t + "'" for t in types)
+
 
 def render_sql(template: str, sources: dict[str, str] | None = None, schema_filter: str | None = None,
                schema_column: str = "table_schema", workspace_filter: str | None = None) -> str:
@@ -227,8 +252,8 @@ UC_FOUNDATION = _index({
             ),
             "sql": (
                 "SELECT COUNT(*) AS total,\n"
-                "       SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE','STREAMING_TABLE','MATERIALIZED_VIEW') THEN 1 ELSE 0 END) AS managed\n"
-                "FROM <TABLES> WHERE {schema_filter} AND table_type NOT IN ('VIEW','METRIC_VIEW');"
+                f"       SUM(CASE WHEN table_type IN ({sql_type_list(UC_MANAGED_TABLE_TYPES)}) THEN 1 ELSE 0 END) AS managed\n"
+                f"FROM <TABLES> WHERE {{schema_filter}} AND table_type NOT IN ({sql_type_list(UC_NON_TABLE_TYPES)});"
             ),
             "shared": True,
         },
@@ -238,12 +263,14 @@ UC_FOUNDATION = _index({
                 "legacy (non-UC) footprint still in the workspace-local Hive metastore (best-effort;\n"
                 "omit this signal if hive_metastore.information_schema isn't readable — e.g. it\n"
                 "raises UC_HIVE_METASTORE_DISABLED_EXCEPTION when legacy access is turned off,\n"
-                "which just means non_uc is unknown, NOT that the pillar is unavailable)"
+                "which just means non_uc is unknown, NOT that the pillar is unavailable).\n"
+                "Excludes views (same as the UC total) so both sides of uc_coverage_pct count\n"
+                "only physical tables (#87)."
             ),
             "sql": (
                 "SELECT COUNT(*) AS non_uc\n"
                 "FROM hive_metastore.information_schema.tables\n"
-                "WHERE table_schema <> 'information_schema';"
+                f"WHERE table_schema <> 'information_schema' AND table_type NOT IN ({sql_type_list(UC_NON_TABLE_TYPES)});"
             ),
             "shared": True,
         },
@@ -362,8 +389,8 @@ REL_MODELING = _index({
 # ---------------------------------------------------------------------------
 # 4. Metrics (metric views)
 # ---------------------------------------------------------------------------
-# table_type is spelled either way on different runtimes; the App tries each in turn.
-METRIC_VIEW_TYPES = ("METRIC_VIEW", "METRIC VIEW")
+# ``METRIC_VIEW_TYPES`` (the runtime spellings the App tries in turn) is defined
+# once near the top of this module and shared with the UC-foundation exclusion.
 METRIC_BASE_POINTS = 30
 METRIC_RAMP_POINTS = 40
 METRIC_RAMP_VIEWS = 10

@@ -39,15 +39,17 @@ WHERE schema_name <> 'information_schema';
 -- of these alongside views — see issue #87).
 SELECT COUNT(*) AS total,
        SUM(CASE WHEN table_type IN ('MANAGED','MANAGED_SHALLOW_CLONE','STREAMING_TABLE','MATERIALIZED_VIEW') THEN 1 ELSE 0 END) AS managed
-FROM <TABLES> WHERE table_schema <> 'information_schema' AND table_type NOT IN ('VIEW','METRIC_VIEW');
+FROM <TABLES> WHERE table_schema <> 'information_schema' AND table_type NOT IN ('VIEW','METRIC_VIEW','METRIC VIEW');
 
 -- legacy (non-UC) footprint still in the workspace-local Hive metastore (best-effort;
 -- omit this signal if hive_metastore.information_schema isn't readable — e.g. it
 -- raises UC_HIVE_METASTORE_DISABLED_EXCEPTION when legacy access is turned off,
--- which just means non_uc is unknown, NOT that the pillar is unavailable)
+-- which just means non_uc is unknown, NOT that the pillar is unavailable).
+-- Excludes views (same as the UC total) so both sides of uc_coverage_pct count
+-- only physical tables (#87).
 SELECT COUNT(*) AS non_uc
 FROM hive_metastore.information_schema.tables
-WHERE table_schema <> 'information_schema';
+WHERE table_schema <> 'information_schema' AND table_type NOT IN ('VIEW','METRIC_VIEW','METRIC VIEW');
 ```
 
 `n_catalogs` = user (non-internal) catalogs in scope.
