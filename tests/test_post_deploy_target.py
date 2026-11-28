@@ -9,10 +9,10 @@ drift that would make the "read the name back from the bundle" guarantee inert
 fails a test instead of silently always using the fallback.
 """
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import post_deploy  # noqa: E402
@@ -88,6 +88,16 @@ def test_preview_requires_bundle_summary(monkeypatch, summary):
     monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
     monkeypatch.setattr(post_deploy, "cli_json", lambda *args: summary)
     with pytest.raises(SystemExit, match="preview app name must be resolved from bundle summary"):
+        post_deploy.resolve_app_name()
+
+
+@pytest.mark.parametrize("slug", ["", " ", "\t\n"])
+def test_preview_rejects_empty_slug(monkeypatch, slug):
+    monkeypatch.setattr(post_deploy, "TARGET", "preview")
+    monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "")
+    monkeypatch.setattr(post_deploy, "cli_json",
+                        lambda *args: _bundle_summary(f"genie-ontology-readiness-pr-{slug}"))
+    with pytest.raises(SystemExit, match=r"non-empty preview_slug \(PR number or branch slug\)"):
         post_deploy.resolve_app_name()
 
 

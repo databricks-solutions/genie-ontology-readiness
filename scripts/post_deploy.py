@@ -518,6 +518,8 @@ def resolve_app_name():
         name = None
     if not name:
         name = _fallback_app_name()
+    if TARGET == "preview" and name.rstrip().endswith("pr-"):
+        raise SystemExit("ERROR: preview requires a non-empty preview_slug (PR number or branch slug).")
     explicit = os.environ.get("APP_NAME")
     if explicit and explicit != name:
         print(f"  (warning) APP_NAME={explicit!r} ignored — target '{TARGET}' resolves the "
