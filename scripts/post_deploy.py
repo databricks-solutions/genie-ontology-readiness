@@ -42,6 +42,11 @@ setting that you do not set is reused from the deployed app. To change one
 setting, export just that variable. To ignore the deployed settings, set
 RESET_SETTINGS=true. Set INFRA=true only when the release changed databricks.yml.
 
+For contributor previews, prefer scripts/preview.sh: it builds the frontend, forces
+stateless settings, and uses your CLI auth (a named profile is optional for preview).
+Preview skips automatic catalog/system grants; an admin can grant additional reads
+separately using /api/setup/grants.
+
 Python 3.9+. Requires databricks-sdk>=0.36.0 (the SP-grant step,
 setup_app_permissions.py, resolves the app SP via the SDK). The Lakebase
 history steps additionally require asyncpg.
@@ -49,7 +54,6 @@ history steps additionally require asyncpg.
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -70,6 +74,7 @@ from server.user_agent import git_version  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deploy_settings  # noqa: E402
+from preview import validate_slug  # noqa: E402
 
 PROFILE = os.environ.get("DATABRICKS_PROFILE", "")
 # Bundle target (dev|stg|prod|preview). The app name is pinned per target in
@@ -174,6 +179,9 @@ def render_app_yml(values):
     text, missing = deploy_settings.render(ORIGINAL_APP_CONFIG, rendered)
     for name in missing:
         print(f"  (warning) could not set {name} in app.yaml — leaving the committed value")
+    if TARGET == "preview":
+        # A stateless app has no lakebase-db resource to resolve at startup.
+        text = text.replace("valueFrom: lakebase-db", 'value: ""')
     APP_CONFIG.write_text(text)
     print(f"  Rendered {APP_CONFIG} (restored to the committed text when this run ends)")
 
@@ -509,13 +517,10 @@ def _preview_var_args():
     """Validate the preview identifier before any bundle call; other targets ignore it."""
     if TARGET != "preview":
         return []
-    slug = PREVIEW_SLUG.strip()
-    if not slug:
-        raise SystemExit("ERROR: preview requires a non-empty PREVIEW_SLUG / preview_slug (PR number or branch slug).")
-    if not re.fullmatch(r"[a-z0-9-]+", slug):
-        raise SystemExit("ERROR: PREVIEW_SLUG must contain only lowercase letters, digits, and hyphens.")
-    if len(f"gor-pr-{slug}") > 30:
-        raise SystemExit("ERROR: PREVIEW_SLUG must be at most 23 characters so the app name is at most 30 characters.")
+    try:
+        slug = validate_slug(PREVIEW_SLUG)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     return [f"--var=preview_slug={slug}"]
 
 
@@ -570,7 +575,7 @@ def main():
 
 def _main():
     global APP_NAME, WAREHOUSE_ID, USE_LAKEBASE, LAKEBASE_INSTANCE, LAKEBASE_DATABASE, LAKEBASE_SSL_MODE
-    if not PROFILE:
+    if not PROFILE and TARGET != "preview":
         print("ERROR: DATABRICKS_PROFILE not set.")
         sys.exit(1)
     if TARGET not in VALID_TARGETS:
@@ -620,7 +625,11 @@ def _main():
     # The grants must cover the catalogs this run deploys, which may come from the
     # deployed app rather than from this shell.
     env["ASSESS_CATALOGS"] = values["ASSESS_CATALOGS"].value
-    subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
+    if TARGET == "preview":
+        print("  Preview: skipping automatic catalog/system grants. Unavailable data is not assessed. "
+              "An admin can apply the app's /api/setup/grants SQL separately if needed.")
+    else:
+        subprocess.run([sys.executable, str(Path(__file__).parent / "setup_app_permissions.py")], env=env)
 
     if mode == "upgrade":
         print("\n[3/3] Upgrading the app in place (sync source, apps deploy)...")
@@ -640,6 +649,8 @@ def _main():
         _stop(["bundle deploy failed. The app was not updated. Fix the error above, then run this script again."])
     rc = cli("bundle", "run", "ontology_readiness", "-t", TARGET, *var_args, check=False)
     if rc != 0:
+        if TARGET == "preview":
+            _stop(["Preview bundle run failed. Fix the error above and retry."])
         print(f"  (bundle run failed — ensure --var warehouse_id is set. If the app already "
               f"exists outside target '{TARGET}' state, redeploy code with `databricks apps deploy {APP_NAME}`.)")
 

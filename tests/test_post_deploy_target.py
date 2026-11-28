@@ -139,12 +139,13 @@ def test_non_preview_summary_ignores_slug(monkeypatch, target):
 
 
 @pytest.mark.parametrize("target", ["preview", "dev", "stg", "prod"])
-def test_bundle_publish_threads_slug_only_for_preview(monkeypatch, target):
+@pytest.mark.parametrize("run_rc", [0, 1])
+def test_bundle_publish_threads_slug_only_for_preview(monkeypatch, target, run_rc):
     """Exercise the real publish path with all external calls stubbed."""
     for key in ("APP_NAME", "WAREHOUSE_ID", "USE_LAKEBASE", "LAKEBASE_INSTANCE",
                 "LAKEBASE_DATABASE", "LAKEBASE_SSL_MODE"):
         monkeypatch.setattr(post_deploy, key, getattr(post_deploy, key))
-    monkeypatch.setattr(post_deploy, "PROFILE", "test-profile")
+    monkeypatch.setattr(post_deploy, "PROFILE", "" if target == "preview" else "test-profile")
     monkeypatch.setattr(post_deploy, "TARGET", target)
     monkeypatch.setattr(post_deploy, "PREVIEW_SLUG", "159")
     monkeypatch.setattr(post_deploy, "WAREHOUSE_ID", "warehouse")
@@ -157,11 +158,20 @@ def test_bundle_publish_threads_slug_only_for_preview(monkeypatch, target):
         {"USE_LAKEBASE": "false", "LAKEBASE_SSL_MODE": "verify-full"})
     monkeypatch.setattr(post_deploy, "resolve_settings", lambda live: values)
     monkeypatch.setattr(post_deploy, "render_app_yml", lambda values: None)
-    monkeypatch.setattr(post_deploy.subprocess, "run", lambda *args, **kwargs: None)
+    grants = []
+    monkeypatch.setattr(post_deploy.subprocess, "run", lambda *args, **kwargs: grants.append(args))
     calls = []
-    monkeypatch.setattr(post_deploy, "cli", lambda *args, **kwargs: calls.append(args) or 0)
+    def cli(*args, **kwargs):
+        calls.append(args)
+        return run_rc if args[:2] == ("bundle", "run") else 0
 
-    post_deploy._main()
+    monkeypatch.setattr(post_deploy, "cli", cli)
+    if target == "preview" and run_rc:
+        with pytest.raises(SystemExit):
+            post_deploy._main()
+    else:
+        post_deploy._main()
+    assert len(grants) == (0 if target == "preview" else 1)
 
     var_args = ("--var=warehouse_id=warehouse",)
     if target == "preview":
@@ -170,3 +180,24 @@ def test_bundle_publish_threads_slug_only_for_preview(monkeypatch, target):
         ("bundle", "deploy", "-t", target, *var_args),
         ("bundle", "run", "ontology_readiness", "-t", target, *var_args),
     ]
+
+
+@pytest.mark.parametrize("target", ["preview", "dev", "stg", "prod"])
+def test_render_preview_has_no_unbound_lakebase_reference(monkeypatch, tmp_path, target):
+    original = (post_deploy.APP_DIR / "app.yaml").read_text()
+    config = tmp_path / "app.yaml"
+    config.write_text(original)
+    monkeypatch.setattr(post_deploy, "APP_CONFIG", config)
+    monkeypatch.setattr(post_deploy, "ORIGINAL_APP_CONFIG", original)
+    monkeypatch.setattr(post_deploy, "TARGET", target)
+    monkeypatch.setattr(post_deploy, "USE_LAKEBASE", False)
+    values = post_deploy.deploy_settings.resolve({}, {}, {}, {})
+    post_deploy.render_app_yml(values)
+    rendered = yaml.safe_load(config.read_text())
+    entries = {entry["name"]: entry for entry in rendered["env"]}
+    assert entries["USE_LAKEBASE"]["value"] == "false"
+    assert entries["DATABRICKS_WAREHOUSE_ID"]["valueFrom"] == "sql-warehouse"
+    if target == "preview":
+        assert entries["LAKEBASE_HOST"] == {"name": "LAKEBASE_HOST", "value": ""}
+    else:
+        assert entries["LAKEBASE_HOST"]["valueFrom"] == "lakebase-db"
