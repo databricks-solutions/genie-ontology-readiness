@@ -163,10 +163,12 @@ def test_git_detection_does_not_need_an_empty_source_path():
     assert live["git"] and live["yml_readable"]
 
 
-def test_an_empty_postgres_object_still_counts_as_autoscaling():
+def test_an_empty_postgres_object_counts_as_autoscaling_but_stops_as_unknown():
     live = ds.read_live(_git_app(lakebase={"name": "lakebase-db", "postgres": {}}), lambda p: None)
-    # Autoscaling is now the default path: a correctly-triggered reuse run proceeds (no stop).
-    assert live["autoscaling"] and ds.find_problems(_values(live=live)[0], live) == []
+    # Attached to Autoscaling, but the resource names no branch/database — the destination is
+    # unknown, so the run must NOT assume a first install and create a new project.
+    assert live["autoscaling"]
+    assert ds.find_problems(_values(live=live)[0], live) == [ds.AUTOSCALING_UNKNOWN_STOP]
 
 
 LIVE_BRANCH = "projects/p/branches/production"
@@ -244,6 +246,34 @@ def test_reset_does_not_bypass_the_autoscaling_detach_or_repoint_stops():
     # legitimate reuse under reset still proceeds
     assert ds.find_problems(values, live, reset=True,
                             autoscaling_target=(LIVE_BRANCH, LIVE_DB_RESOURCE)) == []
+
+
+def test_detach_stop_only_on_an_explicit_user_use_lakebase_false():
+    """An INHERITED USE_LAKEBASE=false (render artifact when the host was momentarily empty) must
+    NOT block an attached Autoscaling app on every upgrade; only a user-set false detaches."""
+    live = _autoscaling_live()
+    target = (LIVE_BRANCH, LIVE_DB_RESOURCE)
+    base = dict(_values(live=live)[0])
+    # inherited false (deployed) -> history treated as on -> no stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_DEPLOYED)
+    assert ds.find_problems(base, live, autoscaling_target=target) == []
+    # default false -> also no stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_DEFAULT)
+    assert ds.find_problems(base, live, autoscaling_target=target) == []
+    # explicit user false -> detach stop
+    base["USE_LAKEBASE"] = ds.Setting("false", ds.SOURCE_YOU)
+    assert ds.find_problems(base, live, autoscaling_target=target) == [ds.AUTOSCALING_STOP]
+
+
+def test_history_on_treats_inherited_false_as_on_for_autoscaling():
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_DEPLOYED), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_DEFAULT), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "", autoscaling=True) is True
+    assert ds.history_on(ds.Setting("false", ds.SOURCE_YOU), "", autoscaling=True) is False
+    # non-autoscaling falls back to effective_lakebase
+    assert ds.history_on(ds.Setting("true", ds.SOURCE_YOU), "", autoscaling=False) is True
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "", autoscaling=False) is False
+    assert ds.history_on(ds.Setting("auto", ds.SOURCE_DEFAULT), "inst", autoscaling=False) is True
 
 
 # --- precedence ----------------------------------------------------------------

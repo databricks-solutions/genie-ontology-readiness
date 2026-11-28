@@ -25,7 +25,7 @@ import post_deploy  # noqa: E402
 TEMPLATE = (ROOT / "app" / "app.yaml").read_text()
 APP = "genie-ontology-readiness-dev"
 SP = "sp-uuid-123"
-ROLE_ID = "gor_sp_uuid_123"  # _pg_role_id(SP): starts with a letter, UUID sanitized
+ROLE_ID = "gor-sp-uuid-123"  # _pg_role_id(SP): a valid resource id (lowercase/hyphen, letter-prefixed)
 
 
 def _reset_lakebase():
@@ -67,16 +67,20 @@ class _PgFake:
     (write) call so a test can assert create-vs-reuse, ordering, and that --replace-existing is
     never passed for the history database/endpoint."""
 
-    def __init__(self, existing=(), resolve_db=True, get_error=None):
+    def __init__(self, existing=(), resolve_db=True, get_error=None, create_fail=None,
+                 endpoint_host="ep-x.database.cloud.databricks.com", read_only_endpoints=()):
         self.existing = set(existing)
         self.resolve_db = resolve_db  # False: get-database returns a status WITHOUT postgres_database
         self.get_error = get_error    # (verb, stderr) -> a non-NOT_FOUND read failure on that verb
+        self.create_fail = create_fail  # a create-* verb that returns non-zero (rc 1)
+        self.endpoint_host = endpoint_host  # "" -> endpoint host never populates
+        self.read_only_endpoints = set(read_only_endpoints)  # excluded from list-endpoints RW set
         self.cli_calls = []
         self.updates = []             # apps update payloads (the attach)
 
     def _resource_json(self, verb, name):
         if verb == "get-endpoint":
-            return {"name": name, "status": {"hosts": {"host": "ep-x.database.cloud.databricks.com"}}}
+            return {"name": name, "status": {"hosts": {"host": self.endpoint_host}}}
         if verb == "get-database":
             status = {"postgres_database": "databricks_postgres"} if self.resolve_db else {}
             return {"name": name, "status": status}
@@ -102,6 +106,12 @@ class _PgFake:
         if a[:2] == ["apps", "update"]:
             self.updates.append(json.loads(a[a.index("--json") + 1]))
             return {"name": APP}
+        if a[:2] == ["postgres", "list-endpoints"]:  # reuse: find the branch's read-write endpoint
+            branch = a[2].rstrip("/")
+            eps = [n for n in self.existing
+                   if n.startswith(branch + "/endpoints/") and n not in self.read_only_endpoints]
+            return {"endpoints": [{"name": n, "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE"}}
+                                  for n in sorted(eps)]}
         if a and a[0] == "postgres" and a[1].startswith("get-"):  # host / db-name resolution reads
             name = a[2]
             return self._resource_json(a[1], name) if name in self.existing else None
@@ -110,6 +120,8 @@ class _PgFake:
     def cli(self, *args, check=True):
         self.cli_calls.append(args)
         verb = args[1] if len(args) > 1 else ""
+        if self.create_fail and verb == self.create_fail:
+            return 1  # create failed; _pg_create must _stop
         if verb == "create-project":
             self.existing.add(f"projects/{args[2]}")
         elif verb == "create-branch":
@@ -138,9 +150,14 @@ def _wire(monkeypatch, fake, *, endpoint_setting=""):
 
 # --- sanitizers / destination ------------------------------------------------
 
-def test_role_id_starts_with_a_letter_and_sanitizes_the_uuid():
-    assert post_deploy._pg_role_id(SP) == ROLE_ID
-    assert post_deploy._pg_role_id("123-abc")[0].isalpha()
+def test_role_id_is_a_valid_resource_id():
+    import re
+    rid = post_deploy._pg_role_id(SP)
+    assert rid == ROLE_ID
+    # valid Lakebase resource id: starts with a lowercase letter, only lowercase/digits/hyphens
+    assert re.fullmatch(r"[a-z][a-z0-9-]*", rid) and len(rid) <= 63
+    assert post_deploy._pg_role_id("123-ABC")[0].isalpha()
+    assert post_deploy._pg_role_id("123-ABC") == post_deploy._pg_role_id("123-ABC").lower()
 
 
 def test_project_id_is_a_valid_resource_id():
@@ -155,11 +172,12 @@ def test_destination_parses_explicit_endpoint_else_reuses_deployed_else_derives(
     dest = post_deploy._autoscaling_destination("projects/other/branches/dev/endpoints/e1", {})
     assert (dest["branch"], dest["endpoint_id"], dest["database_id"]) == (
         "projects/other/branches/dev", "e1", "databricks-postgres")
-    # 2. already attached, no explicit: reuse the DEPLOYED branch + database resource (non-default db)
+    # 2. already attached, no explicit: reuse the DEPLOYED branch + database resource (non-default db).
+    #    endpoint_id is None -> setup must find the branch's EXISTING read-write endpoint.
     deployed = {"LAKEBASE_BRANCH": "projects/p/branches/production",
                 "LAKEBASE_DATABASE_RESOURCE": "projects/p/branches/production/databases/d"}
     dest = post_deploy._autoscaling_destination("", deployed)
-    assert dest == {"branch": "projects/p/branches/production", "endpoint_id": "primary",
+    assert dest == {"branch": "projects/p/branches/production", "endpoint_id": None,
                     "database_resource": "projects/p/branches/production/databases/d", "database_id": "d"}
     # 3. first install: derive from the app name
     dest = post_deploy._autoscaling_destination("", {})
@@ -168,6 +186,41 @@ def test_destination_parses_explicit_endpoint_else_reuses_deployed_else_derives(
     # explicit endpoint on the SAME branch as the deployed resource keeps the deployed database
     dest = post_deploy._autoscaling_destination("projects/p/branches/production/endpoints/x", deployed)
     assert dest["database_resource"] == "projects/p/branches/production/databases/d"
+
+
+# --- _pg_get tri-state (fail-closed) -----------------------------------------
+
+def test_pg_get_success_but_null_or_non_dict_stops(monkeypatch):
+    """Exit 0 with a null/non-dict body is NOT 'missing' — STOP rather than let _ensure_* create."""
+    monkeypatch.setattr(post_deploy, "PROFILE", "")
+    for out in ("null", "[]", "\"x\"", ""):
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Done(0, stdout=out))
+        with pytest.raises(SystemExit):
+            post_deploy._pg_get("get-database", "projects/p/branches/b/databases/x")
+
+
+def test_pg_get_auth_error_mentioning_not_found_stops(monkeypatch):
+    """An auth/token error whose text happens to contain 'not found' must STOP, not be read as
+    resource-absent (which would create/replace a live resource)."""
+    monkeypatch.setattr(post_deploy, "PROFILE", "")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: _Done(1, stderr="401 Unauthorized: token not found"))
+    with pytest.raises(SystemExit):
+        post_deploy._pg_get("get-database", "projects/p/branches/b/databases/x")
+
+
+def test_pg_get_explicit_resource_not_found_returns_none(monkeypatch):
+    monkeypatch.setattr(post_deploy, "PROFILE", "")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: _Done(1, stderr="RESOURCE_DOES_NOT_EXIST: no such database"))
+    assert post_deploy._pg_get("get-database", "projects/p/branches/b/databases/x") is None
+
+
+def test_pg_get_unrecognised_error_stops(monkeypatch):
+    monkeypatch.setattr(post_deploy, "PROFILE", "")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Done(1, stderr="weird backend hiccup"))
+    with pytest.raises(SystemExit):
+        post_deploy._pg_get("get-database", "projects/p/branches/b/databases/x")
 
 
 # --- idempotent create-if-missing AND reuse-if-exists ------------------------
@@ -445,17 +498,50 @@ def _attached_live(branch, db_resource):
     return {"resources": {"LAKEBASE_BRANCH": branch, "LAKEBASE_DATABASE_RESOURCE": db_resource}}
 
 
-def test_setup_reuses_the_deployed_non_default_database(monkeypatch):
-    """An app attached to a non-default database resource (e.g. one created in the Apps UI) must be
-    REUSED on upgrade, not switched to databricks-postgres — nothing is created."""
+def test_setup_reuses_the_deployed_non_default_db_and_existing_endpoint(monkeypatch):
+    """An app attached to a non-default database resource with a read-write endpoint whose id is NOT
+    'primary' (a typical Apps-UI deploy) must REUSE both — not switch to databricks-postgres and not
+    create a second 'primary' endpoint. Nothing is created."""
     branch = DERIVED_BRANCH
     db = f"{branch}/databases/custom-db"
-    present = [f"projects/{APP}", branch, f"{branch}/endpoints/primary", db, f"{branch}/roles/{ROLE_ID}"]
+    ep = f"{branch}/endpoints/rw-abc"  # NOT 'primary'
+    present = [f"projects/{APP}", branch, ep, db, f"{branch}/roles/{ROLE_ID}"]
     fake = _PgFake(existing=present)
     _wire(monkeypatch, fake)
     post_deploy.setup_lakebase_autoscaling(_attached_live(branch, db))
-    assert fake.cli_calls == []  # everything reused
+    assert fake.cli_calls == []  # nothing created
+    assert post_deploy._LAKEBASE["endpoint"] == ep  # reused the existing RW endpoint, not a new 'primary'
     assert post_deploy._LAKEBASE["database_resource"] == db  # the deployed db, not databricks-postgres
+
+
+def test_setup_stops_when_attached_branch_has_no_read_write_endpoint(monkeypatch):
+    """An attached branch with no read-write endpoint this script can find must STOP and ask for
+    LAKEBASE_ENDPOINT_NAME — never create a second endpoint on a live history branch."""
+    branch = DERIVED_BRANCH
+    db = f"{branch}/databases/custom-db"
+    present = [f"projects/{APP}", branch, db, f"{branch}/roles/{ROLE_ID}"]  # no endpoint
+    fake = _PgFake(existing=present)
+    _wire(monkeypatch, fake)
+    with pytest.raises(SystemExit):
+        post_deploy.setup_lakebase_autoscaling(_attached_live(branch, db))
+    assert not any(c[1] == "create-endpoint" for c in fake.cli_calls)
+
+
+def test_setup_retains_another_projects_deployed_branch_and_database(monkeypatch):
+    """Real-setup check for the other-project reuse: an app attached to a DIFFERENT project retains
+    that project's deployed branch/database/endpoint and creates nothing (no repoint to the derived
+    app-name project)."""
+    branch = "projects/elsewhere/branches/production"
+    db = f"{branch}/databases/d"
+    ep = f"{branch}/endpoints/rw"
+    present = ["projects/elsewhere", branch, ep, db, f"{branch}/roles/{ROLE_ID}"]
+    fake = _PgFake(existing=present)
+    _wire(monkeypatch, fake)
+    post_deploy.setup_lakebase_autoscaling(_attached_live(branch, db))
+    assert fake.cli_calls == []  # nothing created; the other project is retained
+    assert post_deploy._LAKEBASE["branch"] == branch
+    assert post_deploy._LAKEBASE["database_resource"] == db
+    assert post_deploy._LAKEBASE["endpoint"] == ep
 
 
 def test_main_reuses_when_attached_to_another_project_without_an_override(monkeypatch):
@@ -536,3 +622,40 @@ def test_postgres_database_name_ignores_spec_and_uses_status_only(monkeypatch):
     monkeypatch.setattr(post_deploy, "cli_json",
                         lambda *a: {"name": a[2], "status": {"postgres_database": "from_status"}})
     assert post_deploy._postgres_database_name("projects/p/branches/b/databases/x") == "from_status"
+
+
+# --- bug 3: a failed create stops the run ------------------------------------
+
+def test_a_failed_create_role_stops_the_run(monkeypatch):
+    """A failed create-* (e.g. a rejected role id or a quota/permission error) must STOP — not
+    leave the SP without a Postgres role while the run attaches and reports success."""
+    fake = _PgFake(existing=[], create_fail="create-role")
+    _wire(monkeypatch, fake)
+    with pytest.raises(SystemExit):
+        post_deploy.setup_lakebase_autoscaling(FIRST_INSTALL)
+    assert any(c[1] == "create-role" for c in fake.cli_calls)  # it was attempted, and it stopped
+
+
+# --- bug 4: a freshly-created endpoint's host must be populated before publish ----------------
+
+def test_setup_stops_when_endpoint_host_never_populates(monkeypatch):
+    """If the endpoint host stays empty, setup must STOP (not render history OFF and fall through)."""
+    fake = _PgFake(existing=list(_ids().values()), endpoint_host="")
+    _wire(monkeypatch, fake)
+    monkeypatch.setattr(post_deploy, "AUTOSCALING_HOST_WAIT", 0)  # don't actually sleep
+    with pytest.raises(SystemExit):
+        post_deploy.setup_lakebase_autoscaling(FIRST_INSTALL)
+    assert post_deploy._LAKEBASE["host"] == ""  # nothing recorded for publish
+
+
+# --- bug 6: an attached-but-empty resource must not be treated as first install ---------------
+
+def test_main_stops_when_attached_autoscaling_resource_is_empty(monkeypatch):
+    """postgres={} (attached, but no branch/database) must STOP — never assume a first install and
+    create a NEW project that orphans the existing history."""
+    order = []
+    app = _as_app("", "")  # empty branch + database resource
+    with pytest.raises(SystemExit):
+        _drive_main(monkeypatch, get_app=app, env={"USE_LAKEBASE": "true"}, order=order)
+    assert not any(s in order for s in ("setup-autoscaling", "bundle-deploy", "attach-autoscaling",
+                                        "upgrade"))

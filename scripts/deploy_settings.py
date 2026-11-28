@@ -182,6 +182,21 @@ def uses_lakebase(live_env, live_resources, autoscaling=False):
             or bool(autoscaling))
 
 
+def history_on(use_setting, instance, autoscaling=False):
+    """Whether this run keeps history ON.
+
+    For an app with an attached Autoscaling resource, history is on UNLESS the operator EXPLICITLY
+    set USE_LAKEBASE=false (an inherited/default 'false' is a render artifact — render_app_yml
+    writes 'false' whenever the host was momentarily empty — not an intent to turn history off, so
+    it must not silently disable the attached history). Otherwise follow effective_lakebase.
+
+    `use_setting` is a Setting(value, source); `instance` is LAKEBASE_INSTANCE_NAME's value."""
+    if autoscaling:
+        return not (use_setting.source == SOURCE_YOU
+                    and (use_setting.value or "").strip().lower() == "false")
+    return effective_lakebase(use_setting.value, instance, autoscaling)
+
+
 def _deployed_value(key, live_env, live_resources):
     if key in RESOURCE_KEYS and key in live_resources:
         return live_resources[key]
@@ -249,6 +264,14 @@ AUTOSCALING_STOP = (
     "history to a different database on purpose, detach the lakebase-db resource in the Apps UI first."
 )
 
+AUTOSCALING_UNKNOWN_STOP = (
+    "The app has a Lakebase Autoscaling lakebase-db resource, but it does not name a branch and "
+    "database (the postgres resource is empty). This script cannot tell where the history lives, so "
+    "it will NOT assume a first install and create a new project (that would orphan the existing "
+    "history). Re-attach the lakebase-db resource with its branch and database in the Apps UI, or "
+    "set LAKEBASE_ENDPOINT_NAME, then run again."
+)
+
 
 def _autoscaling_problems(values, live, target=None):
     """Safety stops for an app whose history is a Lakebase Autoscaling database.
@@ -257,35 +280,44 @@ def _autoscaling_problems(values, live, target=None):
     the same project/branch/endpoint/database/role idempotently. The stops here preserve the
     original safety intent — never silently detach or repoint an existing history:
 
-    - explicit USE_LAKEBASE=false would turn history off (detach);
+    - an EXPLICIT (user-set) USE_LAKEBASE=false would turn history off (detach). An inherited or
+      default 'false' is a render artifact (render_app_yml writes 'false' when the host was
+      momentarily empty) and does NOT count — else every CLI upgrade of an app later attached to
+      Autoscaling in the Apps UI would be blocked with a misleading "would turn history off";
     - LAKEBASE_INSTANCE_NAME set would switch to a Provisioned instance (repoint);
-    - this run's intended destination (``target``: the branch + database RESOURCE names the caller
-      will create/attach) differs from the DEPLOYED lakebase-db resource — it would repoint the
-      compute branch or switch the database.
+    - the attached resource names no branch/database (empty postgres) — destination unknown, so we
+      must not assume a first install;
+    - this run's intended destination (``target``: the branch + database RESOURCE the caller will
+      create/attach) differs from the DEPLOYED lakebase-db resource — it would repoint the compute
+      branch or switch the database.
 
     ``target`` is ``(branch, database_resource)``. When it is not supplied (a direct
     ``find_problems`` call with no computed destination), fall back to comparing an explicit
     LAKEBASE_ENDPOINT_NAME against the deployed branch, so the branch-repoint stop still holds.
     """
-    if (values["USE_LAKEBASE"].value or "").strip().lower() == "false":
+    use = values["USE_LAKEBASE"]
+    if use.source == SOURCE_YOU and (use.value or "").strip().lower() == "false":
         return [AUTOSCALING_STOP]
     if (values["LAKEBASE_INSTANCE_NAME"].value or "").strip():
         return [AUTOSCALING_STOP]
     deployed_branch = (live.get("resources", {}).get("LAKEBASE_BRANCH") or "").rstrip("/")
     deployed_db = (live.get("resources", {}).get("LAKEBASE_DATABASE_RESOURCE") or "").rstrip("/")
+    if not deployed_branch or not deployed_db:
+        # Attached, but the resource does not say where history lives — do not treat as first install.
+        return [AUTOSCALING_UNKNOWN_STOP]
     if target is not None:
         want_branch = (target[0] or "").rstrip("/")
         want_db = (target[1] or "").rstrip("/")
         # Compare against the DEPLOYED resource. A derived destination (from the app name) that
         # differs from where the app is actually attached would silently repoint it; so would an
         # explicit endpoint on another branch, or a different database on the same branch.
-        if deployed_branch and want_branch and want_branch != deployed_branch:
+        if want_branch and want_branch != deployed_branch:
             return [AUTOSCALING_STOP]
-        if deployed_db and want_db and want_db != deployed_db:
+        if want_db and want_db != deployed_db:
             return [AUTOSCALING_STOP]
         return []
     want_endpoint = (values["LAKEBASE_ENDPOINT_NAME"].value or "").strip()
-    if want_endpoint and deployed_branch and not want_endpoint.startswith(deployed_branch + "/"):
+    if want_endpoint and not want_endpoint.startswith(deployed_branch + "/"):
         return [AUTOSCALING_STOP]
     return []
 
