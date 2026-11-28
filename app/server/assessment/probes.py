@@ -1161,19 +1161,59 @@ async def probe_metrics() -> dict:
             return _empty("Metric view metadata not available on this metastore version; use the self-assessment for the semantic layer.",
                           reason="not_enabled")
 
-        # If no metric views, return early with the "absent" result
+        # Gold-table coverage (#23): count gold tables in the SAME scope/filters as the
+        # metric-view count (apples-to-apples), reusing the Relationships gold heuristic.
+        # A read failure is treated as "no gold layer detected" (0 -> no penalty). Computed
+        # up front so BOTH the zero-view path and the scored path emit the coverage fields
+        # and signal unconditionally — the spec defines the signal unconditionally too.
+        async def _gold_coverage(views: int):
+            gold = 0
+            try:
+                gold = await _scalar(
+                    render_sql(q["gold_tables"]["sql"], {"<TABLES>": tbl},
+                               schema_filter=_schema_sql(s)).rstrip(";")
+                ) or 0
+            except Exception as e:
+                logger.info(f"metrics gold-table count failed: {str(e)[:80]}")
+                gold = 0
+            has = bool(gold and gold > 0)
+            ratio = (views / float(gold)) if has else None
+            # cov scales only the quantity ramp. G==0 (no gold detected) and M>=G both yield
+            # cov=1.0 (no penalty); lower coverage strictly lowers the ramp.
+            multiplier = min(ratio, 1.0) if has else 1.0
+            if has:
+                sig = {
+                    "label": label["gold_coverage"],
+                    "value": round(multiplier * 100.0, 1),
+                    "unit": "%",
+                    "detail": f"{views} metric views / {gold} gold tables (count-based proxy)",
+                }
+            else:
+                sig = {
+                    "label": label["gold_coverage"],
+                    "value": "n/a",
+                    "detail": "No gold tables detected",
+                }
+            return gold, ratio, multiplier, sig
+
+        # If no metric views, return early with the "absent" result (score stays 0), but
+        # still emit the coverage fields + signal so probe output matches the spec.
         if metric_views == 0:
             gaps: list[str] = []
             gap_ids: list[str] = []
             _spec_gap(METRICS, "no_metric_views", gaps, gap_ids)
+            gold_tables, coverage_ratio, _cov, coverage_signal = await _gold_coverage(0)
             return {
                 "available": True,
                 "score": 0.0,
-                "signals": [{"label": label["metric_views"], "value": 0, "detail": "UC metric views"}],
+                "signals": [
+                    {"label": label["metric_views"], "value": 0, "detail": "UC metric views"},
+                    coverage_signal,
+                ],
                 "gaps": gaps,
                 "gap_ids": gap_ids,
                 "note": None,
-                "metrics": {"metric_views": 0},
+                "metrics": {"metric_views": 0, "gold_tables": gold_tables, "coverage_ratio": coverage_ratio},
             }
 
         # Query for commented metric views (defensive: treat failure as 0)
@@ -1183,25 +1223,7 @@ async def probe_metrics() -> dict:
         except Exception:
             commented = 0
 
-        # Gold-table coverage (#23): count gold tables in the SAME scope/filters as the
-        # metric-view count (apples-to-apples), reusing the Relationships gold heuristic.
-        # A read failure is treated as "no gold layer detected" (0 -> no penalty).
-        gold_tables = 0
-        try:
-            gold_tables = await _scalar(
-                render_sql(q["gold_tables"]["sql"], {"<TABLES>": tbl},
-                           schema_filter=_schema_sql(s)).rstrip(";")
-            ) or 0
-        except Exception as e:
-            logger.info(f"metrics gold-table count failed: {str(e)[:80]}")
-            gold_tables = 0
-
-        # Coverage multiplier: a thin semantic layer over a large gold layer shouldn't
-        # overstate maturity. cov scales only the quantity ramp. G==0 (no gold detected)
-        # and M>=G both yield cov=1.0 (no penalty); lower coverage strictly lowers the ramp.
-        has_gold = bool(gold_tables and gold_tables > 0)
-        coverage_ratio = (metric_views / float(gold_tables)) if has_gold else None
-        cov = min(coverage_ratio, 1.0) if has_gold else 1.0
+        gold_tables, coverage_ratio, cov, coverage_signal = await _gold_coverage(metric_views)
 
         # Score formula (see the spec's `score`): base + coverage-scaled quantity ramp + quality.
         score = float(METRIC_BASE_POINTS)
@@ -1220,19 +1242,7 @@ async def probe_metrics() -> dict:
                 "unit": "%",
                 "detail": "Share of metric views with a description",
             })
-        if has_gold:
-            signals.append({
-                "label": label["gold_coverage"],
-                "value": round(cov * 100.0, 1),
-                "unit": "%",
-                "detail": f"{metric_views} metric views / {gold_tables} gold tables (count-based proxy)",
-            })
-        else:
-            signals.append({
-                "label": label["gold_coverage"],
-                "value": "n/a",
-                "detail": "No gold tables detected",
-            })
+        signals.append(coverage_signal)
 
         # Build gaps
         gaps: list[str] = []

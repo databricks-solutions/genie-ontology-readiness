@@ -242,10 +242,73 @@ class MetricsGoldenTest(unittest.TestCase):
                 "comments to reason; add them.")
 
     def test_no_metric_views(self):
+        # Zero metric views, no gold layer detected: score 0, coverage signal reads n/a.
         out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(0, 0))
         self.assertEqual(out["score"], 0.0)
         self.assertEqual(out["gaps"], [self._NO_MV])
-        self.assertEqual([s["label"] for s in out["signals"]], ["Metric views"])
+        self.assertEqual([(s["label"], s["value"]) for s in out["signals"]],
+                         [("Metric views", 0), ("Gold-table coverage", "n/a")])
+        self.assertEqual(out["metrics"]["gold_tables"], 0)
+        self.assertIsNone(out["metrics"]["coverage_ratio"])
+
+    def test_no_metric_views_with_gold_layer(self):
+        # Zero metric views over a real gold layer: score still 0, but coverage is
+        # well-defined at 0.0 (0 / 40) and the signal shows 0.0%.
+        out = _run(probes.probe_metrics, _sources(["main"]), *_metric_routes(0, 0, gold=40))
+        self.assertEqual(out["score"], 0.0)
+        self.assertEqual(out["gaps"], [self._NO_MV])
+        cov = out["signals"][-1]
+        self.assertEqual((cov["label"], cov["value"], cov["unit"]), ("Gold-table coverage", 0.0, "%"))
+        self.assertEqual(cov["detail"], "0 metric views / 40 gold tables (count-based proxy)")
+        self.assertEqual(out["metrics"]["gold_tables"], 40)
+        self.assertEqual(out["metrics"]["coverage_ratio"], 0.0)
+
+    def test_no_metric_views_gold_count_read_fails(self):
+        # A failed gold-count read degrades to "no gold layer detected" (n/a), score still 0.
+        out = _run(probes.probe_metrics, _sources(["main"]),
+                   *_metric_routes(0, 0, gold=RuntimeError("gold read refused")))
+        self.assertEqual(out["score"], 0.0)
+        self.assertEqual([(s["label"], s["value"]) for s in out["signals"]],
+                         [("Metric views", 0), ("Gold-table coverage", "n/a")])
+        self.assertEqual(out["metrics"]["gold_tables"], 0)
+        self.assertIsNone(out["metrics"]["coverage_ratio"])
+
+    def test_gold_count_read_fails_with_views(self):
+        # With views present, a failed gold read is treated as no gold (cov=1.0 -> no penalty),
+        # so the score matches the pre-#23 formula and the coverage signal reads n/a.
+        out = _run(probes.probe_metrics, _sources(["main"]),
+                   *_metric_routes(4, 1, gold=RuntimeError("gold read refused")))
+        self.assertEqual(out["score"], 53.5)
+        self.assertEqual(out["metrics"]["gold_tables"], 0)
+        self.assertIsNone(out["metrics"]["coverage_ratio"])
+        self.assertEqual(out["signals"][-1]["value"], "n/a")
+
+    def test_coverage_respects_explicit_schema_scope(self):
+        # Under an explicit schema selection, both the metric-view count and the gold count
+        # must carry the same schema predicate so the ratio stays apples-to-apples.
+        seen = []
+
+        async def warehouse(query, parameters=None, force_sp=False, record=True):
+            seen.append(query)
+            if "comment IS NOT NULL" in query and "GROUP BY" not in query:
+                return [{"c": "1"}]
+            if "RLIKE" in query and "GROUP BY" not in query:
+                return [{"c": "8"}]
+            if "table_type = '" in query and "GROUP BY" not in query:
+                return [{"c": "4"}]
+            return []
+
+        with patch.object(probes, "_resolve_sources",
+                          AsyncMock(return_value=_sources(["main"], schemas=["sales"]))), \
+             patch.object(probes, "execute_sql", warehouse):
+            out = asyncio.run(probes.probe_metrics())
+        self.assertEqual(out["score"], 45.5)  # 4 views / 8 gold -> cov 0.5
+        self.assertEqual(out["metrics"]["gold_tables"], 8)
+        # The gold-count query and the metric-view count query both scope to the chosen schema.
+        gold_q = next(q for q in seen if "RLIKE" in q and "GROUP BY" not in q)
+        views_q = next(q for q in seen if "table_type = '" in q and "comment" not in q and "GROUP BY" not in q)
+        self.assertIn("sales", gold_q)
+        self.assertIn("sales", views_q)
 
     def test_some_metric_views_one_described(self):
         # Thin layer: 4 metric views over 8 gold tables -> cov = 0.5, so the quantity ramp
