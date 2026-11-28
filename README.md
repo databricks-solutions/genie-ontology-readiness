@@ -161,12 +161,15 @@ Node.js, the Databricks CLI, and Python 3.9+.
 
 - It deploys from a workspace folder, not from Git. A later **Deploy from Git** in the Apps UI goes
   back to the release defaults.
-- History works with a **Provisioned** Lakebase instance only. If the app's `lakebase-db` is an
-  **Autoscaling** database, the script stops before any change. Upgrade that app in the Apps UI
-  ([Upgrade to a new release](#upgrade-to-a-new-release)).
+- History works with both Lakebase kinds. **Autoscaling is the default**: with `USE_LAKEBASE=true`
+  and no `LAKEBASE_INSTANCE_NAME`, the script idempotently creates-or-reuses the Autoscaling
+  project / branch / endpoint / database and the app SP's Postgres role, attaches the `lakebase-db`
+  resource itself (no manual `apps update`), and restarts the app. **Provisioned** is legacy: it
+  runs only when you set `LAKEBASE_INSTANCE_NAME` to an existing instance.
 - It keeps every setting you do not set, and it stops before any change if the deployed settings
-  cannot be read, or if the run would turn history off or point it at another database. An app
-  deployed from Git with no custom settings counts as having the release defaults.
+  cannot be read, or if the run would turn history off, switch an Autoscaling app to a Provisioned
+  instance, or point it at another database/branch. An app deployed from Git with no custom
+  settings counts as having the release defaults.
 
 ```bash
 # Stable: the latest release (recommended)
@@ -187,14 +190,21 @@ databricks bundle deploy -t prod --profile <p> --var="warehouse_id=<id>"
 export DATABRICKS_PROFILE=<p>
 export TARGET=prod
 export WAREHOUSE_ID=<id>
-export USE_LAKEBASE=true                        # optional: per-user history
-export LAKEBASE_INSTANCE_NAME=<instance>        # an existing Lakebase instance
-export LAKEBASE_DATABASE=ontology_readiness
+export USE_LAKEBASE=true                        # optional: per-user history (Autoscaling, the default)
+# Provisioned (legacy) only: set an existing instance instead of taking the Autoscaling path.
+#   export LAKEBASE_INSTANCE_NAME=<instance>
+#   export LAKEBASE_DATABASE=ontology_readiness
+# Reuse an existing Autoscaling endpoint instead of deriving one from the app name:
+#   export LAKEBASE_ENDPOINT_NAME=projects/<p>/branches/<b>/endpoints/<e>
 python3 scripts/post_deploy.py
 ```
 
-If you use Lakebase, run the upgrade command below once more after the first install. The app's
-service principal id is known only after step 2 creates the app.
+With `USE_LAKEBASE=true` and no `LAKEBASE_INSTANCE_NAME`, the script takes the **Autoscaling** path
+(the default): it creates-or-reuses the project / branch / endpoint / database and the app SP's
+Postgres role, resolves the database's real (underscore) Postgres name, attaches the `lakebase-db`
+resource, and restarts the app. Run the upgrade command below once more after the first install:
+the app's service principal id — needed for its Postgres role — is known only after step 2 creates
+the app.
 
 Upgrade, from the repo root, after you check out the new tag:
 
@@ -385,6 +395,20 @@ A few reads are **always** the SP (they can't run OBO): the Genie REST API (not
 covered by the `sql` user scope) and Lakebase credential minting. The Domains REST API
 is tried as the viewer first, but the `sql`-scoped token is refused, so in practice it
 also runs as the SP.
+
+> [!NOTE]
+> **Lakebase history: the SP Postgres role and the database-name trap.** For history, the app
+> connects to Lakebase as its own service principal, so the SP needs a **Postgres role** on the
+> Lakebase branch. On the **Autoscaling** (default) path, `post_deploy.py` creates it for you: a
+> role whose id starts with a letter (`gor_<sp>`, the SP client-id UUID sanitized) and whose
+> `postgres_role` is the raw SP client-id UUID, then it grants that role schema privileges on the
+> history schemas. **Database-name trap:** a Lakebase Autoscaling database has a hyphenated
+> *resource id* (e.g. `databricks-postgres`) that is **not** its actual Postgres database name,
+> which is the underscore form (e.g. `databricks_postgres`, read from
+> `databricks postgres get-database <resource> -o json` → `.status.postgres_database`). The app
+> must connect using the underscore name — the hyphenated id fails pool init with
+> `database "databricks-postgres" does not exist`. `post_deploy.py` resolves and renders the
+> underscore name into `LAKEBASE_DATABASE`; a Git deploy's runtime resolves it the same way.
 
 ### Who needs what
 
