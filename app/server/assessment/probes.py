@@ -1621,10 +1621,10 @@ async def probe_genie_agents() -> dict:
         "note": (f"Scored from standalone Genie Agents in the in-scope workspaces' system.access.audit "
                  f"events over the last {_GENIE_AUDIT_LOOKBACK_DAYS} days (aibiGenie), graded on real "
                  "conversation usage. Agent type is a best-effort audit heuristic: 'dashboard-embedded' "
-                 "is positively detected (the agent's space id is the exact space_id in an AI/BI "
-                 "dashboard-genie response), while 'standalone' means no dashboard association was "
-                 "observed in the audit window — absence of evidence, not a positively-confirmed "
-                 "standalone. Per-agent curation (instructions, example SQL, benchmarks) is read where "
+                 "is positively detected — the agent is an AI/BI dashboard-genie action's own space, or "
+                 "its exact space id appears in that action's response — while 'standalone' means no "
+                 "dashboard association was observed in the audit window, absence of evidence, not a "
+                 "positively-confirmed standalone. Per-agent curation (instructions, example SQL, benchmarks) is read where "
                  "visible — it needs CAN_EDIT and only works for agents in this workspace, so it is "
                  "labeled 'where visible' and never affects the score."),
         "metrics": {"genie_agents": total, "active_30d": active,

@@ -71,8 +71,11 @@ describe('GenieSpacesTable (per-agent curation, where visible)', () => {
     const html = renderToStaticMarkup(
       createElement(PillarDetail, { pillar: geniePillar([readable]), config }),
     );
-    // The classification caption must make clear what standalone vs dashboard-embedded mean.
+    // The classification caption must make clear what standalone vs dashboard-embedded mean,
+    // including the wrapper-id detection path (the agent being the dashboard action's own space).
     expect(html).toContain('best-effort audit heuristic');
+    expect(html).toContain('own space');
+    expect(html).toContain('appears in that');
     expect(html).toContain('absence of evidence');
     expect(html).toContain('no dashboard association was observed');
     expect(html).toContain('Only standalone agents are scored');

@@ -291,7 +291,8 @@ export default function PillarDetail({ pillar, config }: { pillar: PillarScore; 
           <Info size={12} className="mt-0.5 shrink-0" />
           <span>
             Agent type is a best-effort audit heuristic. <span className="font-medium text-ink-500">Dashboard-embedded</span> is
-            positively detected (the agent’s space id is the exact space_id in an AI/BI dashboard-genie response);{' '}
+            positively detected — the agent is an AI/BI dashboard-genie action’s own space, or its exact space id appears in that
+            action’s response;{' '}
             <span className="font-medium text-ink-500">Standalone</span> means no dashboard association was observed in the audit
             window — absence of evidence, not a confirmed standalone. Only standalone agents are scored.
           </span>

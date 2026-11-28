@@ -552,6 +552,34 @@ class GenieClassificationTest(unittest.TestCase):
         self.assertEqual(row["total"], 1)  # only 'abcd' remains standalone
         self.assertEqual(row["active_30d"], 1)  # abcd had a conversation in 30d
 
+    def test_wrapper_only_null_response_is_dashboard_embedded(self):
+        # The wrapper-only detection path: a dashboard-genie row with a NULL response.result
+        # still identifies its OWN request_params.space_id as a dashboard construct, so that
+        # space is dashboard-embedded even with no response payload to parse.
+        try:
+            import duckdb
+        except ImportError:  # pragma: no cover - requirements-dev.txt installs it
+            self.skipTest("duckdb not installed")
+        con = duckdb.connect()
+        con.execute("CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p)")
+        con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
+                    "request_params STRUCT(space_id VARCHAR, display_name VARCHAR), "
+                    "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
+        con.execute(
+            "INSERT INTO audit VALUES "
+            # a plain standalone conversation agent
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'solo', 'display_name': 'Solo'}, {'email': 'carol@example.com'}, {'result': NULL}, 1), "
+            # wrapper-only: a getDashboardGenie row with NULL response.result; its own space_id is the wrapper
+            "(current_date() - 1, 'aibiGenie', 'getDashboardGenie', {'space_id': 'wraponly', 'display_name': NULL}, {'email': 'carol@example.com'}, {'result': NULL}, 1)")
+        sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
+        sql = sql.replace("system.access.audit", "audit").rstrip(";")
+        cols = [d[0] for d in con.execute(sql).description]
+        row = dict(zip(cols, con.execute(sql).fetchone()))
+        # 'wraponly' is dashboard-embedded via its own id (no response payload needed); only 'solo' is scored.
+        self.assertEqual(row["dashboard_embedded"], 1)
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["active_30d"], 1)
+
     def test_updateDashboardGenie_and_duplicate_id_in_both_json_paths(self):
         # Classification recognizes updateDashboardGenie (not just getDashboardGenie), and an
         # id present in BOTH $.space_id and $.genie_space_id is de-duplicated (counted once).
