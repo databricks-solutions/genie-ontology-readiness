@@ -283,6 +283,37 @@ class MetricsGoldenTest(unittest.TestCase):
         self.assertIsNone(out["metrics"]["coverage_ratio"])
         self.assertEqual(out["signals"][-1]["value"], "n/a")
 
+    def test_gold_denominator_excludes_metric_views(self):
+        # The coverage denominator must NOT count metric views themselves (the numerator),
+        # otherwise metric views sitting in a gold/semantic schema inflate G and adding more
+        # views could never reach full coverage. Prove the gold-count SQL excludes BOTH
+        # table_type spellings while keeping other table types (not a BASE TABLE-only filter).
+        seen = []
+
+        async def warehouse(query, parameters=None, force_sp=False, record=True):
+            seen.append(query)
+            if "comment IS NOT NULL" in query and "GROUP BY" not in query:
+                return [{"c": "8"}]
+            if "RLIKE" in query and "GROUP BY" not in query:
+                return [{"c": "8"}]
+            if "table_type = '" in query and "GROUP BY" not in query:
+                return [{"c": "8"}]
+            return []
+
+        with patch.object(probes, "_resolve_sources", AsyncMock(return_value=_sources(["main"]))), \
+             patch.object(probes, "execute_sql", warehouse):
+            out = asyncio.run(probes.probe_metrics())
+        gold_q = next(q for q in seen if "RLIKE" in q and "GROUP BY" not in q)
+        self.assertIn("table_type NOT IN ('METRIC_VIEW', 'METRIC VIEW')", gold_q)
+        # Not narrowed to base tables only — materialized/streaming gold tables must still count.
+        self.assertNotIn("table_type = 'BASE TABLE'", gold_q)
+        # 8 views over 8 non-view gold tables -> cov reaches 1.0 (no penalty); if metric views
+        # were trapped in the denominator this would be G=16 and cov=0.5.
+        self.assertEqual(out["metrics"]["gold_tables"], 8)
+        self.assertEqual(out["metrics"]["coverage_ratio"], 1.0)
+        self.assertEqual(out["signals"][-1]["value"], 100.0)
+        self.assertEqual(out["score"], 92.0)  # 30 + 40*min(8,10)/10*1.0 + 30*(8/8)
+
     def test_coverage_respects_explicit_schema_scope(self):
         # Under an explicit schema selection, both the metric-view count and the gold count
         # must carry the same schema predicate so the ratio stays apples-to-apples.

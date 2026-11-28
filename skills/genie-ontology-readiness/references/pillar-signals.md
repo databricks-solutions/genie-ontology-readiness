@@ -236,16 +236,17 @@ SELECT COUNT(*) AS commented
 FROM <TABLES>
 WHERE table_type = 'METRIC_VIEW' AND comment IS NOT NULL AND trim(comment) <> '' AND table_schema <> 'information_schema';
 
--- gold/mart layer in the SAME scope/filters as the metric-view count, for the coverage ratio (same gold heuristic as Relationships, detected by schema or table naming)
+-- gold/mart layer in the SAME scope/filters as the metric-view count, for the coverage ratio (same gold heuristic as Relationships, detected by schema or table naming). Metric views are EXCLUDED from this denominator (both table_type spellings): they are the coverage numerator and usually live in gold/semantic/analytics schemas, so counting them here would trap the numerator inside its own denominator and adding metric views could never reach full coverage. Base/materialized/streaming tables and plain views stay in — they are the gold surface a metric view can model, so this count may differ slightly from the Relationships pillar's gold_tables (by design).
 SELECT COUNT(*) AS gold_tables
 FROM <TABLES>
 WHERE table_schema <> 'information_schema'
+  AND table_type NOT IN ('METRIC_VIEW', 'METRIC VIEW')
   AND (lower(table_schema) RLIKE '(gold|mart|marts|analytics|semantic|presentation|reporting|dwh)'
        OR lower(table_name) RLIKE '^(gold_|mart_|dim_|fact_)');
 ```
 
 `uncommented = metric_views - commented`.
-`cov = min(metric_views / gold_tables, 1.0)` when `gold_tables > 0`, else `1.0` (no penalty when no gold layer is detected, and `cov == 1.0` whenever `metric_views >= gold_tables`).
+`cov = min(metric_views / gold_tables, 1.0)` when `gold_tables > 0`, else `1.0` (no penalty when no gold layer is detected, and `cov == 1.0` whenever `metric_views >= gold_tables`). `gold_tables` counts the gold/mart layer **excluding metric views themselves** (the coverage numerator), so adding metric views genuinely raises coverage toward full.
 
 **Score:**
 

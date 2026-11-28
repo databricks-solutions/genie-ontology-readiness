@@ -398,11 +398,18 @@ METRICS = _index({
             "id": "gold_tables",
             "comment": ("gold/mart layer in the SAME scope/filters as the metric-view count, for the "
                         "coverage ratio (same gold heuristic as Relationships, detected by schema or "
-                        "table naming)"),
+                        "table naming). Metric views are EXCLUDED from this denominator (both "
+                        "table_type spellings): they are the coverage numerator and usually live in "
+                        "gold/semantic/analytics schemas, so counting them here would trap the "
+                        "numerator inside its own denominator and adding metric views could never "
+                        "reach full coverage. Base/materialized/streaming tables and plain views "
+                        "stay in — they are the gold surface a metric view can model, so this count "
+                        "may differ slightly from the Relationships pillar's gold_tables (by design)."),
             "sql": (
                 "SELECT COUNT(*) AS gold_tables\n"
                 "FROM <TABLES>\n"
                 "WHERE {schema_filter}\n"
+                "  AND table_type NOT IN ('METRIC_VIEW', 'METRIC VIEW')\n"
                 f"  AND (lower(table_schema) RLIKE '{GOLD_SCHEMA_PATTERN}'\n"
                 f"       OR lower(table_name) RLIKE '{GOLD_TABLE_PATTERN}');"
             ),
@@ -413,7 +420,9 @@ METRICS = _index({
         "`uncommented = metric_views - commented`.",
         ("`cov = min(metric_views / gold_tables, 1.0)` when `gold_tables > 0`, else `1.0` "
          "(no penalty when no gold layer is detected, and `cov == 1.0` whenever "
-         "`metric_views >= gold_tables`)."),
+         "`metric_views >= gold_tables`). `gold_tables` counts the gold/mart layer "
+         "**excluding metric views themselves** (the coverage numerator), so adding metric "
+         "views genuinely raises coverage toward full."),
     ],
     "score": [
         "If `metric_views == 0`, the score is **0** and only the gap below applies.",
