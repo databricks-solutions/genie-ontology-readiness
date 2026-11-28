@@ -381,6 +381,18 @@ class GenieAgentsGoldenTest(unittest.TestCase):
         self.assertEqual(out["score"], 53.0)
         self.assertEqual(out["gaps"], [])
 
+    def test_polling_only_population_scores_existence_floor_only(self):
+        # Agents exist but have no conversation anywhere: no active, no users, no questions,
+        # and no recency (last_active_date is NULL → recency_days None). Polling can't lift
+        # the score past the existence floor.
+        out = _run(probes.probe_genie_agents, _sources(["main"]),
+                   *_genie_routes(_genie_counts(3, 0, users=0, questions=0, recency_days=None)))
+        self.assertEqual(out["score"], 15.0)
+        self.assertEqual(out["gaps"], [
+            "3 standalone Genie Agent(s) exist but none had a conversation in the last 30 days "
+            "— drive adoption or retire stale agents.",
+        ])
+
     def test_audit_read_refused(self):
         out = _run(probes.probe_genie_agents, _sources(["main"]),
                    *_genie_routes(RuntimeError("PERMISSION_DENIED on system.access.audit")))
@@ -466,6 +478,9 @@ class GenieClassificationTest(unittest.TestCase):
             "(current_date() - 5, 'aibiGenie', 'trashSpace', {'space_id': 'gone', 'display_name': NULL}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
             # polling noise with the 'new' placeholder id: not an agent
             "(current_date() - 2, 'aibiGenie', 'genieGetSpace', {'space_id': 'new', 'display_name': NULL}, {'email': 'svc@example.com'}, {'result': NULL}, 1), "
+            # standalone, polling only: a recent genieGetSpace with no conversation. It EXISTS
+            # (counted in total) but must not be active and must not drive recency.
+            "(current_date() - 1, 'aibiGenie', 'genieGetSpace', {'space_id': 'poll', 'display_name': 'Poll'}, {'email': 'svc@example.com'}, {'result': NULL}, 1), "
             # dashboard-embedded: conversation activity AND space_id seen in a dashboard-genie response
             "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'dash', 'display_name': 'Dash'}, {'email': 'carol@example.com'}, {'result': NULL}, 1), "
             "(current_date() - 1, 'aibiGenie', 'getDashboardGenie', {'space_id': 'wrap', 'display_name': NULL}, {'email': 'carol@example.com'}, {'result': '{\"genie_space_id\":\"dash\"}'}, 1)")
@@ -478,12 +493,28 @@ class GenieClassificationTest(unittest.TestCase):
         cols = [d[0] for d in con.execute(sql).description]
         row = dict(zip(cols, con.execute(sql).fetchone()))
         # 'dash' is dashboard-embedded (space_id in a dashboard-genie response.result) so it
-        # leaves the standalone population; 'wrap' is a standalone (non-conversation) agent.
-        self.assertEqual(row["total"], 3)             # fresh + stale + wrap
+        # leaves the standalone population; 'wrap' and 'poll' are standalone non-conversation agents.
+        self.assertEqual(row["total"], 4)             # fresh + stale + wrap + poll
         self.assertEqual(row["active_30d"], 1)        # only fresh had a conversation in 30d
         self.assertEqual(row["questions_30d"], 2)     # fresh's two conversation messages
         self.assertEqual(row["distinct_users_30d"], 2)  # alice@example.com + bob@example.com
         self.assertEqual(row["dashboard_embedded"], 1)  # 'dash', counted separately
+
+    def test_recency_and_active_ignore_polling_only_agents(self):
+        # Regression (#24 isac review): recency and active come from conversation actions only.
+        # 'poll' (genieGetSpace at -1) and 'wrap' (getDashboardGenie at -1) are the most recent
+        # events overall, but recency must track the latest CONVERSATION — fresh at -3 — so a
+        # polling-only agent earns zero recency and is never active.
+        import datetime
+        con = self._audit_table()
+        sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
+        sql = sql.replace("system.access.audit", "audit").rstrip(";")
+        cols = [d[0] for d in con.execute(sql).description]
+        row = dict(zip(cols, con.execute(sql).fetchone()))
+        self.assertEqual(row["last_active_date"], datetime.date.today() - datetime.timedelta(days=3))
+        # 'poll' exists in the population but contributes no activity.
+        self.assertEqual(row["total"], 4)
+        self.assertEqual(row["active_30d"], 1)
 
     def test_classification_is_exact_match_not_substring(self):
         # Regression (#24 review): the classifier parses the space_id out of the dashboard
@@ -515,6 +546,37 @@ class GenieClassificationTest(unittest.TestCase):
         self.assertEqual(row["dashboard_embedded"], 1)
         self.assertEqual(row["total"], 2)  # abcd + wrap remain standalone; abc is excluded
         self.assertEqual(row["active_30d"], 1)  # only abcd had a conversation in 30d
+
+    def test_updateDashboardGenie_and_duplicate_id_in_both_json_paths(self):
+        # Classification recognizes updateDashboardGenie (not just getDashboardGenie), and an
+        # id present in BOTH $.space_id and $.genie_space_id is de-duplicated (counted once).
+        try:
+            import duckdb
+        except ImportError:  # pragma: no cover - requirements-dev.txt installs it
+            self.skipTest("duckdb not installed")
+        con = duckdb.connect()
+        con.execute("CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p)")
+        con.execute("CREATE TABLE audit (event_date DATE, service_name VARCHAR, action_name VARCHAR, "
+                    "request_params STRUCT(space_id VARCHAR, display_name VARCHAR), "
+                    "user_identity STRUCT(email VARCHAR), response STRUCT(result VARCHAR), workspace_id BIGINT)")
+        con.execute(
+            "INSERT INTO audit VALUES "
+            # two conversation agents that a dashboard embeds
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'd1', 'display_name': 'D1'}, {'email': 'alice@example.com'}, {'result': NULL}, 1), "
+            "(current_date() - 2, 'aibiGenie', 'createConversationMessage', {'space_id': 'd2', 'display_name': 'D2'}, {'email': 'bob@example.com'}, {'result': NULL}, 1), "
+            # d1 embedded via updateDashboardGenie, $.space_id only
+            "(current_date() - 1, 'aibiGenie', 'updateDashboardGenie', {'space_id': 'w1', 'display_name': NULL}, {'email': 'alice@example.com'}, {'result': '{\"space_id\":\"d1\"}'}, 1), "
+            # d2 embedded via updateDashboardGenie, id duplicated across BOTH json paths
+            "(current_date() - 1, 'aibiGenie', 'updateDashboardGenie', {'space_id': 'w2', 'display_name': NULL}, {'email': 'bob@example.com'}, {'result': '{\"space_id\":\"d2\",\"genie_space_id\":\"d2\"}'}, 1)")
+        sql = S.render_sql(S.GENIE_AGENTS["queries_by_id"]["audit_counts"]["sql"], workspace_filter="")
+        sql = sql.replace("system.access.audit", "audit").rstrip(";")
+        cols = [d[0] for d in con.execute(sql).description]
+        row = dict(zip(cols, con.execute(sql).fetchone()))
+        # d1 + d2 are embedded (counted once each, despite d2 appearing in both paths);
+        # the two wrapper spaces (w1, w2) remain standalone.
+        self.assertEqual(row["dashboard_embedded"], 2)
+        self.assertEqual(row["total"], 2)
+        self.assertEqual(row["active_30d"], 0)
 
 
 class GenieAgentsParityTest(unittest.TestCase):

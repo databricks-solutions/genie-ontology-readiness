@@ -287,14 +287,19 @@ scored population and counted separately so they don't skew the pillar. "Real us
 is measured from **conversation actions only** (`genieStartConversationMessage`,
 `createConversationMessage`, `genieCreateConversationMessage`), never raw events —
 raw events are dominated by `genieGetSpace` polling and service/eval accounts and
-overstate usage.
+overstate usage. **Population vs usage:** `total` counts agents that **exist** (any
+`aibiGenie` event is evidence of existence), while every usage signal — active count,
+active-share, distinct users, questions, and **recency** (`last_active_date`) — is
+derived from **conversation actions only**. So an existing-but-never-conversed agent
+(e.g. one seen only via `genieGetSpace` polling) correctly lowers active-share and
+earns **no** recency, rather than being dropped from the count.
 
 <!-- BEGIN GENERATED: pillar-genie_agents -->
 <!-- Generated from app/server by scripts/render_skill.py — edit the spec, not this block. -->
 **Signals**
 
 ```sql
--- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id EXACTLY equals the space_id/genie_space_id value parsed from the response.result JSON of a getDashboardGenie/updateDashboardGenie row (exact match, not a substring); otherwise STANDALONE (absence-of-evidence default). Real usage is measured from CONVERSATION actions only (not raw events, which overstate via polling): questions_30d, distinct_users_30d and active_30d are over the last 30 days.
+-- Graded usage for STANDALONE Genie Agents, from the audit log over the last 90 days (aibiGenie), minus trashed spaces. A space is DASHBOARD-EMBEDDED (counted separately, not scored) when its space_id EXACTLY equals the space_id/genie_space_id value parsed from the response.result JSON of a getDashboardGenie/updateDashboardGenie row (exact match, not a substring); otherwise STANDALONE (absence-of-evidence default). POPULATION vs USAGE: total counts agents that EXIST (any aibiGenie event is evidence of existence), but every USAGE signal — active_30d, active-share, distinct_users_30d, questions_30d and recency (last_active_date) — is derived from CONVERSATION actions only (never raw events, which overstate via genieGetSpace polling and service/eval accounts). So an existing-but-never-conversed agent lowers active-share and earns no recency rather than being dropped. questions_30d/distinct_users_30d/active_30d are over the last 30 days; last_active_date is the most recent conversation over the full lookback.
 WITH genie_events AS (
   SELECT request_params.space_id AS space_id, action_name, event_date,
          user_identity.email AS user_email
@@ -322,7 +327,9 @@ per_space AS (
          SUM(CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
                    AND event_date >= current_date() - INTERVAL 30 DAYS
                   THEN 1 ELSE 0 END) AS questions_30d,
-         MAX(event_date) AS last_active_date
+         -- recency is conversation-only: polling (genieGetSpace) must not earn it
+         MAX(CASE WHEN lower(action_name) IN ('geniestartconversationmessage', 'createconversationmessage', 'geniecreateconversationmessage')
+                  THEN event_date END) AS last_active_date
   FROM genie_events GROUP BY space_id
 ),
 classified AS (
